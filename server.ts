@@ -1,7 +1,7 @@
 /**
  * @file server.ts
  * Enterprise Full-Stack Application Entrypoint (Express + Vite)
- * AI Contact Center OS
+ * AI Contact Center OS v1.0.1
  */
 
 import express from 'express';
@@ -10,6 +10,9 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './server/api/router.ts';
 import { initializeSeedData } from './server/db/seed.ts';
+import { db } from './server/db/store.ts';
+import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
+import { getUsers, getOrCreateUser } from './src/db/users.ts';
 
 dotenv.config();
 
@@ -17,8 +20,15 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // 1. Initialize Seed Data for Enterprise Multi-Tenant Store
-  initializeSeedData();
+  // 1. Initialize Seed Data or Load from Persistent Storage
+  const restored = db.loadFromDisk();
+  if (!restored) {
+    console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
+    initializeSeedData();
+    db.saveToDisk();
+  } else {
+    console.log('[Storage] Loaded live state from disk successfully.');
+  }
 
   // 2. Global Middlewares
   app.use(express.json({ limit: '10mb' }));
@@ -36,6 +46,31 @@ async function startServer() {
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
     });
+  });
+
+  // Cloud SQL & Firebase Auth Users API
+  app.get('/api/users', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const sqlUsers = await getUsers();
+      res.json({ success: true, data: sqlUsers });
+    } catch (error: any) {
+      console.error('Failed to fetch users:', error);
+      res.status(500).json({ success: false, error: error.message || 'Failed to fetch users' });
+    }
+  });
+
+  app.post('/api/users/sync', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = req.user;
+      if (!user || !user.uid) {
+        return res.status(400).json({ success: false, error: 'User UID missing' });
+      }
+      const synced = await getOrCreateUser(user.uid, user.email || '', user.name);
+      res.json({ success: true, data: synced });
+    } catch (error: any) {
+      console.error('Failed to sync user:', error);
+      res.status(500).json({ success: false, error: error.message || 'Failed to sync user' });
+    }
   });
 
   // Global Error Handler for API

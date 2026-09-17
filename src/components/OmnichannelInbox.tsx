@@ -20,8 +20,26 @@ import {
   ChevronLeft,
   Search,
   BookOpen,
+  Zap,
+  CheckCircle2,
+  Activity,
 } from 'lucide-react';
 import { Conversation, Message, Customer, ChannelType } from '../types.ts';
+import { DiagnosticsAndRegionalModal } from './DiagnosticsAndRegionalModal.tsx';
+
+interface MacroItem {
+  id: string;
+  shortcut: string;
+  title: string;
+  category: string;
+  text: string;
+  actions?: {
+    setStatus?: string;
+    setPriority?: string;
+    escalate?: boolean;
+    assignTo?: string;
+  };
+}
 
 interface OmnichannelInboxProps {
   conversations: Conversation[];
@@ -45,6 +63,13 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
   const [channelFilter, setChannelFilter] = useState<string>('all');
   const [loadingMessages, setLoadingMessages] = useState(false);
 
+  // Quick Macros & Canned Responses state
+  const [macros, setMacros] = useState<MacroItem[]>([]);
+  const [showMacrosModal, setShowMacrosModal] = useState(false);
+  const [showDiagnosticsModal, setShowDiagnosticsModal] = useState(false);
+  const [executingMacroId, setExecutingMacroId] = useState<string | null>(null);
+  const [macroSuccess, setMacroSuccess] = useState<string | null>(null);
+
   // AI Copilot state
   const [copilotSuggestion, setCopilotSuggestion] = useState<{
     reply: string;
@@ -55,6 +80,44 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
   const [copilotLoading, setCopilotLoading] = useState(false);
 
   const activeConv = conversations.find((c) => c.id === selectedConvId) || conversations[0];
+
+  // Fetch macros on mount
+  useEffect(() => {
+    fetch('/api/v1/macros')
+      .then((r) => r.json())
+      .then((d) => d.success && setMacros(d.data))
+      .catch(() => {});
+  }, []);
+
+  const handleInsertMacro = (m: MacroItem) => {
+    setInputMessage(m.text);
+    setShowMacrosModal(false);
+  };
+
+  const handleExecuteMacro = async (m: MacroItem) => {
+    if (!activeConv) return;
+    setExecutingMacroId(m.id);
+    try {
+      const res = await fetch(`/api/v1/macros/${m.id}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: activeConv.id }),
+      });
+      const d = await res.json();
+      if (d.success) {
+        setMessages((prev) => [...prev, d.data.message]);
+        setMacroSuccess(`تم تطبيق ماكرو (${m.title}) بنجاح وتحديث حالة المحادثة!`);
+        setTimeout(() => {
+          setMacroSuccess(null);
+          setShowMacrosModal(false);
+        }, 1200);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setExecutingMacroId(null);
+    }
+  };
 
   // Fetch messages and customer 360 when conversation changes
   useEffect(() => {
@@ -379,14 +442,38 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
                   </button>
                 </div>
 
-                {/* Canned Responses Quick Chips */}
+                {/* Canned Responses & Quick Macros Chips */}
                 <div className="flex items-center gap-1.5 overflow-x-auto text-[11px]">
+                  <button
+                    onClick={() => setShowDiagnosticsModal(true)}
+                    className="px-2.5 py-1 rounded-lg bg-teal-600/30 hover:bg-teal-600/50 text-teal-200 border border-teal-500/40 flex items-center gap-1 transition font-bold shrink-0"
+                    title="فحص جودة خط العميل (VDSL/FTTH)، تفعيل شريحة eSIM، أو إنشاء كود سداد إنستاباي/كاش"
+                  >
+                    <Activity className="w-3 h-3 text-teal-400" />
+                    <span>فحص فني / eSIM / دفع (⚡)</span>
+                  </button>
+
+                  <button
+                    onClick={() => setShowMacrosModal(true)}
+                    className="px-2.5 py-1 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-200 border border-indigo-500/40 flex items-center gap-1 transition font-bold shrink-0"
+                    title="فتح مكتبة قوالب الماكرو والأتمتة السريعة للوكلاء"
+                  >
+                    <Zap className="w-3 h-3 text-indigo-400" />
+                    <span>قوالب الماكرو (⚡)</span>
+                  </button>
+
                   <span className="text-slate-500 font-medium">ردود سريعة:</span>
                   <button
                     onClick={() => setInputMessage('أهلاً بك، يسعدني خدمتك اليوم في مدار. كيف يمكنني مساعدتك؟')}
                     className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition"
                   >
-                    ترحيب
+                    ترحيب (/welcome)
+                  </button>
+                  <button
+                    onClick={() => setInputMessage('نعتذر بشدة عن الإزعاج، سيتم تفعيل التعويض الفوري بقيمة الفاتورة وإعادة ضبط الخدمة.')}
+                    className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition"
+                  >
+                    اعتذار وتعويض (/apology)
                   </button>
                   <button
                     onClick={() => setInputMessage('تم التحقق من بيانات طلبكم، وجارٍ متابعة التحديثات مع الفريق المختص فوراً.')}
@@ -398,10 +485,109 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
                     onClick={() => setInputMessage('شكراً لتواصلك معنا، يسعدنا دائماً تقديم أفضل تجربة لكم ونتمنى لك يوماً سعيداً!')}
                     className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition"
                   >
-                    إنهاء المحادثة
+                    إنهاء المحادثة (/close)
                   </button>
                 </div>
               </div>
+
+              {/* Macro Success Notification */}
+              {macroSuccess && (
+                <div className="mb-2 p-2.5 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>{macroSuccess}</span>
+                </div>
+              )}
+
+              {/* Macros & Canned Responses Modal */}
+              {showMacrosModal && (
+                <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                  <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-xl p-5 shadow-2xl space-y-4">
+                    <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                      <div className="flex items-center gap-2">
+                        <div className="p-2 rounded-xl bg-indigo-600/20 text-indigo-400">
+                          <Zap className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold text-white">مكتبة قوالب الماكرو والردود الجاهزة</h3>
+                          <p className="text-[11px] text-slate-400">
+                            تطبيق ردود معتمدة مع أتمتة تصعيد الأولوية وتحديث حالة المحادثة
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setShowMacrosModal(false)}
+                        className="text-slate-400 hover:text-white text-xs p-1"
+                      >
+                        ✕
+                      </button>
+                    </div>
+
+                    <div className="space-y-2.5 max-h-96 overflow-y-auto pr-1">
+                      {macros.length > 0 ? (
+                        macros.map((m) => (
+                          <div
+                            key={m.id}
+                            className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5 space-y-2 hover:border-slate-700 transition"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <span className="font-bold text-xs text-white">{m.title}</span>
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-indigo-300 border border-slate-700">
+                                  {m.shortcut}
+                                </span>
+                              </div>
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">
+                                {m.category}
+                              </span>
+                            </div>
+
+                            <p className="text-xs text-slate-300 leading-relaxed bg-slate-900/60 p-2.5 rounded-xl border border-slate-800/60 font-sans">
+                              {m.text}
+                            </p>
+
+                            {m.actions && (
+                              <div className="flex items-center gap-2 text-[10px] text-amber-400/90 font-medium">
+                                <span>الإجراء الآلي:</span>
+                                {m.actions.setStatus && (
+                                  <span className="bg-amber-950/40 border border-amber-500/30 px-1.5 py-0.5 rounded">
+                                    تغيير الحالة: {m.actions.setStatus}
+                                  </span>
+                                )}
+                                {m.actions.setPriority && (
+                                  <span className="bg-rose-950/40 border border-rose-500/30 text-rose-300 px-1.5 py-0.5 rounded">
+                                    الأولوية: {m.actions.setPriority}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+
+                            <div className="flex items-center justify-end gap-2 pt-1">
+                              <button
+                                onClick={() => handleInsertMacro(m)}
+                                className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition"
+                              >
+                                إدراج في حقل الكتابة
+                              </button>
+                              <button
+                                onClick={() => handleExecuteMacro(m)}
+                                disabled={executingMacroId === m.id}
+                                className="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition flex items-center gap-1 disabled:opacity-50"
+                              >
+                                <Zap className="w-3 h-3" />
+                                <span>{executingMacroId === m.id ? 'جارٍ التنفيذ...' : 'تطبيق الماكرو والإرسال الآن'}</span>
+                              </button>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-center py-6 text-xs text-slate-500">
+                          لا توجد قوالب ماكرو مسجلة حالياً
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div className="flex items-end gap-2">
                 <textarea
@@ -554,6 +740,14 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
           </div>
         )}
       </div>
+
+      {/* Autonomous Diagnostics & Instant Wallets Modal */}
+      <DiagnosticsAndRegionalModal
+        isOpen={showDiagnosticsModal}
+        onClose={() => setShowDiagnosticsModal(false)}
+        customerPhone={customer?.phone || '01012345678'}
+        onInsertMessage={(msg) => setInputMessage(msg)}
+      />
     </div>
   );
 };

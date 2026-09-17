@@ -19,6 +19,11 @@ import {
   Radio,
   ExternalLink,
   Layers,
+  Settings,
+  Copy,
+  Check,
+  Key,
+  RefreshCw,
 } from 'lucide-react';
 
 interface ChannelIntegration {
@@ -48,6 +53,17 @@ export const ChannelIntegrationsView: React.FC = () => {
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
   const [loading, setLoading] = useState(false);
 
+  // Channel Configuration & Credential Modal State
+  const [configChannel, setConfigChannel] = useState<ChannelIntegration | null>(null);
+  const [configForm, setConfigForm] = useState<Record<string, string>>({});
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [configFeedback, setConfigFeedback] = useState<string | null>(null);
+
+  // Live Connection Testing State
+  const [testingChannelId, setTestingChannelId] = useState<string | null>(null);
+  const [connectionTestResults, setConnectionTestResults] = useState<Record<string, any>>({});
+  const [copiedWebhookId, setCopiedWebhookId] = useState<string | null>(null);
+
   // Send Template Modal State
   const [selectedTemplate, setSelectedTemplate] = useState<WhatsAppTemplate | null>(null);
   const [recipientPhone, setRecipientPhone] = useState('+966500123456');
@@ -63,17 +79,88 @@ export const ChannelIntegrationsView: React.FC = () => {
   const [simulating, setSimulating] = useState(false);
   const [simResult, setSimResult] = useState<any | null>(null);
 
-  useEffect(() => {
+  const fetchChannels = () => {
     setLoading(true);
     fetch('/api/v1/integrations/channels')
       .then((r) => r.json())
       .then((d) => d.success && setChannels(d.data))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchChannels();
 
     fetch('/api/v1/integrations/whatsapp/templates')
       .then((r) => r.json())
       .then((d) => d.success && setTemplates(d.data));
   }, []);
+
+  const handleOpenConfig = (channel: ChannelIntegration) => {
+    setConfigChannel(channel);
+    setConfigFeedback(null);
+    const initial: Record<string, string> = {};
+    Object.entries(channel.accountInfo || {}).forEach(([k, v]) => {
+      if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+        initial[k] = String(v);
+      }
+    });
+    setConfigForm(initial);
+  };
+
+  const handleSaveConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!configChannel) return;
+    setSavingConfig(true);
+    setConfigFeedback(null);
+
+    try {
+      const res = await fetch(`/api/v1/integrations/channels/${configChannel.id}/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(configForm),
+      });
+      const d = await res.json();
+      if (d.success) {
+        setConfigFeedback('تم حفظ بيانات الاعتماد والربط بنجاح!');
+        fetchChannels();
+        setTimeout(() => {
+          setConfigChannel(null);
+          setConfigFeedback(null);
+        }, 1200);
+      }
+    } catch {
+      setConfigFeedback('حدث خطأ أثناء حفظ الإعدادات');
+    } finally {
+      setSavingConfig(false);
+    }
+  };
+
+  const handleTestConnection = async (channelId: string) => {
+    setTestingChannelId(channelId);
+    try {
+      const res = await fetch(`/api/v1/integrations/channels/${channelId}/test-connection`, {
+        method: 'POST',
+      });
+      const d = await res.json();
+      if (d.success) {
+        setConnectionTestResults((prev) => ({
+          ...prev,
+          [channelId]: d.data,
+        }));
+      }
+    } catch {
+      // test failed
+    } finally {
+      setTestingChannelId(null);
+    }
+  };
+
+  const handleCopyWebhook = (channelId: string, url: string) => {
+    const fullUrl = `${window.location.origin}${url}`;
+    navigator.clipboard.writeText(fullUrl);
+    setCopiedWebhookId(channelId);
+    setTimeout(() => setCopiedWebhookId(null), 2500);
+  };
 
   const handleSendTemplate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -148,37 +235,78 @@ export const ChannelIntegrationsView: React.FC = () => {
 
       {/* 2. Channel Health Matrix Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-3">
-        {channels.map((chan) => (
-          <div
-            key={chan.id}
-            className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between hover:border-slate-700 transition space-y-3"
-          >
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
-                  <span className="text-xs font-bold text-white truncate">{chan.type.toUpperCase()}</span>
-                </div>
-                <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-medium">
-                  {chan.status === 'online'
-                    ? 'متصل ونشط'
-                    : chan.status === 'degraded'
-                    ? 'أداء متذبذب'
-                    : 'غير متصل'}
-                </span>
-              </div>
-              <div className="text-xs text-slate-300 font-medium truncate">{chan.name}</div>
-              <div className="text-[11px] text-emerald-400 mt-0.5">{chan.badge}</div>
-            </div>
+        {channels.map((chan) => {
+          const testRes = connectionTestResults[chan.id];
+          const isTesting = testingChannelId === chan.id;
+          const webhookUrl = chan.metrics.webhookUrl || `/api/v1/integrations/${chan.type}/webhook`;
+          const isCopied = copiedWebhookId === chan.id;
 
-            <div className="pt-2 border-t border-slate-800/80 text-[10px] font-mono text-slate-400 flex items-center justify-between">
-              <span>الاستجابة: {chan.metrics.latencyMs}ms</span>
-              {chan.metrics.deliveryRatePercent && (
-                <span className="text-emerald-400">{chan.metrics.deliveryRatePercent}% تسليم</span>
-              )}
+          return (
+            <div
+              key={chan.id}
+              className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between hover:border-slate-700 transition space-y-3"
+            >
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span className="text-xs font-bold text-white truncate">{chan.type.toUpperCase()}</span>
+                  </div>
+                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-medium">
+                    {chan.status === 'online'
+                      ? 'متصل ونشط'
+                      : chan.status === 'degraded'
+                      ? 'أداء متذبذب'
+                      : 'غير متصل'}
+                  </span>
+                </div>
+                <div className="text-xs text-slate-300 font-medium truncate">{chan.name}</div>
+                <div className="text-[11px] text-emerald-400 mt-0.5">{chan.badge}</div>
+              </div>
+
+              {/* Webhook endpoint copy */}
+              <div className="bg-slate-950/80 rounded-lg p-1.5 border border-slate-800/80 flex items-center justify-between gap-1">
+                <span className="text-[10px] font-mono text-slate-400 truncate dir-ltr">{webhookUrl}</span>
+                <button
+                  onClick={() => handleCopyWebhook(chan.id, webhookUrl)}
+                  className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-800 transition shrink-0"
+                  title="نسخ رابط الـ Webhook الكامل للاستخدام في بوابة المزود"
+                >
+                  {isCopied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                </button>
+              </div>
+
+              {/* Actions: Configure & Test */}
+              <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-800/80">
+                <button
+                  onClick={() => handleOpenConfig(chan)}
+                  className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium flex items-center justify-center gap-1 transition"
+                  title="تعديل مفاتيح الربط والاعتماد"
+                >
+                  <Settings className="w-3 h-3 text-indigo-400" />
+                  <span>تهيئة</span>
+                </button>
+
+                <button
+                  onClick={() => handleTestConnection(chan.id)}
+                  disabled={isTesting}
+                  className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium flex items-center justify-center gap-1 transition disabled:opacity-50"
+                  title="اختبار الاتصال الفعلي وفحص الـ Latency"
+                >
+                  <RefreshCw className={`w-3 h-3 text-emerald-400 ${isTesting ? 'animate-spin' : ''}`} />
+                  <span>{isTesting ? 'فحص...' : 'فحص'}</span>
+                </button>
+              </div>
+
+              <div className="text-[10px] font-mono text-slate-400 flex items-center justify-between">
+                <span>الاستجابة: {testRes ? `${testRes.latencyMs}ms` : `${chan.metrics.latencyMs}ms`}</span>
+                {chan.metrics.deliveryRatePercent && (
+                  <span className="text-emerald-400">{chan.metrics.deliveryRatePercent}% تسليم</span>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* 3. WhatsApp Business Cloud API Dossier */}
@@ -452,6 +580,86 @@ export const ChannelIntegrationsView: React.FC = () => {
                 >
                   <Send className="w-3.5 h-3.5" />
                   <span>{sendingTemplate ? 'جارٍ الإرسال عبر Meta...' : 'إرسال الرسالة الآن'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 6. Channel Configuration & Credentials Modal */}
+      {configChannel && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-lg p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2">
+                <div className="p-2 rounded-xl bg-indigo-500/20 text-indigo-400">
+                  <Key className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">إعدادات وبيانات اعتماد {configChannel.name}</h3>
+                  <span className="text-[11px] text-slate-400 font-mono">
+                    القناة: {configChannel.type.toUpperCase()} • {configChannel.badge}
+                  </span>
+                </div>
+              </div>
+              <button
+                onClick={() => setConfigChannel(null)}
+                className="text-slate-400 hover:text-white text-xs p-1 rounded-lg hover:bg-slate-800"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveConfig} className="space-y-3.5">
+              <p className="text-xs text-slate-400 leading-relaxed">
+                قم بتحديث معرّفات المزود ومفاتيح الـ Webhook ورموز الـ API الخاصة بهذه القناة. يتم التحقق والتخزين المشفر
+                مباشرة على الخادم.
+              </p>
+
+              <div className="space-y-3 max-h-[50vh] overflow-y-auto px-1 py-1">
+                {Object.keys(configForm).map((fieldKey) => (
+                  <div key={fieldKey}>
+                    <label className="text-xs font-mono font-medium text-slate-300 block mb-1">
+                      {fieldKey}
+                    </label>
+                    <input
+                      type={fieldKey.toLowerCase().includes('token') || fieldKey.toLowerCase().includes('secret') ? 'password' : 'text'}
+                      value={configForm[fieldKey] || ''}
+                      onChange={(e) =>
+                        setConfigForm({
+                          ...configForm,
+                          [fieldKey]: e.target.value,
+                        })
+                      }
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono"
+                    />
+                  </div>
+                ))}
+              </div>
+
+              {configFeedback && (
+                <div className="p-3 rounded-xl bg-emerald-500/20 text-emerald-300 text-xs border border-emerald-500/30 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>{configFeedback}</span>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setConfigChannel(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition"
+                >
+                  إلغاء
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingConfig}
+                  className="px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center gap-1.5 transition disabled:opacity-50"
+                >
+                  <Key className="w-3.5 h-3.5" />
+                  <span>{savingConfig ? 'جارٍ الحفظ والتحقق...' : 'حفظ الاعتمادات'}</span>
                 </button>
               </div>
             </form>

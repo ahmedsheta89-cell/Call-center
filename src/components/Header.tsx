@@ -25,8 +25,15 @@ import {
   ChevronLeft,
   Sparkles,
   ExternalLink,
+  FileSpreadsheet,
+  Radio,
+  Command,
+  Globe,
+  Activity,
+  Wifi,
 } from 'lucide-react';
 import { Customer, Ticket, Conversation } from '../types.ts';
+import { GoogleWorkspaceAuthButton } from './GoogleWorkspaceAuthButton';
 
 export interface NotificationItem {
   id: string;
@@ -56,6 +63,11 @@ interface HeaderProps {
   onNavigateToCustomer?: (customerId: string) => void;
   onNavigateToTicket?: (ticketId: string) => void;
   onNavigateToConversation?: (conversationId: string) => void;
+  onOpenCommandPalette?: () => void;
+  onOpenExecutiveReport?: () => void;
+  onOpenGuidedTour?: () => void;
+  onOpenDiagnostics?: () => void;
+  isSseConnected?: boolean;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -75,9 +87,50 @@ export const Header: React.FC<HeaderProps> = ({
   onNavigateToCustomer,
   onNavigateToTicket,
   onNavigateToConversation,
+  onOpenCommandPalette,
+  onOpenExecutiveReport,
+  onOpenGuidedTour,
+  onOpenDiagnostics,
+  isSseConnected = true,
 }) => {
   const [showSearchDropdown, setShowSearchDropdown] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
+  const [showRegionDropdown, setShowRegionDropdown] = useState(false);
+  const [regionConfig, setRegionConfig] = useState<{
+    currentRegion: 'EG' | 'SA' | 'AE' | 'GLOBAL';
+    currency: string;
+    regulatoryBody: string;
+    dataProtectionLaw: string;
+  }>({
+    currentRegion: 'EG',
+    currency: 'EGP',
+    regulatoryBody: 'الجهاز القومي لتنظيم الاتصالات المصري (NTRA)',
+    dataProtectionLaw: 'قانون حماية البيانات الشخصية رقم 151 لسنة 2020',
+  });
+
+  const regionContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    fetch('/api/v1/regional/config')
+      .then((r) => r.json())
+      .then((d) => d.success && setRegionConfig(d.data))
+      .catch(() => {});
+  }, []);
+
+  const handleSwitchRegion = async (region: 'EG' | 'SA' | 'GLOBAL', curr: string) => {
+    try {
+      const res = await fetch('/api/v1/regional/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ region, currency: curr }),
+      });
+      const d = await res.json();
+      if (d.success) {
+        setRegionConfig(d.data);
+        setShowRegionDropdown(false);
+      }
+    } catch {}
+  };
   const searchContainerRef = useRef<HTMLDivElement>(null);
   const notifContainerRef = useRef<HTMLDivElement>(null);
 
@@ -217,19 +270,30 @@ export const Header: React.FC<HeaderProps> = ({
             setShowSearchDropdown(true);
           }}
           placeholder="بحث شامل بالعميل، التذكرة، أو نص الرسالة..."
-          className="w-full bg-slate-950 border border-slate-700/80 rounded-lg pr-9 pl-8 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+          className="w-full bg-slate-950 border border-slate-700/80 rounded-lg pr-9 pl-20 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
         />
-        {searchQuery && (
-          <button
-            onClick={() => {
-              onSearchChange('');
-              setShowSearchDropdown(false);
-            }}
-            className="absolute left-2.5 text-slate-400 hover:text-white"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        )}
+        <div className="absolute left-2.5 flex items-center gap-1.5">
+          {searchQuery ? (
+            <button
+              onClick={() => {
+                onSearchChange('');
+                setShowSearchDropdown(false);
+              }}
+              className="text-slate-400 hover:text-white"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          ) : (
+            <button
+              onClick={onOpenCommandPalette}
+              className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-mono text-slate-400 transition-colors"
+              title="فتح لوحة الأوامر السريعة (Cmd+K)"
+            >
+              <Command className="w-2.5 h-2.5" />
+              <span>K</span>
+            </button>
+          )}
+        </div>
 
         {/* Live Search Results Popup Dropdown */}
         {showSearchDropdown && searchQuery.trim() && (
@@ -474,6 +538,135 @@ export const Header: React.FC<HeaderProps> = ({
           )}
         </div>
 
+        {/* SSE Real-Time Stream Status Indicator */}
+        <div
+          className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-all ${
+            isSseConnected
+              ? 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30'
+              : 'bg-amber-950/40 text-amber-300 border-amber-500/30'
+          }`}
+          title={isSseConnected ? 'الاتصال اللحظي المباشر عبر SSE نشط ومستقر' : 'جارٍ إعادة الاتصال بالبث اللحظي...'}
+        >
+          <span className="relative flex h-2 w-2">
+            {isSseConnected && (
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            )}
+            <span
+              className={`relative inline-flex rounded-full h-2 w-2 ${
+                isSseConnected ? 'bg-emerald-500' : 'bg-amber-500'
+              }`}
+            ></span>
+          </span>
+          <span className="text-[11px]">{isSseConnected ? 'بث حي (SSE)' : 'إعادة الاتصال...'}</span>
+        </div>
+
+        {/* Regional Hub & Compliance Selector (Egypt / Gulf / Global BPO) */}
+        <div className="relative" ref={regionContainerRef}>
+          <button
+            onClick={() => setShowRegionDropdown(!showRegionDropdown)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 hover:border-indigo-500/40 transition-all shadow-sm"
+            title="تبديل النطاق الإقليمي والتنظيمي (مصر / الخليج / التعهيد العالمي)"
+          >
+            <Globe className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="font-mono">
+              {regionConfig.currentRegion === 'EG'
+                ? '🇪🇬 مصر (NTRA)'
+                : regionConfig.currentRegion === 'SA'
+                ? '🇸🇦 السعودية (CST)'
+                : '🌐 Global BPO'}
+            </span>
+            <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-900 text-emerald-400 font-mono">
+              {regionConfig.currency}
+            </span>
+          </button>
+
+          {showRegionDropdown && (
+            <div className="absolute left-0 mt-2 w-64 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-2.5 z-50 text-xs space-y-1.5">
+              <div className="text-[10px] font-bold text-slate-400 px-2 py-1">النطاق والاشتراطات التنظيمية:</div>
+              <button
+                onClick={() => handleSwitchRegion('EG', 'EGP')}
+                className={`w-full text-right p-2 rounded-xl flex items-center justify-between transition ${
+                  regionConfig.currentRegion === 'EG'
+                    ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/30'
+                    : 'hover:bg-slate-800 text-slate-200'
+                }`}
+              >
+                <div>
+                  <div className="font-bold flex items-center gap-1.5">
+                    <span>🇪🇬 مصر (مركز العمليات الإقليمي)</span>
+                  </div>
+                  <div className="text-[10px] text-slate-400">NTRA • إنستاباي • فودافون كاش</div>
+                </div>
+                <span className="font-mono text-[11px] text-emerald-400 font-bold">EGP</span>
+              </button>
+
+              <button
+                onClick={() => handleSwitchRegion('SA', 'SAR')}
+                className={`w-full text-right p-2 rounded-xl flex items-center justify-between transition ${
+                  regionConfig.currentRegion === 'SA'
+                    ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/30'
+                    : 'hover:bg-slate-800 text-slate-200'
+                }`}
+              >
+                <div>
+                  <div className="font-bold flex items-center gap-1.5">
+                    <span>🇸🇦 السعودية والخليج العربي</span>
+                  </div>
+                  <div className="text-[10px] text-slate-400">CST • SDAIA • مدى • سداد</div>
+                </div>
+                <span className="font-mono text-[11px] text-emerald-400 font-bold">SAR</span>
+              </button>
+
+              <button
+                onClick={() => handleSwitchRegion('GLOBAL', 'USD')}
+                className={`w-full text-right p-2 rounded-xl flex items-center justify-between transition ${
+                  regionConfig.currentRegion === 'GLOBAL'
+                    ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/30'
+                    : 'hover:bg-slate-800 text-slate-200'
+                }`}
+              >
+                <div>
+                  <div className="font-bold flex items-center gap-1.5">
+                    <span>🌐 Global BPO & Enterprise</span>
+                  </div>
+                  <div className="text-[10px] text-slate-400">GDPR • SOC-2 • Stripe • Multi-Voice</div>
+                </div>
+                <span className="font-mono text-[11px] text-emerald-400 font-bold">USD</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Autonomous Network & Billing Diagnostics Button */}
+        <button
+          onClick={onOpenDiagnostics}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-teal-600/30 to-emerald-600/30 hover:from-teal-600/50 hover:to-emerald-600/50 text-teal-200 border border-teal-500/40 hover:border-teal-400 transition-all shadow-sm"
+          title="تشغيل محرك التشخيص الفني الذاتي للخطوط والـ eSIM ومحافظ الدفع"
+        >
+          <Activity className="w-3.5 h-3.5 text-teal-400 animate-pulse" />
+          <span className="hidden sm:inline">تشخيص الخط / eSIM (⚡)</span>
+        </button>
+
+        {/* Guided Walkthrough Scenario Tour Button */}
+        <button
+          onClick={onOpenGuidedTour}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-emerald-600/30 to-indigo-600/30 hover:from-emerald-600/50 hover:to-indigo-600/50 text-emerald-200 border border-emerald-500/40 hover:border-emerald-400 transition-all shadow-sm"
+          title="تشغيل جولة المحاكاة التشغيلية التفاعلية الحية (End-to-End Walkthrough)"
+        >
+          <Sparkles className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+          <span className="hidden sm:inline">جولة المحاكاة (⚡)</span>
+        </button>
+
+        {/* Executive Report & Export Modal Button */}
+        <button
+          onClick={onOpenExecutiveReport}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 hover:border-emerald-500/50 transition-all"
+          title="عرض التقرير التنفيذي الشامل وتصدير ملفات Excel و PDF"
+        >
+          <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+          <span className="hidden md:inline">التقرير التنفيذي</span>
+        </button>
+
         {/* Softphone Quick Dial Button */}
         <button
           onClick={onOpenSoftphone}
@@ -523,6 +716,9 @@ export const Header: React.FC<HeaderProps> = ({
             />
           </div>
         </div>
+
+        {/* Google Workspace Connection Status Button */}
+        <GoogleWorkspaceAuthButton compact />
 
         {/* RBAC Role Switcher */}
         <div className="flex items-center gap-2 bg-slate-800/90 border border-slate-700 rounded-lg px-2.5 py-1">

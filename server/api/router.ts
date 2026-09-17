@@ -6,11 +6,12 @@
 
 import { Router, Request, Response } from 'express';
 import { db } from '../db/store.ts';
-import { DEMO_ORG_ID } from '../db/seed.ts';
+import { DEMO_ORG_ID, initializeSeedData } from '../db/seed.ts';
 import { AuditLogger } from '../core/audit.ts';
 import { assertPermission, hasPermission, Permission } from '../core/rbac.ts';
 import { AIGateway } from '../modules/ai/gateway.ts';
 import { UnifiedMessage, UUID, Ticket, CallSession } from '../core/types.ts';
+import { EventBus } from '../core/events.ts';
 
 export const apiRouter = Router();
 
@@ -21,6 +22,78 @@ let currentActor = {
   role: 'Supervisor',
   name: 'سلطان القحطاني',
 };
+
+// ----------------------------------------------------
+// 0. Real-Time Server-Sent Events (SSE) Stream
+// ----------------------------------------------------
+apiRouter.get('/stream', (req: Request, res: Response) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  // Initial handshake event
+  res.write(`data: ${JSON.stringify({ type: 'system:connected', message: 'Live stream connected successfully', clientCount: EventBus.getSseClientCount() + 1, timestamp: new Date().toISOString() })}\n\n`);
+
+  // Heartbeat every 25 seconds
+  const heartbeat = setInterval(() => {
+    res.write(`: heartbeat ${Date.now()}\n\n`);
+  }, 25000);
+
+  // Subscribe to EventBus
+  const unsubscribe = EventBus.addSseClient((event) => {
+    try {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      // client disconnected
+    }
+  });
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
+});
+
+// ----------------------------------------------------
+// 0.1 Backup, Restore & Data Persistence APIs
+// ----------------------------------------------------
+apiRouter.get('/system/backup', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'audit.read');
+  const backup = db.exportFullBackup();
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="contact_center_backup_${Date.now()}.json"`);
+  res.json({ success: true, data: backup });
+});
+
+apiRouter.post('/system/restore', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'audit.read');
+  const payload = req.body;
+  if (!payload || !payload.organizations) {
+    res.status(400).json({ success: false, error: { message: 'Invalid backup file structure' } });
+    return;
+  }
+
+  const restored = db.importFullBackup(payload);
+  if (restored) {
+    db.saveToDisk();
+    EventBus.publish('system:restored', { timestamp: new Date().toISOString() });
+    res.json({ success: true, message: 'Database state restored successfully' });
+  } else {
+    res.status(500).json({ success: false, error: { message: 'Failed to restore database state' } });
+  }
+});
+
+apiRouter.post('/system/reset-seed', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'audit.read');
+  initializeSeedData();
+  db.saveToDisk();
+  EventBus.publish('system:reset', { timestamp: new Date().toISOString() });
+  res.json({ success: true, message: 'Reset to seed state completed' });
+});
 
 // ----------------------------------------------------
 // 1. Identity, Auth & Role Switching (for testing RBAC)
@@ -43,7 +116,20 @@ apiRouter.get('/auth/me', (req: Request, res: Response) => {
 
 apiRouter.post('/auth/switch-role', (req: Request, res: Response) => {
   const { role, userId } = req.body;
-  if (role) currentActor.role = role;
+  if (role) {
+    const roleMapping: Record<string, string> = {
+      admin: 'Admin',
+      supervisor: 'Supervisor',
+      agent: 'Agent',
+      owner: 'Owner',
+      qa: 'QA',
+      'team leader': 'Team Leader',
+      analyst: 'Analyst',
+      'read only': 'Read Only',
+      'ai agent': 'AI Agent',
+    };
+    currentActor.role = roleMapping[role.toLowerCase().trim()] || role;
+  }
   if (userId && db.users.has(userId)) {
     currentActor.userId = userId;
     currentActor.name = db.users.get(userId)!.fullName;
@@ -204,10 +290,11 @@ apiRouter.get('/conversations/:id/messages', (req: Request, res: Response) => {
   res.json({ success: true, data: messages });
 });
 
-apiRouter.post('/conversations/:id/reply', async (req: Request, res: Response) => {
+const handleConversationReply = async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.reply');
   const convId = req.params.id;
-  const { body, isInternalNote } = req.body;
+  const bodyText = req.body.body || req.body.text || '';
+  const isInternalNote = !!req.body.isInternalNote;
   const conv = db.conversations.get(convId);
 
   if (!conv || conv.organizationId !== currentActor.organizationId) {
@@ -224,7 +311,7 @@ apiRouter.post('/conversations/:id/reply', async (req: Request, res: Response) =
     channel: conv.channel,
     direction: isInternalNote ? 'internal_note' : 'outbound',
     type: 'text',
-    body,
+    body: bodyText,
     sender: {
       id: currentActor.userId,
       type: 'agent',
@@ -239,6 +326,9 @@ apiRouter.post('/conversations/:id/reply', async (req: Request, res: Response) =
   conv.lastMessageAt = newMessage.createdAt;
   conv.updatedAt = newMessage.createdAt;
 
+  db.schedulePersist();
+  EventBus.publish('message:new', { conversationId: conv.id, message: newMessage });
+
   // Log in audit trail
   await AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -247,11 +337,14 @@ apiRouter.post('/conversations/:id/reply', async (req: Request, res: Response) =
     action: isInternalNote ? 'conversation.note' : 'conversation.reply',
     entityType: 'message',
     entityId: msgId,
-    afterState: { bodyLength: body.length, channel: conv.channel },
+    afterState: { bodyLength: bodyText.length, channel: conv.channel },
   });
 
   res.json({ success: true, data: newMessage });
-});
+};
+
+apiRouter.post('/conversations/:id/reply', handleConversationReply);
+apiRouter.post('/conversations/:id/messages', handleConversationReply);
 
 // ----------------------------------------------------
 // 4. Voice & Telephony Engine
@@ -267,6 +360,65 @@ apiRouter.get('/calls', (req: Request, res: Response) => {
     };
   });
   res.json({ success: true, data: calls });
+});
+
+apiRouter.post('/calls/dial', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'call.make');
+  const { phoneNumber, customerName, customerId } = req.body;
+  const callId = `call-${Date.now().toString(36)}`;
+  const newCall: CallSession = {
+    id: callId,
+    organizationId: currentActor.organizationId,
+    direction: 'outbound',
+    status: 'in_progress',
+    callerNumber: phoneNumber || '+966500000000',
+    calleeNumber: '920000001',
+    agentId: currentActor.userId,
+    customerId: customerId || undefined,
+    startedAt: new Date().toISOString(),
+    durationSeconds: 1,
+    aiSentiment: 'positive',
+  };
+  db.calls.set(callId, newCall);
+  db.schedulePersist();
+  EventBus.publish('call:event', { action: 'dial', call: newCall });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'agent',
+    action: 'call.outbound_dial',
+    entityType: 'call',
+    entityId: callId,
+    afterState: { phoneNumber, customerName },
+  });
+
+  res.json({ success: true, data: newCall });
+});
+
+apiRouter.post('/calls/:id/end', async (req: Request, res: Response) => {
+  const call = db.calls.get(req.params.id);
+  if (!call || call.organizationId !== currentActor.organizationId) {
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
+    return;
+  }
+  call.status = 'completed';
+  call.endedAt = new Date().toISOString();
+
+  db.schedulePersist();
+  EventBus.publish('call:event', { action: 'end', call });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'call.hangup',
+    entityType: 'call',
+    entityId: call.id,
+    afterState: { status: 'completed' },
+  });
+
+  res.json({ success: true, data: call });
 });
 
 apiRouter.post('/calls/:id/control', async (req: Request, res: Response) => {
@@ -287,6 +439,9 @@ apiRouter.post('/calls/:id/control', async (req: Request, res: Response) => {
     call.status = 'completed';
     call.endedAt = new Date().toISOString();
   }
+
+  db.schedulePersist();
+  EventBus.publish('call:event', { action, call });
 
   await AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -353,6 +508,8 @@ apiRouter.post('/tickets', async (req: Request, res: Response) => {
   };
 
   db.tickets.set(newTicket.id, newTicket);
+  db.schedulePersist();
+  EventBus.publish('ticket:created', newTicket);
 
   await AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -379,6 +536,9 @@ apiRouter.post('/tickets/:id/escalate', async (req: Request, res: Response) => {
   ticket.slaStatus = 'at_risk';
   ticket.updatedAt = new Date().toISOString();
 
+  db.schedulePersist();
+  EventBus.publish('ticket:updated', ticket);
+
   await AuditLogger.log({
     organizationId: currentActor.organizationId,
     actorId: currentActor.userId,
@@ -391,6 +551,42 @@ apiRouter.post('/tickets/:id/escalate', async (req: Request, res: Response) => {
 
   res.json({ success: true, data: ticket });
 });
+
+const handleTicketUpdate = async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+    return;
+  }
+
+  const { status, assignedAgentId, priority, category, title, description } = req.body;
+  if (status) ticket.status = status;
+  if (assignedAgentId !== undefined) ticket.assignedAgentId = assignedAgentId;
+  if (priority) ticket.priority = priority;
+  if (category) ticket.category = category;
+  if (title) ticket.title = title;
+  if (description) ticket.description = description;
+  ticket.updatedAt = new Date().toISOString();
+
+  db.schedulePersist();
+  EventBus.publish('ticket:updated', ticket);
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.update',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    afterState: { status: ticket.status, assignedAgentId: ticket.assignedAgentId },
+  });
+
+  res.json({ success: true, data: ticket });
+};
+
+apiRouter.put('/tickets/:id', handleTicketUpdate);
+apiRouter.put('/tickets/:id/status', handleTicketUpdate);
 
 // ----------------------------------------------------
 // 6. AI Gateway & Copilot
@@ -408,7 +604,13 @@ apiRouter.post('/ai/copilot/suggest', async (req: Request, res: Response) => {
     forceLocal: !!forceLocal,
   });
 
-  res.json({ success: true, data: result });
+  res.json({
+    success: true,
+    data: {
+      ...result,
+      suggestedResponse: result.content,
+    },
+  });
 });
 
 apiRouter.post('/ai/analyst', async (req: Request, res: Response) => {
@@ -443,6 +645,7 @@ apiRouter.post('/ai/analyst', async (req: Request, res: Response) => {
     data: {
       query,
       answer,
+      analysis: answer,
       evidence,
       timeframe: 'آخر 7 أيام عمل',
       confidence: 0.96,
@@ -454,7 +657,13 @@ apiRouter.post('/ai/analyst', async (req: Request, res: Response) => {
 apiRouter.get('/ai/benchmark', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'analytics.read');
   const results = await AIGateway.runBenchmark(currentActor.organizationId);
-  res.json({ success: true, data: results });
+  res.json({
+    success: true,
+    data: {
+      ...results,
+      scenarios: results.details,
+    },
+  });
 });
 
 // ----------------------------------------------------
@@ -728,6 +937,7 @@ apiRouter.post('/kb/test-rag', (req: Request, res: Response) => {
     data: {
       query,
       answer: responseText,
+      suggestedAnswer: responseText,
       confidence: topMatches.length > 0 ? topMatches[0].similarity : 0.2,
       citations: topMatches.map((m) => m.citationSource),
       matchedChunks: topMatches,
@@ -738,8 +948,68 @@ apiRouter.post('/kb/test-rag', (req: Request, res: Response) => {
 // ----------------------------------------------------
 // 12. Omnichannel Integrations & Meta WhatsApp Cloud API
 // ----------------------------------------------------
+const memoryChannelConfigs: Map<string, Record<string, any>> = new Map([
+  [
+    'chan-whatsapp',
+    {
+      wabaId: 'WABA-902184920194',
+      phoneNumberId: 'PNID-8820194829',
+      displayNumber: '+966 55 012 3456',
+      apiToken: 'EAAG...sec_meta_token',
+      webhookSecret: 'madar_verify_token_2026',
+      webhookUrl: '/api/v1/integrations/whatsapp/webhook',
+      verified: true,
+      lastCheckedAt: new Date().toISOString(),
+    },
+  ],
+  [
+    'chan-webchat',
+    {
+      widgetId: 'widget-madar-portal-v2',
+      domainWhitelist: ['madar.sa', 'app.madar.sa', 'localhost'],
+      sslEnabled: true,
+      verified: true,
+      lastCheckedAt: new Date().toISOString(),
+    },
+  ],
+  [
+    'chan-voice',
+    {
+      sipServer: 'sip.madar.sa:5060',
+      trunkUsername: 'madar_sip_trunk_01',
+      authSecret: '********',
+      codec: 'Opus, G.711u',
+      webrtcGateway: 'wss://sip-edge.madar.sa/ws',
+      verified: true,
+      lastCheckedAt: new Date().toISOString(),
+    },
+  ],
+  [
+    'chan-email',
+    {
+      smtpHost: 'smtp.madar.sa',
+      smtpPort: 587,
+      smtpUser: 'support@madar.sa',
+      imapHost: 'imap.madar.sa',
+      imapPort: 993,
+      verified: true,
+      lastCheckedAt: new Date().toISOString(),
+    },
+  ],
+  [
+    'chan-messenger',
+    {
+      pageId: '1092837465',
+      pageName: 'Madar Telecom Official',
+      igHandle: '@madar_sa',
+      verified: true,
+      lastCheckedAt: new Date().toISOString(),
+    },
+  ],
+]);
+
 apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
-  const channels = [
+  const defaultChannels = [
     {
       id: 'chan-whatsapp',
       type: 'whatsapp',
@@ -753,12 +1023,13 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
         verifiedName: 'مدار كير للاتصالات والتقنية',
         qualityRating: 'High',
         messagingLimitTier: 'Tier 2 (10,000 محادثة / 24 ساعة)',
+        ...memoryChannelConfigs.get('chan-whatsapp'),
       },
       metrics: {
         latencyMs: 42,
         messagesSent24h: 3842,
         deliveryRatePercent: 99.4,
-        webhookUrl: 'https://api.madar.sa/api/v1/integrations/whatsapp/webhook',
+        webhookUrl: '/api/v1/integrations/whatsapp/webhook',
       },
       compliance: {
         optInPolicyActive: true,
@@ -775,11 +1046,13 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       accountInfo: {
         widgetId: 'widget-madar-portal-v2',
         sslEnabled: true,
+        ...memoryChannelConfigs.get('chan-webchat'),
       },
       metrics: {
         latencyMs: 14,
         messagesSent24h: 1240,
         deliveryRatePercent: 100,
+        webhookUrl: '/api/v1/integrations/webchat/webhook',
       },
     },
     {
@@ -792,11 +1065,13 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
         trunkName: 'STC-SIP-TRUNK-RIYADH-01',
         concurrentLines: 32,
         codecs: 'Opus, G.711u',
+        ...memoryChannelConfigs.get('chan-voice'),
       },
       metrics: {
         latencyMs: 24,
         callsHandled24h: 340,
         averageMOSScore: 4.4,
+        webhookUrl: '/api/v1/integrations/voice/webhook',
       },
     },
     {
@@ -808,10 +1083,12 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       accountInfo: {
         smtpHost: 'smtp.madar.sa',
         pollingIntervalSec: 30,
+        ...memoryChannelConfigs.get('chan-email'),
       },
       metrics: {
         latencyMs: 120,
         emailsProcessed24h: 185,
+        webhookUrl: '/api/v1/integrations/email/webhook',
       },
     },
     {
@@ -823,16 +1100,239 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       accountInfo: {
         pageName: 'Madar Telecom Official',
         igHandle: '@madar_sa',
+        ...memoryChannelConfigs.get('chan-messenger'),
       },
       metrics: {
         latencyMs: 65,
         messagesSent24h: 520,
+        webhookUrl: '/api/v1/integrations/messenger/webhook',
       },
     },
   ];
 
-  res.json({ success: true, data: channels });
+  res.json({ success: true, data: defaultChannels });
 });
+
+// Update channel configuration
+apiRouter.put('/integrations/channels/:id/config', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'settings.manage');
+  const channelId = req.params.id;
+  const config = req.body;
+
+  const current = memoryChannelConfigs.get(channelId) || {};
+  const updated = {
+    ...current,
+    ...config,
+    verified: true,
+    lastCheckedAt: new Date().toISOString(),
+  };
+  memoryChannelConfigs.set(channelId, updated);
+
+  AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'channel.update_config',
+    entityType: 'channel',
+    entityId: channelId,
+    afterState: { configKeys: Object.keys(config) },
+  });
+
+  res.json({
+    success: true,
+    data: updated,
+    message: 'تم حفظ إعدادات القناة والاعتمادات بنجاح',
+  });
+});
+
+// Test channel connection live
+apiRouter.post('/integrations/channels/:id/test-connection', async (req: Request, res: Response) => {
+  const channelId = req.params.id;
+  const simulatedDelay = Math.floor(20 + Math.random() * 30);
+  await new Promise((r) => setTimeout(r, simulatedDelay));
+
+  const config = memoryChannelConfigs.get(channelId) || {};
+
+  res.json({
+    success: true,
+    data: {
+      channelId,
+      status: 'online',
+      latencyMs: simulatedDelay,
+      handshake: 'TLS 1.3 - Verified',
+      endpoint: `/api/v1/integrations/${channelId.replace('chan-', '')}/webhook`,
+      testedAt: new Date().toISOString(),
+      details: {
+        optInCompliant: true,
+        credentialsValid: true,
+        ...config,
+      },
+    },
+  });
+});
+
+// Meta WhatsApp Webhook Verification Endpoint (hub.challenge)
+apiRouter.get(['/integrations/:channel/webhook', '/webhooks/:channel'], (req: Request, res: Response) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe') {
+    if (token === 'madar_verify_token_2026' || !token) {
+      res.status(200).send(challenge || 'VERIFIED');
+      return;
+    }
+    res.status(403).send('Forbidden: Verify token mismatch');
+    return;
+  }
+
+  res.status(200).json({ status: 'active', channel: req.params.channel });
+});
+
+// Universal Inbound Webhook Processor (Meta WhatsApp, Twilio, Generic HTTP Webhooks)
+const handleIncomingWebhook = async (req: Request, res: Response) => {
+  const channelType = (req.params.channel || 'whatsapp') as UnifiedMessage['channel'];
+  const payload = req.body || {};
+
+  // Extract from Meta WhatsApp Cloud API format or generic JSON
+  let text = '';
+  let phone = '';
+  let name = 'عميل عبر Webhook';
+
+  if (payload.object === 'whatsapp_business_account') {
+    const entry = payload.entry?.[0];
+    const change = entry?.changes?.[0]?.value;
+    const msg = change?.messages?.[0];
+    const contact = change?.contacts?.[0];
+
+    text = msg?.text?.body || 'رسالة وسائط واردة';
+    phone = msg?.from ? `+${msg.from}` : '+966500112233';
+    name = contact?.profile?.name || 'عميل واتساب';
+  } else if (payload.From || payload.Body) {
+    // Twilio SMS/Voice webhook format
+    text = payload.Body || payload.TranscriptionText || 'مكالمة أو رسالة واردة';
+    phone = payload.From || '+966500112233';
+    name = payload.CallerName || 'متصل عبر الهاتف';
+  } else {
+    // Generic JSON payload
+    text = payload.messageText || payload.text || payload.body || 'استفسار وارد جديد';
+    phone = payload.senderPhone || payload.phone || payload.from || '+966500112233';
+    name = payload.senderName || payload.customerName || payload.name || 'عميل تجريبي';
+  }
+
+  // 1. Find or create Customer
+  let customer = Array.from(db.customers.values()).find(
+    (c) => c.organizationId === currentActor.organizationId && c.phone === phone
+  );
+
+  if (!customer) {
+    const custId = `cust-wh-${Date.now().toString(36)}`;
+    customer = {
+      id: custId,
+      organizationId: currentActor.organizationId,
+      name,
+      phone,
+      email: `${custId}@madar.sa`,
+      customerTier: 'standard',
+      lifetimeValue: 1500,
+      tags: [`webhook_${channelType}`, 'عميل_مباشر'],
+      customFields: { source: 'webhook', channel: channelType },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    db.customers.set(custId, customer);
+  }
+
+  // 2. Find or create Conversation
+  let conv = Array.from(db.conversations.values()).find(
+    (c) => c.organizationId === currentActor.organizationId && c.customerId === customer!.id && c.status === 'open'
+  );
+
+  const now = new Date().toISOString();
+  if (!conv) {
+    const convId = `conv-wh-${Date.now().toString(36)}`;
+    conv = {
+      id: convId,
+      organizationId: currentActor.organizationId,
+      customerId: customer.id,
+      channel: channelType,
+      status: 'open',
+      priority: customer.customerTier === 'vip' ? 'urgent' : 'medium',
+      sentiment: 'neutral',
+      intent: 'general_inquiry',
+      lastMessageAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.conversations.set(convId, conv);
+  }
+
+  // 3. Create Unified Message
+  const msgId = `msg-wh-${Date.now().toString(36)}`;
+  const msg: UnifiedMessage = {
+    id: msgId,
+    organizationId: currentActor.organizationId,
+    conversationId: conv.id,
+    customerId: customer.id,
+    channel: channelType,
+    direction: 'inbound',
+    type: 'text',
+    body: text,
+    sender: {
+      id: customer.id,
+      type: 'customer',
+      name: customer.name,
+    },
+    status: 'delivered',
+    metadata: { webhook: true, receivedAt: now },
+    createdAt: now,
+  };
+  db.messages.set(msgId, msg);
+
+  // 4. Run AI Sentiment & Intent analysis
+  try {
+    const aiResult = await AIGateway.execute({
+      organizationId: currentActor.organizationId,
+      task: 'sentiment_intent_analysis',
+      input: text,
+      privacy: 'confidential',
+      forceLocal: true,
+    });
+    const parsed = JSON.parse(aiResult.content);
+    if (parsed.intent) conv.intent = parsed.intent;
+    if (parsed.sentiment) conv.sentiment = parsed.sentiment;
+  } catch {
+    // fallback
+  }
+
+  // 5. Persist & Broadcast
+  db.schedulePersist();
+  EventBus.publish('message:new', { conversationId: conv.id, message: msg });
+  EventBus.publish('conversation:updated', conv);
+
+  AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: customer.id,
+    actorType: 'system',
+    action: 'webhook.inbound_processed',
+    entityType: 'message',
+    entityId: msgId,
+    afterState: { channel: channelType, phone, textSnippet: text.slice(0, 30) },
+  });
+
+  res.status(200).json({
+    success: true,
+    data: {
+      messageId: msg.id,
+      conversationId: conv.id,
+      customerId: customer.id,
+      status: 'received_and_broadcasted',
+    },
+  });
+};
+
+apiRouter.post('/integrations/:channel/webhook', handleIncomingWebhook);
+apiRouter.post('/webhooks/:channel', handleIncomingWebhook);
 
 apiRouter.get('/integrations/whatsapp/templates', (req: Request, res: Response) => {
   const templates = [
@@ -926,11 +1426,11 @@ apiRouter.post('/integrations/whatsapp/send-template', (req: Request, res: Respo
 });
 
 apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Response) => {
-  const { channel, senderName, senderPhone, messageText } = req.body;
+  const { channel, senderName, senderPhone, customerName, phoneNumber, messageText } = req.body;
   const channelType = channel || 'whatsapp';
   const text = messageText || 'السلام عليكم، أود الاستفسار عن ترقية باقتي الحالية';
-  const phone = senderPhone || '+966500998877';
-  const name = senderName || 'عميل تجريبي';
+  const phone = senderPhone || phoneNumber || '+966500998877';
+  const name = senderName || customerName || 'عميل تجريبي';
 
   // 1. Find or create Customer
   let customer = Array.from(db.customers.values()).find(
@@ -1020,6 +1520,10 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
     // fallback
   }
 
+  db.schedulePersist();
+  EventBus.publish('message:new', { conversationId: conv.id, message: msg });
+  EventBus.publish('conversation:updated', conv);
+
   AuditLogger.log({
     organizationId: currentActor.organizationId,
     actorId: customer.id,
@@ -1034,6 +1538,7 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
     success: true,
     data: {
       conversation: conv,
+      conversationId: conv.id,
       customer,
       message: msg,
     },
@@ -1085,6 +1590,7 @@ apiRouter.get('/wfm/overview', (req: Request, res: Response) => {
       },
       statusDistribution: statusCounts,
       erlangForecast: hoursForecast,
+      intervalForecasts: hoursForecast,
     },
   });
 });
@@ -1129,6 +1635,8 @@ apiRouter.post('/wfm/shifts', (req: Request, res: Response) => {
   };
 
   db.shifts.set(shiftId, newShift);
+  db.schedulePersist();
+  EventBus.publish('shift:created', newShift);
 
   AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -1492,6 +2000,8 @@ apiRouter.post('/recommendations/:id/apply', (req: Request, res: Response) => {
   rec.applied = true;
   rec.appliedAt = new Date().toISOString();
 
+  EventBus.publish('recommendation:applied', rec);
+
   AuditLogger.log({
     organizationId: currentActor.organizationId,
     actorId: currentActor.userId,
@@ -1589,4 +2099,256 @@ apiRouter.post('/qa/coaching-plans/:id/progress', (req: Request, res: Response) 
   if (status) plan.status = status;
 
   res.json({ success: true, data: plan });
+});
+
+// ----------------------------------------------------
+// 21. Canned Responses, Quick Macros & Guided Scenarios
+// ----------------------------------------------------
+interface MacroItem {
+  id: string;
+  shortcut: string;
+  title: string;
+  category: string;
+  text: string;
+  actions?: {
+    setStatus?: string;
+    setPriority?: string;
+    escalate?: boolean;
+    assignTo?: string;
+  };
+}
+
+const memoryMacros: MacroItem[] = [
+  {
+    id: 'macro-welcome',
+    shortcut: '/welcome',
+    title: 'ترحيب رسمي معتمد (CST Compliant)',
+    category: 'عام',
+    text: 'أهلاً بك في مدار كير للاتصالات والتقنية، يسعدني جداً خدمتك اليوم. كيف يمكنني مساعدتك؟',
+  },
+  {
+    id: 'macro-apology',
+    shortcut: '/apology',
+    title: 'اعتذار عن التأخير وعرض تعويض معتمد',
+    category: 'شكاوى',
+    text: 'نعتذر بشدة عن التأخير غير المقصود في تفعيل الخدمة. وبحسب معايير هيئة الاتصالات والفضاء والتقنية (CST)، تم تسجيل طلبكم بأولوية قصوى واحتساب رصيد تعويضي على فاتورتكم القادمة.',
+    actions: {
+      setPriority: 'urgent',
+    },
+  },
+  {
+    id: 'macro-esim',
+    shortcut: '/esim',
+    title: 'خطوات تفعيل وتثبيت شريحة eSIM',
+    category: 'الدعم الفني',
+    text: 'لتثبيت شريحة الـ eSIM، يرجى التوجه إلى: الإعدادات > البيانات الخلوية > إضافة باقة خلوية، ومسح رمز الاستجابة السريعة (QR Code) المرسل إلى بريدك المعتمد مع التأكد من الاتصال بشبكة Wi-Fi مستقرة.',
+  },
+  {
+    id: 'macro-escalate',
+    shortcut: '/escalate',
+    title: 'إشعار تصعيد إلى الدعم الميداني المتقدم',
+    category: 'تصعيد',
+    text: 'تم رفع تذكرتكم مباشرة إلى فريق المهندسين الميدانيين للمعاينة الفنية السريعة. سيصلك إشعار SMS برقم الموعد المحدد خلال ساعتين.',
+    actions: {
+      setPriority: 'urgent',
+      setStatus: 'escalated',
+      escalate: true,
+    },
+  },
+  {
+    id: 'macro-close',
+    shortcut: '/close',
+    title: 'إغلاق المحادثة وطلب تقييم الخدمة (CSAT)',
+    category: 'إغلاق',
+    text: 'سعدنا بخدمتكم في مدار كير! نرجو أن نكون وفقنا في حل استفساركم بالكامل. نرجو التكرم بتقييم مستوى الخدمة من 1 إلى 5 بالرد المباشر على هذه الرسالة.',
+    actions: {
+      setStatus: 'resolved',
+    },
+  },
+];
+
+apiRouter.get('/macros', (req: Request, res: Response) => {
+  res.json({ success: true, data: memoryMacros });
+});
+
+apiRouter.post('/macros', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'settings.manage');
+  const { shortcut, title, category, text, actions } = req.body;
+  if (!shortcut || !title || !text) {
+    res.status(400).json({ success: false, error: { message: 'Shortcut, title, and text required' } });
+    return;
+  }
+  const newMacro: MacroItem = {
+    id: `macro-${Date.now().toString(36)}`,
+    shortcut: shortcut.startsWith('/') ? shortcut : `/${shortcut}`,
+    title,
+    category: category || 'عام',
+    text,
+    actions,
+  };
+  memoryMacros.push(newMacro);
+  res.json({ success: true, data: newMacro });
+});
+
+apiRouter.post('/macros/:id/execute', async (req: Request, res: Response) => {
+  const { conversationId } = req.body;
+  const macro = memoryMacros.find((m) => m.id === req.params.id);
+  if (!macro) {
+    res.status(404).json({ success: false, error: { message: 'Macro not found' } });
+    return;
+  }
+
+  const conv = db.conversations.get(conversationId);
+  if (!conv) {
+    res.status(404).json({ success: false, error: { message: 'Conversation not found' } });
+    return;
+  }
+
+  // 1. Create message from macro
+  const msgId = `msg-mcr-${Date.now().toString(36)}`;
+  const now = new Date().toISOString();
+  const msg: UnifiedMessage = {
+    id: msgId,
+    organizationId: currentActor.organizationId,
+    conversationId: conv.id,
+    customerId: conv.customerId,
+    channel: conv.channel,
+    direction: 'outbound',
+    type: 'text',
+    body: macro.text,
+    sender: {
+      id: currentActor.userId,
+      type: 'agent',
+      name: currentActor.name,
+    },
+    status: 'delivered',
+    metadata: {},
+    createdAt: now,
+  };
+  db.messages.set(msgId, msg);
+
+  // 2. Apply actions
+  if (macro.actions?.setPriority) {
+    conv.priority = macro.actions.setPriority as any;
+  }
+  if (macro.actions?.setStatus) {
+    conv.status = macro.actions.setStatus as any;
+  }
+  conv.lastMessageAt = now;
+
+  db.schedulePersist();
+  EventBus.publish('message:new', { conversationId: conv.id, message: msg });
+  EventBus.publish('conversation:updated', conv);
+
+  res.json({
+    success: true,
+    data: {
+      macro,
+      message: msg,
+      conversation: conv,
+    },
+  });
+});
+
+// Guided End-to-End Operational Scenario Runner
+apiRouter.post('/demo/run-scenario', async (req: Request, res: Response) => {
+  const scenarioType = req.body?.scenarioType || 'vip_billing_dispute';
+  const now = new Date().toISOString();
+
+  // Create or retrieve demo VIP customer
+  const phone = '+966500998811';
+  let cust = Array.from(db.customers.values()).find((c) => c.phone === phone);
+  if (!cust) {
+    const custId = `cust-scenario-${Date.now().toString(36)}`;
+    cust = {
+      id: custId,
+      organizationId: currentActor.organizationId,
+      name: 'سلطان القحطاني (عميل VIP)',
+      phone,
+      email: 'sultan.vip@madar.sa',
+      customerTier: 'vip',
+      lifetimeValue: 14500,
+      tags: ['كبار_العملاء_VIP', 'فايبر_أعمال', 'سيناريو_تفاعلي'],
+      customFields: { contractType: 'Enterprise Dedicated Fiber' },
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.customers.set(custId, cust);
+  }
+
+  // Create Conversation
+  const convId = `conv-scenario-${Date.now().toString(36)}`;
+  const conv = {
+    id: convId,
+    organizationId: currentActor.organizationId,
+    customerId: cust.id,
+    channel: 'whatsapp' as const,
+    status: 'open' as const,
+    priority: 'urgent' as const,
+    sentiment: 'negative' as const,
+    intent: 'billing_dispute',
+    assignedAgentId: currentActor.userId,
+    lastMessageAt: now,
+    createdAt: now,
+    updatedAt: now,
+  };
+  db.conversations.set(convId, conv);
+
+  // Inbound Customer Message
+  const msg1Id = `msg-scen-1-${Date.now().toString(36)}`;
+  const msg1: UnifiedMessage = {
+    id: msg1Id,
+    organizationId: currentActor.organizationId,
+    conversationId: convId,
+    customerId: cust.id,
+    channel: 'whatsapp',
+    direction: 'inbound',
+    type: 'text',
+    body: 'السلام عليكم، ظهرت رسوم تجديد مكررة على اشتراك الألياف البصرية للفرع الرئيسي، أرجو المعالجة الفورية وفق اتفاقية مستوى الخدمة.',
+    sender: { id: cust.id, type: 'customer', name: cust.name },
+    status: 'delivered',
+    metadata: {},
+    createdAt: now,
+  };
+  db.messages.set(msg1Id, msg1);
+
+  // Auto-generate Ticket
+  const num = Math.floor(1000 + Math.random() * 9000);
+  const ticketId = `TICK-${num}`;
+  const newTicket = {
+    id: ticketId,
+    ticketNumber: num,
+    organizationId: currentActor.organizationId,
+    customerId: cust.id,
+    conversationId: convId,
+    title: 'نزاع فوترة وتكرار رسوم اشتراك الألياف البصرية (VIP)',
+    description: 'نزاع فوترة وتكرار رسوم اشتراك الألياف البصرية للفرع الرئيسي، يتطلب مراجعة فورية وتطبيق سياسات التعويض المعتمدة.',
+    category: 'الفوترة والمطالبات المالية',
+    priority: 'urgent' as const,
+    status: 'new' as const,
+    assignedAgentId: currentActor.userId,
+    slaDueAt: new Date(Date.now() + 2 * 3600000).toISOString(),
+    slaStatus: 'healthy' as const,
+    createdAt: now,
+    updatedAt: now,
+  };
+  db.tickets.set(ticketId, newTicket);
+
+  // Persistence & Broadcast
+  db.schedulePersist();
+  EventBus.publish('message:new', { conversationId: convId, message: msg1 });
+  EventBus.publish('conversation:updated', conv);
+  EventBus.publish('ticket:created', newTicket);
+
+  res.json({
+    success: true,
+    data: {
+      scenario: scenarioType,
+      conversationId: convId,
+      customerId: cust.id,
+      ticketId: newTicket.id,
+      customerName: cust.name,
+      messageText: msg1.body,
+    },
+  });
 });

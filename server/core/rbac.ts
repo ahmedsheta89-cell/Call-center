@@ -137,6 +137,7 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
     'qa.evaluate',
     'qa.approve',
     'qa.rubric.manage',
+    'coaching.plan.manage',
     'ai.suggest',
     'analytics.read',
     'audit.read',

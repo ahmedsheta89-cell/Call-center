@@ -19,7 +19,9 @@ import {
   Layers,
   Activity,
   ShieldAlert,
+  GitFork,
 } from 'lucide-react';
+import { VisualIVRFlowBuilder } from './VisualIVRFlowBuilder.tsx';
 
 interface AutomationRule {
   id: string;
@@ -33,6 +35,7 @@ interface AutomationRule {
 }
 
 export const AutomationRulesView: React.FC = () => {
+  const [activeSubTab, setActiveSubTab] = useState<'rules' | 'ivr_flow' | 'simulator'>('rules');
   const [rules, setRules] = useState<AutomationRule[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -170,8 +173,51 @@ export const AutomationRulesView: React.FC = () => {
         </button>
       </div>
 
-      {/* 2. Rule Engine Interactive Simulator */}
-      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-sm space-y-4">
+      {/* View Switcher Sub-Tabs */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 pb-3">
+        <button
+          onClick={() => setActiveSubTab('rules')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition ${
+            activeSubTab === 'rules'
+              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+              : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+          }`}
+        >
+          <Zap className="w-4 h-4" />
+          <span>قواعد الأتمتة والتوجيه المعتمدة ({rules.length})</span>
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab('ivr_flow')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition ${
+            activeSubTab === 'ivr_flow'
+              ? 'bg-gradient-to-r from-teal-500/20 to-indigo-500/20 text-teal-300 border border-teal-500/40 shadow-sm'
+              : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+          }`}
+        >
+          <GitFork className="w-4 h-4 text-teal-400" />
+          <span>مصمم مسارات الرد الصوتي وشجرة IVR التفاعلية (Visual Flow Designer)</span>
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab('simulator')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition ${
+            activeSubTab === 'simulator'
+              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+              : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+          }`}
+        >
+          <Play className="w-4 h-4" />
+          <span>محاكي تقييم قواعد الأتمتة (Rule Sandbox)</span>
+        </button>
+      </div>
+
+      {/* View 1: Visual IVR Flow Builder */}
+      {activeSubTab === 'ivr_flow' && <VisualIVRFlowBuilder />}
+
+      {/* View 2: Rule Engine Interactive Simulator */}
+      {activeSubTab === 'simulator' && (
+        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-sm space-y-4">
         <div className="flex items-center justify-between pb-3 border-b border-slate-800">
           <div className="flex items-center gap-2 text-xs font-bold text-white">
             <Play className="w-4 h-4 text-emerald-400" />
@@ -312,9 +358,11 @@ export const AutomationRulesView: React.FC = () => {
           </div>
         )}
       </div>
+      )}
 
       {/* 3. Automation Rules List Cards */}
-      <div className="space-y-3">
+      {activeSubTab === 'rules' && (
+        <div className="space-y-3">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-bold text-white">قواعد الأتمتة المعتمدة ({rules.length})</h3>
           <span className="text-xs text-slate-500 font-mono">
@@ -404,6 +452,7 @@ export const AutomationRulesView: React.FC = () => {
           </div>
         )}
       </div>
+      )}
 
       {/* 4. Add Rule Modal */}
       {showAddModal && (
