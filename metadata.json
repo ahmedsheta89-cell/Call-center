@@ -1,0 +1,6 @@
+{
+  "name": "AI Contact Center OS",
+  "description": "Enterprise AI-Powered Omnichannel Customer Operations and Contact Center Operating System",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
