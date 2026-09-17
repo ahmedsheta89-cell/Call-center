@@ -515,5 +515,131 @@ export function initializeSeedData() {
     });
   });
 
+  // 13. Ensure Special Customer for 01018108979
+  ensureEgyptSpecialCustomer();
+
   console.log('[Seed] Enterprise demo dataset seeded successfully with full multi-tenant records.');
+}
+
+/**
+ * Ensures the existence of the special customer profile for 01018108979
+ * with comprehensive Customer 360 attributes, VDSL/eSIM details, and tickets.
+ */
+export function ensureEgyptSpecialCustomer(): Customer {
+  const phone = '01018108979';
+  const existing = Array.from(db.customers.values()).find((c) => c.phone === phone);
+  if (existing) return existing;
+
+  const egCustomerId: UUID = 'cust-eg-01018108979';
+  const egCustomer: Customer = {
+    id: egCustomerId,
+    organizationId: DEMO_ORG_ID,
+    name: 'م. أحمد عبد الرحمن (01018108979)',
+    email: 'ahmed.sheta@enterprise.eg',
+    phone,
+    customerTier: 'vip',
+    lifetimeValue: 18900,
+    assignedAgentId: 'usr-agt-01',
+    tags: ['كبار العملاء', 'مصر', 'فودافون مصر', 'VDSL 100M', 'eSIM نشطة'],
+    customFields: {
+      preferredLanguage: 'ar',
+      loyaltyPoints: 3450,
+      city: 'القاهرة (التجمع الخامس)',
+      accountNumber: 'ACC-EG-01018108979',
+      operator: 'فودافون مصر (Vodafone Egypt)',
+      vdslSpeed: '100 Mbps Super',
+      esimStatus: 'Active',
+      wallet: 'InstaPay & Vodafone Cash',
+      nationalId: '28910180108979',
+    },
+    createdAt: new Date(Date.now() - 60 * 86400000).toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  db.customers.set(egCustomer.id, egCustomer);
+
+  db.customerChannels.set(`chn-${egCustomerId}-wa`, {
+    id: `chn-${egCustomerId}-wa`,
+    customerId: egCustomerId,
+    channelType: 'whatsapp',
+    externalIdentifier: phone,
+    isVerified: true,
+    lastInteractionAt: new Date().toISOString(),
+  });
+
+  // Also create a realistic active conversation for this customer
+  const convId = 'conv-eg-01018108979';
+  if (!db.conversations.has(convId)) {
+    const conv: Conversation = {
+      id: convId,
+      organizationId: DEMO_ORG_ID,
+      customerId: egCustomerId,
+      assignedAgentId: 'usr-agt-01',
+      channel: 'whatsapp',
+      status: 'open',
+      priority: 'urgent',
+      intent: 'vdsl_esim_inquiry',
+      sentiment: 'positive',
+      subject: 'استفسار فني: استقرار كابينة VDSL وتفعيل كود eSIM والاشتراك',
+      lastMessageAt: new Date().toISOString(),
+      createdAt: new Date(Date.now() - 3600000).toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    db.conversations.set(conv.id, conv);
+
+    const msg1: UnifiedMessage = {
+      id: 'msg-eg-01',
+      organizationId: DEMO_ORG_ID,
+      conversationId: convId,
+      customerId: egCustomerId,
+      channel: 'whatsapp',
+      direction: 'inbound',
+      type: 'text',
+      body: 'السلام عليكم، رقمي 01018108979، محتاج أتأكد من استقرار خط الـ VDSL وتفعيل كود الـ eSIM على هاتفي الجديد، وتجديد الاشتراك عبر إنستاباي.',
+      sender: { id: egCustomerId, type: 'customer', name: 'م. أحمد عبد الرحمن' },
+      status: 'delivered',
+      metadata: {},
+      createdAt: new Date(Date.now() - 3500000).toISOString(),
+    };
+    const msg2: UnifiedMessage = {
+      id: 'msg-eg-02',
+      organizationId: DEMO_ORG_ID,
+      conversationId: convId,
+      customerId: egCustomerId,
+      channel: 'whatsapp',
+      direction: 'outbound',
+      type: 'text',
+      body: 'أهلاً بك م. أحمد، يسعدنا خدمتك دائماً في باقة كبار العملاء VIP. جاري إجراء فحص كابينة الـ VDSL وتوليد كود الـ QR الخاص بشريحة eSIM فوراً مع تجهيز أمر الدفع السريع.',
+      sender: { id: 'usr-agt-01', type: 'agent', name: 'سارة أحمد' },
+      status: 'read',
+      metadata: {},
+      createdAt: new Date(Date.now() - 3400000).toISOString(),
+    };
+    db.messages.set(msg1.id, msg1);
+    db.messages.set(msg2.id, msg2);
+
+    // Create an active Ticket for this customer
+    const ticketId = 'TICK-EG-01018';
+    if (!db.tickets.has(ticketId)) {
+      const ticket: Ticket = {
+        id: ticketId,
+        ticketNumber: 8979,
+        organizationId: DEMO_ORG_ID,
+        customerId: egCustomerId,
+        conversationId: convId,
+        title: 'فحص جودة خط VDSL وتفعيل شريحة eSIM للرقم 01018108979',
+        description: 'طلب فحص إشارة الكابينة، والتأكد من دعم سرعة 100Mbps وتوليد بروفايل الـ eSIM وسداد الفاتورة عبر إنستاباي.',
+        category: 'الدعم التقني والشبكات',
+        priority: 'urgent',
+        status: 'in_progress',
+        assignedAgentId: 'usr-agt-01',
+        resolutionDueAt: new Date(Date.now() + 4 * 3600000).toISOString(),
+        slaStatus: 'healthy',
+        createdAt: new Date(Date.now() - 3600000).toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      db.tickets.set(ticket.id, ticket);
+    }
+  }
+
+  return egCustomer;
 }

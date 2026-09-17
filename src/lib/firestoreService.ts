@@ -1,10 +1,10 @@
 /**
  * @file src/lib/firestoreService.ts
  * Real-time Firestore & Cloud Persistence Service
- * Database ID: ai-studio-omniflowaios-c7e77753-7b8a-41c8-a9ca-10f723452807
+ * Uses the initialized Firestore instance from firebaseConfig.ts
  */
 
-import { firestore } from './firebase.ts';
+import { firestore, FIRESTORE_DATABASE_ID } from './firebaseConfig.ts';
 import {
   collection,
   doc,
@@ -28,7 +28,14 @@ export interface CloudDatabaseStatus {
   lastSyncTimestamp: string;
 }
 
-const FIRESTORE_DB_ID = 'ai-studio-omniflowaios-c7e77753-7b8a-41c8-a9ca-10f723452807';
+export const FIRESTORE_DB_ID = FIRESTORE_DATABASE_ID;
+
+/**
+ * Get the initialized Firestore database instance
+ */
+export function getFirestoreInstance() {
+  return firestore;
+}
 
 /**
  * Sync a ticket to Firestore
@@ -63,6 +70,42 @@ export async function syncConversationToFirestore(conv: Conversation): Promise<b
   } catch (err) {
     console.warn('[Firestore Sync] Non-blocking conversation sync notice:', err);
     return false;
+  }
+}
+
+/**
+ * Fetch all tickets directly from Firestore
+ */
+export async function fetchTicketsFromFirestore(): Promise<Ticket[]> {
+  try {
+    const q = query(collection(firestore, 'tickets'), limit(50));
+    const snapshot = await getDocs(q);
+    const tickets: Ticket[] = [];
+    snapshot.forEach((d) => {
+      tickets.push(d.data() as Ticket);
+    });
+    return tickets;
+  } catch (err) {
+    console.warn('[Firestore] Error fetching tickets:', err);
+    return [];
+  }
+}
+
+/**
+ * Fetch all conversations directly from Firestore
+ */
+export async function fetchConversationsFromFirestore(): Promise<Conversation[]> {
+  try {
+    const q = query(collection(firestore, 'conversations'), limit(50));
+    const snapshot = await getDocs(q);
+    const conversations: Conversation[] = [];
+    snapshot.forEach((d) => {
+      conversations.push(d.data() as Conversation);
+    });
+    return conversations;
+  } catch (err) {
+    console.warn('[Firestore] Error fetching conversations:', err);
+    return [];
   }
 }
 
@@ -117,3 +160,4 @@ export async function triggerReplicationToCloud(
     return { success: false, ticketsCount: tCount, conversationsCount: cCount };
   }
 }
+

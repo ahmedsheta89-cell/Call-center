@@ -878,7 +878,7 @@ export default function App() {
       <DiagnosticsAndRegionalModal
         isOpen={isDiagnosticsOpen}
         onClose={() => setIsDiagnosticsOpen(false)}
-        customerPhone={customers.find((c) => c.id === selectedCustomerId)?.phone || '01012345678'}
+        customerPhone={customers.find((c) => c.id === selectedCustomerId)?.phone || '01018108979'}
         onInsertMessage={(msg) => handleSendMessage(selectedConvId || 'conv-001', msg, false)}
       />
     </div>

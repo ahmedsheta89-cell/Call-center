@@ -33,7 +33,7 @@ interface DiagnosticsAndRegionalModalProps {
 export const DiagnosticsAndRegionalModal: React.FC<DiagnosticsAndRegionalModalProps> = ({
   isOpen,
   onClose,
-  customerPhone = '01098765432',
+  customerPhone = '01018108979',
   onInsertMessage,
 }) => {
   const [activeTab, setActiveTab] = useState<'vdsl' | 'esim' | 'payment'>('vdsl');

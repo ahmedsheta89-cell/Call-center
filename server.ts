@@ -9,7 +9,7 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './server/api/router.ts';
-import { initializeSeedData } from './server/db/seed.ts';
+import { initializeSeedData, ensureEgyptSpecialCustomer } from './server/db/seed.ts';
 import { db } from './server/db/store.ts';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import { getUsers, getOrCreateUser } from './src/db/users.ts';
@@ -29,6 +29,9 @@ async function startServer() {
   } else {
     console.log('[Storage] Loaded live state from disk successfully.');
   }
+
+  // Ensure Egypt special test customer (01018108979) is always initialized in memory
+  ensureEgyptSpecialCustomer();
 
   // 2. Global Middlewares
   app.use(express.json({ limit: '10mb' }));
