@@ -43,6 +43,12 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
   const [tierFilter, setTierFilter] = useState<string>('all');
   const [timeline, setTimeline] = useState<any[]>([]);
   const [timelineLoading, setTimelineLoading] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3500);
+  };
 
   const activeCustomer = customers.find((c) => c.id === selectedCustomerId) || customers[0];
 
@@ -289,7 +295,7 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
                     <button
                       onClick={async () => {
                         await fetch('/api/v1/recommendations/rec-nba-01/apply', { method: 'POST' }).catch(() => {});
-                        alert('تم تفعيل حزمة الاستبقاء الذهبية بنجاح وإرسال إشعار للمشرف.');
+                        showToast('تم تفعيل حزمة الاستبقاء الذهبية بنجاح وإرسال إشعار للمشرف.');
                       }}
                       className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition shadow-sm"
                     >
@@ -314,7 +320,7 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
                     <span className="text-[10px] text-indigo-400 font-mono">+120 ريال إضافة إلى الفاتورة الشهرية</span>
                     <button
                       onClick={() => {
-                        alert('تم تسجيل توصية الترقية وإرسال رسالة العرض المخصصة للعميل.');
+                        showToast('تم تسجيل توصية الترقية وإرسال رسالة العرض المخصصة للعميل.');
                       }}
                       className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs flex items-center gap-1.5 transition border border-slate-700"
                     >
@@ -376,6 +382,13 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
           <div className="text-center text-xs text-slate-500 py-20">اختر عميلاً لعرض ملفه الشامل</div>
         )}
       </div>
+
+      {toastMessage && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 border border-emerald-500/50 text-white px-5 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 text-xs font-bold z-50 animate-fade-in">
+          <Check className="w-4 h-4 text-emerald-400" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
     </div>
   );
 };

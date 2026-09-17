@@ -1319,13 +1319,16 @@ interface CoachingPlanRecord {
   organizationId: string;
   agentId: string;
   agentName: string;
+  title?: string;
   focusArea: string;
   recommendationText: string;
   targetMetric: string;
   status: 'active' | 'in_progress' | 'completed';
   assignedBy: string;
   dueDate: string;
+  targetDate?: string;
   progressPercent: number;
+  recommendedActions?: string[];
 }
 
 const memoryRecommendations: Map<string, RecommendationRecord> = new Map([
@@ -1428,13 +1431,19 @@ const memoryCoachingPlans: Map<string, CoachingPlanRecord> = new Map([
       organizationId: DEMO_ORG_ID,
       agentId: 'agt-sarah',
       agentName: 'سارة أحمد',
+      title: 'خطة تقليص فترات الصمت وسرعة الاستجابة',
       focusArea: 'تقليص زمن الصمت في المكالمات',
       recommendationText: 'استخدام خاصية البحث اللحظي في مستودع المعرفة وتجنب وضع العميل في وضع الانتظار الصامت بدون إشعار صوتي لطيف.',
       targetMetric: 'أقل من 15 ثانية صمت',
       status: 'in_progress',
       assignedBy: 'سلطان القحطاني (مشرف)',
       dueDate: '2026-09-25',
+      targetDate: '2026-09-25',
       progressPercent: 65,
+      recommendedActions: [
+        'الاستماع لتسجيلين نموذجيين لمكالمات de-escalation',
+        'التدريب على اختصارات البحث في قاعدة المعرفة',
+      ],
     },
   ],
   [
@@ -1444,13 +1453,19 @@ const memoryCoachingPlans: Map<string, CoachingPlanRecord> = new Map([
       organizationId: DEMO_ORG_ID,
       agentId: 'agt-omar',
       agentName: 'عمر خالد',
+      title: 'خطة الامتثال الأمني والتحقق من الهوية',
       focusArea: 'الامتثال للتحقق من هوية المتصل وسرية البيانات',
       recommendationText: 'طلب الرقم التعريفي المؤقت عبر تطبيق مدار أو نفاذ قبل الإفصاح عن تفاصيل الفواتير أو العنوان المسجل.',
       targetMetric: '100% نسبة الامتثال الأمني',
       status: 'active',
       assignedBy: 'مسؤول الجودة (QA Officer)',
       dueDate: '2026-09-30',
+      targetDate: '2026-09-30',
       progressPercent: 40,
+      recommendedActions: [
+        'مراجعة ضوابط الأمن السيبراني للهيئة الوطنية',
+        'محاكاة سيناريوهات التحقق الآمن مع المدرب الآلي',
+      ],
     },
   ],
 ]);
@@ -1503,25 +1518,45 @@ apiRouter.get('/qa/coaching-plans', (req: Request, res: Response) => {
 
 apiRouter.post('/qa/coaching-plans', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'qa.rubric.manage');
-  const { agentId, agentName, focusArea, recommendationText, targetMetric, dueDate } = req.body;
-  if (!agentName || !focusArea || !recommendationText) {
-    res.status(400).json({ success: false, error: { message: 'agentName, focusArea, recommendationText are required' } });
+  const {
+    agentId,
+    agentName,
+    focusArea,
+    recommendationText,
+    title,
+    targetMetric,
+    dueDate,
+    targetDate,
+    recommendedActions,
+  } = req.body;
+
+  const resolvedText = recommendationText || title || 'خطة تدريبية وتطويرية مخصصة';
+  const resolvedTitle = title || recommendationText || 'خطة تطوير الأداء والجودة';
+
+  if (!agentName || !focusArea) {
+    res.status(400).json({ success: false, error: { message: 'agentName and focusArea are required' } });
     return;
   }
 
   const id = `cp-dyn-${Date.now().toString(36)}`;
+  const resolvedDueDate = dueDate || targetDate || new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10);
   const plan: CoachingPlanRecord = {
     id,
     organizationId: currentActor.organizationId,
     agentId: agentId || 'agt-general',
     agentName,
+    title: resolvedTitle,
     focusArea,
-    recommendationText,
+    recommendationText: resolvedText,
     targetMetric: targetMetric || 'تحقيق هدف الجودة',
     status: 'active',
     assignedBy: currentActor.name || 'المشرف',
-    dueDate: dueDate || new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10),
+    dueDate: resolvedDueDate,
+    targetDate: resolvedDueDate,
     progressPercent: 0,
+    recommendedActions: recommendedActions && recommendedActions.length > 0
+      ? recommendedActions
+      : ['مراجعة سيناريوهات الدعم المعتمدة', 'جلسة تدريب مع مشرف الجودة'],
   };
 
   memoryCoachingPlans.set(id, plan);
@@ -1533,7 +1568,7 @@ apiRouter.post('/qa/coaching-plans', (req: Request, res: Response) => {
     action: 'qa.coaching_plan_create',
     entityType: 'coaching_plan',
     entityId: id,
-    afterState: { agentName, focusArea },
+    afterState: { agentName, focusArea, title: resolvedTitle },
   });
 
   res.json({ success: true, data: plan });

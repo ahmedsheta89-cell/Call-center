@@ -70,6 +70,12 @@ export const WorkforceManagementView: React.FC = () => {
   const [shiftStart, setShiftStart] = useState('08:00');
   const [shiftEnd, setShiftEnd] = useState('16:00');
   const [creatingShift, setCreatingShift] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3500);
+  };
 
   const fetchData = () => {
     setLoading(true);
@@ -306,7 +312,7 @@ export const WorkforceManagementView: React.FC = () => {
               <button
                 onClick={async () => {
                   await fetch('/api/v1/recommendations/rec-wfm-01/apply', { method: 'POST' }).catch(() => {});
-                  alert('تم تطبيق توصية إعادة جدولة الاستراحات بنجاح، وتحديث خطة الورديات.');
+                  showToast('تم تطبيق توصية إعادة جدولة الاستراحات بنجاح، وتحديث خطة الورديات.');
                   fetchData();
                 }}
                 className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center gap-1.5 transition shadow-sm"
@@ -330,7 +336,7 @@ export const WorkforceManagementView: React.FC = () => {
               <span className="text-[10px] text-emerald-400 font-mono">الأثر: خفض زمن الانتظار بـ 20 ثانية</span>
               <button
                 onClick={() => {
-                  alert('تم تفعيل التوجيه متعدد المهارات (Skill-Based Routing Cross-Support).');
+                  showToast('تم تفعيل التوجيه متعدد المهارات (Skill-Based Routing Cross-Support).');
                   fetchData();
                 }}
                 className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center gap-1.5 transition border border-slate-700"
@@ -551,6 +557,12 @@ export const WorkforceManagementView: React.FC = () => {
               </div>
             </form>
           </div>
+        </div>
+      )}
+      {toastMessage && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 border border-indigo-500/50 text-white px-5 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 text-xs font-bold z-50 animate-fade-in">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+          <span>{toastMessage}</span>
         </div>
       )}
     </div>

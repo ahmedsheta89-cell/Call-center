@@ -146,11 +146,14 @@ export interface CoachingActionPlan {
   id: string;
   agentId: string;
   agentName: string;
+  title?: string;
   focusArea: string;
   recommendationText: string;
   targetMetric: string;
   status: 'active' | 'in_progress' | 'completed';
   assignedBy: string;
   dueDate: string;
+  targetDate?: string;
   progressPercent: number;
+  recommendedActions?: string[];
 }

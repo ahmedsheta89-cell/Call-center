@@ -174,9 +174,14 @@ export function hasPermission(
   userExplicitPermissions: string[] = [],
   requiredPermission: Permission
 ): boolean {
-  if (userRole === 'Owner') return true;
+  if (!userRole) return false;
+  const canonicalRole = Object.keys(ROLE_PERMISSIONS).find(
+    (r) => r.toLowerCase() === userRole.toLowerCase().trim()
+  ) || userRole;
+
+  if (canonicalRole === 'Owner') return true;
   if (userExplicitPermissions.includes(requiredPermission)) return true;
-  const rolePermissions = ROLE_PERMISSIONS[userRole] || [];
+  const rolePermissions = ROLE_PERMISSIONS[canonicalRole] || [];
   return rolePermissions.includes(requiredPermission);
 }
 
