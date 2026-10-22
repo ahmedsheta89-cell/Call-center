@@ -24,14 +24,30 @@ function getGeminiClient(): GoogleGenAI | null {
 
 export class AIGateway {
   /**
+   * PII & PCI-DSS Redaction Filter: Scrubs credit cards, national IDs, and OTP secrets before AI processing
+   */
+  public static redactPII(rawText: string): string {
+    if (!rawText || typeof rawText !== 'string') return '';
+    return rawText
+      // Credit/Debit Cards (13-16 digits with optional spaces or hyphens)
+      .replace(/\b(?:\d[ -]*?){13,16}\b/g, '[REDACTED_CARD]')
+      // Egyptian 14-digit National ID or 10-digit National/Iqama ID
+      .replace(/\b[123]\d{13}\b/g, '[REDACTED_NATIONAL_ID]')
+      // Explicit OTP / CVV patterns
+      .replace(/(?:OTP|CVV|رمز التحقق|الرقم السري)\s*[:=-]?\s*\d{3,8}/gi, '[REDACTED_OTP]');
+  }
+
+  /**
    * Main entrypoint: Routes request dynamically based on complexity, privacy, and budget.
    */
   public static async execute(req: AIRouteRequest): Promise<AIRouteResponse> {
     const startTime = Date.now();
     const org = db.organizations.get(req.organizationId);
+    const sanitizedInput = this.redactPII(req.input);
+    const safeReq: AIRouteRequest = { ...req, input: sanitizedInput };
 
     // 1. Safety Guardrail: Prompt Injection & Forbidden Execution Check
-    const safetyViolation = this.checkSafetyGuardrails(req.input);
+    const safetyViolation = this.checkSafetyGuardrails(safeReq.input);
     if (safetyViolation) {
       return {
         runId: crypto.randomUUID(),
@@ -47,22 +63,22 @@ export class AIGateway {
 
     // 2. Determine Route: Local vs Cloud
     const isZeroCost = org?.settings.zeroCostMode ?? false;
-    const isRestrictedPii = req.privacy === 'restricted_pii';
-    const isSimpleTask = req.task === 'sentiment_intent_analysis';
+    const isRestrictedPii = safeReq.privacy === 'restricted_pii';
+    const isSimpleTask = safeReq.task === 'sentiment_intent_analysis';
     const isBudgetExceeded = (org?.settings.aiCurrentMonthSpendUsd ?? 0) >= (org?.settings.aiMonthlyBudgetUsd ?? 100);
 
-    const useLocal = req.forceLocal || isZeroCost || isRestrictedPii || isSimpleTask || isBudgetExceeded || !process.env.GEMINI_API_KEY;
+    const useLocal = safeReq.forceLocal || isZeroCost || isRestrictedPii || isSimpleTask || isBudgetExceeded || !process.env.GEMINI_API_KEY;
 
     let response: AIRouteResponse;
 
     if (useLocal) {
-      response = await this.executeLocalEngine(req, startTime);
+      response = await this.executeLocalEngine(safeReq, startTime);
     } else {
       try {
-        response = await this.executeCloudGemini(req, startTime);
+        response = await this.executeCloudGemini(safeReq, startTime);
       } catch (cloudErr) {
         console.warn('[AI Gateway] Cloud execution failed or timed out. Gracefully falling back to Local Engine:', cloudErr);
-        response = await this.executeLocalEngine(req, startTime, true);
+        response = await this.executeLocalEngine(safeReq, startTime, true);
       }
     }
 
@@ -72,11 +88,11 @@ export class AIGateway {
     }
 
     // 4. Audit Log for Privileged AI operations
-    if (req.task === 'supervisor_risk_eval' || req.task === 'qa_rubric_audit') {
+    if (safeReq.task === 'supervisor_risk_eval' || safeReq.task === 'qa_rubric_audit') {
       await AuditLogger.log({
-        organizationId: req.organizationId,
+        organizationId: safeReq.organizationId,
         actorType: 'ai',
-        action: `ai.execute.${req.task}`,
+        action: `ai.execute.${safeReq.task}`,
         entityType: 'ai_run',
         entityId: response.runId,
         afterState: { model: response.model, tokens: response.tokensUsed, latencyMs: response.latencyMs },

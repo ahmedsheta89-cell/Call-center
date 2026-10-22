@@ -31,9 +31,11 @@ import {
   Globe,
   Activity,
   Wifi,
+  GitBranch,
 } from 'lucide-react';
 import { Customer, Ticket, Conversation } from '../types.ts';
 import { GoogleWorkspaceAuthButton } from './GoogleWorkspaceAuthButton';
+import { PWAInstallButton } from './PWAInstallButton';
 
 export interface NotificationItem {
   id: string;
@@ -67,6 +69,8 @@ interface HeaderProps {
   onOpenExecutiveReport?: () => void;
   onOpenGuidedTour?: () => void;
   onOpenDiagnostics?: () => void;
+  onOpenGitHubAndQA?: () => void;
+  onOpenCrossPlatformHub?: () => void;
   isSseConnected?: boolean;
 }
 
@@ -91,6 +95,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenExecutiveReport,
   onOpenGuidedTour,
   onOpenDiagnostics,
+  onOpenGitHubAndQA,
+  onOpenCrossPlatformHub,
   isSseConnected = true,
 }) => {
   const [showSearchDropdown, setShowSearchDropdown] = useState(false);
@@ -637,6 +643,19 @@ export const Header: React.FC<HeaderProps> = ({
           )}
         </div>
 
+        {/* Mandatory In-App PWA & Cross-Platform (Android/Windows) Install Button */}
+        <PWAInstallButton compact onOpenCrossPlatformHub={onOpenCrossPlatformHub} />
+
+        {/* Direct Public Link, GitHub Sync & Full QA Test Suite Button */}
+        <button
+          onClick={onOpenGitHubAndQA}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white transition-all shadow-sm whitespace-nowrap shrink-0"
+          title="فتح الرابط العام المباشر للزملاء ومزامنة GitHub وجناح الاختبارات الشامل (100% QA)"
+        >
+          <GitBranch className="w-3.5 h-3.5" />
+          <span>الرابط العام &amp; GitHub + الاختبارات</span>
+        </button>
+
         {/* Autonomous Network & Billing Diagnostics Button */}
         <button
           onClick={onOpenDiagnostics}
@@ -735,6 +754,17 @@ export const Header: React.FC<HeaderProps> = ({
               </option>
             ))}
           </select>
+        </div>
+
+        {/* Admin Verified Identity & Phone */}
+        <div
+          className="hidden sm:flex items-center gap-2 bg-gradient-to-r from-amber-500/15 via-slate-800 to-indigo-500/15 border border-amber-500/30 rounded-lg px-2.5 py-1 text-xs shadow-sm"
+          title="مدير النظام الرئيسي: م. أحمد شتا • رقم الإدارة: 01018108979"
+        >
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse inline-block" />
+          <Shield className="w-3.5 h-3.5 text-amber-400" />
+          <span className="text-slate-300 font-medium">الآدمن:</span>
+          <span className="font-mono text-amber-200 font-bold tracking-wide">01018108979</span>
         </div>
       </div>
     </header>

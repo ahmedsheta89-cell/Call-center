@@ -1,0 +1,499 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 1. Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid is string && request.auth.uid.size() >= 1;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() &&
+             request.auth.token.email_verified == true &&
+             request.auth.token.email is string &&
+             request.auth.token.email.size() >= 3;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function userProfileExists() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function currentUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isIntactProfileData(u) {
+      return u.keys().hasAll(['uid', 'organizationId', 'email', 'role']) &&
+             u.uid == request.auth.uid &&
+             u.organizationId is string &&
+             u.organizationId.size() >= 1 &&
+             u.email is string &&
+             u.role in ['Owner', 'Admin', 'Supervisor', 'Team Leader', 'Agent', 'QA', 'Analyst', 'Read Only'];
+    }
+
+    // Strict profile integrity guard: prevents missing/corrupted user profile fields from falling back to permissive access
+    function hasIntactUserProfile() {
+      return userProfileExists() && isIntactProfileData(currentUserData());
+    }
+
+    // Strict tenant isolation: organizationId is NEVER optional and profile must be intact
+    function isSameOrg(orgId) {
+      return isValidId(orgId) && hasIntactUserProfile() && currentUserData().organizationId == orgId;
+    }
+
+    // Designated primary bootstrap organization (prevents Bootstrapped Admin from claiming arbitrary foreign tenants)
+    function isDesignatedBootstrapOrg(orgId) {
+      return orgId == 'org-madar-001';
+    }
+
+    // Bootstrapped Admin requires verified email token AND is strictly scoped to designated bootstrap org
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'ahmedsheta89@gmail.com';
+    }
+
+    function isAdmin() {
+      return hasIntactUserProfile() && (
+        currentUserData().role in ['Admin', 'Owner'] ||
+        (isBootstrappedAdmin() && isDesignatedBootstrapOrg(currentUserData().organizationId))
+      );
+    }
+
+    // Strict tenant-scoped Admin: Caller MUST be an Admin AND belong to the exact target organizationId
+    function isSameOrgAdmin(orgId) {
+      return isSameOrg(orgId) && (
+        currentUserData().role in ['Admin', 'Owner'] ||
+        (isBootstrappedAdmin() && isDesignatedBootstrapOrg(orgId))
+      );
+    }
+
+    function isSupervisorOrAbove() {
+      return hasIntactUserProfile() && (
+        currentUserData().role in ['Owner', 'Admin', 'Supervisor'] ||
+        (isBootstrappedAdmin() && isDesignatedBootstrapOrg(currentUserData().organizationId))
+      );
+    }
+
+    function isSameOrgSupervisorOrAbove(orgId) {
+      return isSameOrg(orgId) && (
+        currentUserData().role in ['Owner', 'Admin', 'Supervisor'] ||
+        (isBootstrappedAdmin() && isDesignatedBootstrapOrg(orgId))
+      );
+    }
+
+    // Isolated personal namespace for uninvited self-registration (disconnected from all existing tenant data)
+    function isIsolatedPersonalOrg(orgId) {
+      return isSignedIn() && orgId == ('org-isolated-' + request.auth.uid);
+    }
+
+    function isMatchingInvitationTransition(invBefore, invAfter, userId, data) {
+      return invBefore.id == data.inviteId &&
+             invBefore.status == 'pending' &&
+             invBefore.organizationId == data.organizationId &&
+             invBefore.invitedUid == request.auth.uid &&
+             invBefore.invitedUid == userId &&
+             invBefore.invitedEmail == request.auth.token.email &&
+             invBefore.invitedEmail == data.email &&
+             invBefore.role == data.role &&
+             invBefore.expiresAt is int &&
+             invBefore.expiresAt > request.time.toMillis() &&
+             invAfter.status == 'accepted' &&
+             invAfter.consumedByUid == request.auth.uid &&
+             invAfter.organizationId == data.organizationId &&
+             invAfter.invitedUid == request.auth.uid &&
+             invAfter.invitedEmail == request.auth.token.email &&
+             invAfter.role == data.role;
+    }
+
+    // Atomic Single-Use Invitation Verification (AUDIT-3B-04 Remediation):
+    // Proves that an invitation in /invitations/{inviteId} was pending, unexpired, bound to caller's UID + email + target org + role,
+    // AND is atomically transitioned to 'accepted' within the exact same transaction/batch via getAfter().
+    function hasValidAtomicInvitationConsumption(userId, data) {
+      return 'inviteId' in data &&
+             isValidId(data.inviteId) &&
+             exists(/databases/$(database)/documents/invitations/$(data.inviteId)) &&
+             existsAfter(/databases/$(database)/documents/invitations/$(data.inviteId)) &&
+             getAfter(/databases/$(database)/documents/invitations/$(data.inviteId)).data.status == 'accepted' &&
+             isMatchingInvitationTransition(
+               get(/databases/$(database)/documents/invitations/$(data.inviteId)).data,
+               getAfter(/databases/$(database)/documents/invitations/$(data.inviteId)).data,
+               userId,
+               data
+             );
+    }
+
+    // 2. Entity Validation Helpers (Synchronized with firebase-blueprint.json)
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'organizationId', 'email', 'role']) &&
+             data.keys().hasOnly([
+               'uid', 'organizationId', 'email', 'fullName', 'displayName',
+               'phoneNumber', 'role', 'inviteId', 'teamName', 'status', 'skills',
+               'createdAt', 'updatedAt'
+             ]) &&
+             isValidId(data.uid) &&
+             isValidId(data.organizationId) &&
+             data.email is string && data.email.size() >= 3 && data.email.size() <= 255 &&
+             data.role in ['Owner', 'Admin', 'Supervisor', 'Team Leader', 'Agent', 'QA', 'Analyst', 'Read Only'] &&
+             (!('inviteId' in data) || isValidId(data.inviteId)) &&
+             (!('fullName' in data) || (data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 255)) &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 255)) &&
+             (!('phoneNumber' in data) || (data.phoneNumber is string && data.phoneNumber.size() >= 3 && data.phoneNumber.size() <= 50)) &&
+             (!('teamName' in data) || (data.teamName is string && data.teamName.size() <= 255)) &&
+             (!('status' in data) || (data.status in ['online', 'busy', 'break', 'offline'])) &&
+             (!('skills' in data) || (data.skills is list && data.skills.size() <= 20 && (data.skills.size() == 0 || data.skills[0] is string))) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+             (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidInvitation(data) {
+      return data.keys().hasAll([
+               'id', 'organizationId', 'invitedUid', 'invitedEmail',
+               'role', 'status', 'invitedByUid', 'expiresAt', 'createdAt'
+             ]) &&
+             data.keys().hasOnly([
+               'id', 'organizationId', 'invitedUid', 'invitedEmail',
+               'role', 'status', 'invitedByUid', 'expiresAt',
+               'consumedByUid', 'consumedAt', 'createdAt', 'updatedAt'
+             ]) &&
+             isValidId(data.id) &&
+             isValidId(data.organizationId) &&
+             isValidId(data.invitedUid) &&
+             isValidId(data.invitedByUid) &&
+             data.invitedEmail is string && data.invitedEmail.size() >= 3 && data.invitedEmail.size() <= 255 &&
+             data.role in ['Admin', 'Supervisor', 'Team Leader', 'Agent', 'QA', 'Analyst', 'Read Only'] &&
+             data.status in ['pending', 'accepted', 'revoked', 'expired'] &&
+             data.expiresAt is int && data.expiresAt > 0 &&
+             data.createdAt is string && data.createdAt.size() >= 1 && data.createdAt.size() <= 64 &&
+             (!('consumedByUid' in data) || isValidId(data.consumedByUid)) &&
+             (!('consumedAt' in data) || (data.consumedAt is string && data.consumedAt.size() <= 64)) &&
+             (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidCustomer(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'name', 'phone', 'customerTier']) &&
+             data.keys().hasOnly([
+               'id', 'organizationId', 'name', 'email', 'phone',
+               'customerTier', 'lifetimeValue', 'tags', 'assignedAgentId',
+               'assignedAgentName', 'createdAt', 'updatedAt'
+             ]) &&
+             isValidId(data.id) &&
+             isValidId(data.organizationId) &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 255 &&
+             data.phone is string && data.phone.size() >= 3 && data.phone.size() <= 50 &&
+             data.customerTier in ['vip', 'priority', 'standard'] &&
+             (!('email' in data) || (data.email is string && data.email.size() <= 255)) &&
+             (!('lifetimeValue' in data) || (data.lifetimeValue is number && data.lifetimeValue >= 0)) &&
+             (!('tags' in data) || (data.tags is list && data.tags.size() <= 20 && (data.tags.size() == 0 || data.tags[0] is string))) &&
+             (!('assignedAgentId' in data) || (data.assignedAgentId is string && data.assignedAgentId.size() <= 128)) &&
+             (!('assignedAgentName' in data) || (data.assignedAgentName is string && data.assignedAgentName.size() <= 255)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+             (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidTicket(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'customerId', 'title', 'status', 'priority']) &&
+             data.keys().hasOnly([
+               'id', 'organizationId', 'ticketNumber', 'customerId',
+               'customerName', 'customerPhone', 'title', 'description',
+               'category', 'priority', 'status', 'slaStatus',
+               'assignedAgentId', 'assignedAgent', 'assignedAgentName',
+               'firstResponseDueAt', 'resolutionDueAt', 'createdAt', 'updatedAt'
+             ]) &&
+             isValidId(data.id) &&
+             isValidId(data.organizationId) &&
+             isValidId(data.customerId) &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 500 &&
+             data.status in ['new', 'open', 'in_progress', 'pending', 'pending_customer', 'waiting_on_customer', 'escalated', 'resolved', 'closed'] &&
+             data.priority in ['low', 'medium', 'high', 'urgent'] &&
+             (!('ticketNumber' in data) || (data.ticketNumber is number && data.ticketNumber >= 1)) &&
+             (!('customerName' in data) || (data.customerName is string && data.customerName.size() <= 255)) &&
+             (!('customerPhone' in data) || (data.customerPhone is string && data.customerPhone.size() <= 50)) &&
+             (!('description' in data) || (data.description is string && data.description.size() <= 5000)) &&
+             (!('category' in data) || (data.category is string && data.category.size() <= 128)) &&
+             (!('slaStatus' in data) || (data.slaStatus in ['healthy', 'warning', 'at_risk', 'breached'])) &&
+             (!('assignedAgentId' in data) || (data.assignedAgentId is string && data.assignedAgentId.size() <= 128)) &&
+             (!('assignedAgent' in data) || (data.assignedAgent is string && data.assignedAgent.size() <= 128)) &&
+             (!('assignedAgentName' in data) || (data.assignedAgentName is string && data.assignedAgentName.size() <= 255)) &&
+             (!('firstResponseDueAt' in data) || (data.firstResponseDueAt is string && data.firstResponseDueAt.size() <= 64)) &&
+             (!('resolutionDueAt' in data) || (data.resolutionDueAt is string && data.resolutionDueAt.size() <= 64)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+             (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidConversation(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'customerId', 'channel', 'status']) &&
+             data.keys().hasOnly([
+               'id', 'organizationId', 'customerId', 'channel',
+               'customerName', 'customerPhone', 'customerTier', 'status',
+               'priority', 'assignedAgentId', 'subject', 'sentiment',
+               'intent', 'slaDueAt', 'lastMessage', 'latestMessageSnippet',
+               'unreadCount', 'lastMessageAt', 'lastUpdated', 'timestamp',
+               'createdAt', 'updatedAt'
+             ]) &&
+             isValidId(data.id) &&
+             isValidId(data.organizationId) &&
+             isValidId(data.customerId) &&
+             data.channel in ['whatsapp', 'webchat', 'voice', 'email', 'messenger', 'instagram', 'sms'] &&
+             data.status in ['queued', 'open', 'pending', 'resolved', 'closed'] &&
+             (!('customerName' in data) || (data.customerName is string && data.customerName.size() <= 255)) &&
+             (!('customerPhone' in data) || (data.customerPhone is string && data.customerPhone.size() <= 50)) &&
+             (!('customerTier' in data) || (data.customerTier in ['standard', 'priority', 'vip'])) &&
+             (!('priority' in data) || (data.priority in ['low', 'medium', 'high', 'urgent'])) &&
+             (!('assignedAgentId' in data) || (data.assignedAgentId is string && data.assignedAgentId.size() <= 128)) &&
+             (!('subject' in data) || (data.subject is string && data.subject.size() <= 500)) &&
+             (!('sentiment' in data) || (data.sentiment in ['positive', 'neutral', 'negative'])) &&
+             (!('intent' in data) || (data.intent is string && data.intent.size() <= 128)) &&
+             (!('slaDueAt' in data) || (data.slaDueAt is string && data.slaDueAt.size() <= 64)) &&
+             (!('lastMessage' in data) || (data.lastMessage is string && data.lastMessage.size() <= 4000)) &&
+             (!('latestMessageSnippet' in data) || (data.latestMessageSnippet is string && data.latestMessageSnippet.size() <= 4000)) &&
+             (!('unreadCount' in data) || (data.unreadCount is number && data.unreadCount >= 0)) &&
+             (!('lastMessageAt' in data) || (data.lastMessageAt is string && data.lastMessageAt.size() <= 64)) &&
+             (!('lastUpdated' in data) || (data.lastUpdated is string && data.lastUpdated.size() <= 64)) &&
+             (!('timestamp' in data) || (data.timestamp is string && data.timestamp.size() <= 64)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+             (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidAuditEvent(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'action', 'entityType', 'entityId', 'createdAt']) &&
+             data.keys().hasOnly([
+               'id', 'organizationId', 'actorId', 'actorType',
+               'action', 'entityType', 'entityId',
+               'prevHash', 'integrityHash', 'createdAt'
+             ]) &&
+             isValidId(data.id) &&
+             isValidId(data.organizationId) &&
+             data.action is string && data.action.size() >= 1 && data.action.size() <= 128 &&
+             data.entityType is string && data.entityType.size() >= 1 && data.entityType.size() <= 128 &&
+             data.entityId is string && data.entityId.size() >= 1 && data.entityId.size() <= 128 &&
+             data.createdAt is string && data.createdAt.size() >= 1 && data.createdAt.size() <= 64 &&
+             (!('actorId' in data) || (data.actorId is string && data.actorId.size() >= 1 && data.actorId.size() <= 128)) &&
+             (!('actorType' in data) || (data.actorType in ['user', 'agent', 'ai', 'system'])) &&
+             (!('prevHash' in data) || (data.prevHash is string && data.prevHash.size() == 64)) &&
+             (!('integrityHash' in data) || (data.integrityHash is string && data.integrityHash.size() == 64));
+    }
+
+    // 3. Collection Rules
+    match /users/{userId} {
+      // PII & Tenant Isolation: Only profile owner or an Admin of the SAME organization can read user profile
+      allow get: if isSignedIn() && isValidId(userId) && (
+        isOwner(userId) ||
+        (resource != null && isSameOrgAdmin(existing().organizationId))
+      );
+      allow list: if isSignedIn() && (
+        existing().uid == request.auth.uid ||
+        isSameOrgAdmin(existing().organizationId)
+      );
+
+      // AUDIT-3B-04 Remediation — Prevent Unverified Tenant Claiming on Registration:
+      // A user profile can ONLY be created via one of three strictly verified paths:
+      //   1. Isolated Self-Registration: Uninvited user starts in isolated namespace ('org-isolated-' + request.auth.uid) as 'Agent'.
+      //   2. Atomic Invitation Consumption: Invited user joins existing organization by atomically consuming a valid, unexpired, pending /invitations/{inviteId}.
+      //   3. Designated First-Owner Bootstrap: Verified Bootstrapped Admin initializes ONLY the designated primary org ('org-madar-001').
+      allow create: if isVerifiedUser() && isValidId(userId) && isOwner(userId) && isValidUserProfile(incoming()) &&
+                    incoming().uid == request.auth.uid &&
+                    incoming().uid == userId &&
+                    incoming().email == request.auth.token.email && (
+                      (!('inviteId' in incoming()) && isIsolatedPersonalOrg(incoming().organizationId) && incoming().role == 'Agent') ||
+                      hasValidAtomicInvitationConsumption(userId, incoming()) ||
+                      (!('inviteId' in incoming()) && isBootstrappedAdmin() && isDesignatedBootstrapOrg(incoming().organizationId) && incoming().role in ['Owner', 'Admin'])
+                    );
+
+      // Action-Based Update + Anti-Cross-Tenant Admin Pivot (FINDING-4.4B.2.1-01 & AUDIT-3B-04):
+      // 1. uid, organizationId, email, inviteId, and createdAt are strictly IMMUTABLE on update for ALL actors (including Admins).
+      // 2. Target user MUST belong to the caller's organization (isSameOrg).
+      // 3. Self-update cannot modify role or teamName.
+      // 4. Same-org Admin can update member profile fields/role within the same organization, but cannot self-escalate own role or pivot organizationId.
+      allow update: if isVerifiedUser() && isValidId(userId) && isValidUserProfile(incoming()) &&
+                    isSameOrg(existing().organizationId) &&
+                    incoming().uid == userId &&
+                    incoming().uid == existing().uid &&
+                    incoming().organizationId == existing().organizationId &&
+                    incoming().email == existing().email &&
+                    (!('inviteId' in existing()) ? !('inviteId' in incoming()) : ('inviteId' in incoming() && incoming().inviteId == existing().inviteId)) &&
+                    (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt) && (
+                      (
+                        isOwner(userId) &&
+                        incoming().role == existing().role &&
+                        incoming().diff(existing()).affectedKeys().hasOnly([
+                          'fullName', 'displayName', 'phoneNumber', 'status', 'skills', 'updatedAt'
+                        ])
+                      ) ||
+                      (
+                        isSameOrgAdmin(existing().organizationId) &&
+                        (!isOwner(userId) || incoming().role == existing().role) &&
+                        (incoming().role != 'Owner' || currentUserData().role == 'Owner' || (isBootstrappedAdmin() && isDesignatedBootstrapOrg(existing().organizationId))) &&
+                        incoming().diff(existing()).affectedKeys().hasOnly([
+                          'fullName', 'displayName', 'phoneNumber', 'role', 'teamName', 'status', 'skills', 'updatedAt'
+                        ])
+                      )
+                    );
+
+      // Same-org Admin can delete a member profile in the same organization, but NEVER their own profile (prevents delete + re-create tenant pivot)
+      allow delete: if isVerifiedUser() && isValidId(userId) &&
+                    !isOwner(userId) &&
+                    isSameOrgAdmin(existing().organizationId);
+    }
+
+    match /invitations/{inviteId} {
+      // Only a Same-Org Admin or the exact invited user (matching UID + verified email) can read an invitation
+      allow get, list: if isSignedIn() && (
+        isSameOrgAdmin(existing().organizationId) ||
+        (isVerifiedUser() && existing().invitedUid == request.auth.uid && existing().invitedEmail == request.auth.token.email)
+      );
+
+      // Only a verified Same-Org Admin can issue a pending, future-expiring invitation for their own organization
+      allow create: if isVerifiedUser() && isValidId(inviteId) && isValidInvitation(incoming()) &&
+                    incoming().id == inviteId &&
+                    isSameOrgAdmin(incoming().organizationId) &&
+                    incoming().invitedByUid == request.auth.uid &&
+                    incoming().invitedUid != request.auth.uid &&
+                    incoming().status == 'pending' &&
+                    !('consumedByUid' in incoming()) &&
+                    incoming().expiresAt > request.time.toMillis();
+
+      // Strict State Machine on Update:
+      //   Transition A (pending -> accepted): Only by the invited user atomically creating their /users/{uid} profile in the same batch/transaction.
+      //   Transition B (pending -> revoked): Only by a Same-Org Admin revoking an unconsumed invitation.
+      allow update: if isVerifiedUser() && isValidId(inviteId) && isValidInvitation(incoming()) &&
+                    existing().status == 'pending' &&
+                    incoming().id == existing().id &&
+                    incoming().organizationId == existing().organizationId &&
+                    incoming().invitedUid == existing().invitedUid &&
+                    incoming().invitedEmail == existing().invitedEmail &&
+                    incoming().role == existing().role &&
+                    incoming().invitedByUid == existing().invitedByUid &&
+                    incoming().expiresAt == existing().expiresAt &&
+                    incoming().createdAt == existing().createdAt && (
+                      (
+                        existing().invitedUid == request.auth.uid &&
+                        existing().invitedEmail == request.auth.token.email &&
+                        existing().expiresAt > request.time.toMillis() &&
+                        incoming().status == 'accepted' &&
+                        incoming().consumedByUid == request.auth.uid &&
+                        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                        existsAfter(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                        getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.organizationId == existing().organizationId &&
+                        getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.inviteId == inviteId &&
+                        getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == existing().role &&
+                        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'consumedByUid', 'consumedAt', 'updatedAt'])
+                      ) ||
+                      (
+                        isSameOrgAdmin(existing().organizationId) &&
+                        incoming().status == 'revoked' &&
+                        !('consumedByUid' in incoming()) &&
+                        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+                      )
+                    );
+
+      // Invitations are immutable security records and can never be deleted
+      allow delete: if false;
+    }
+
+    match /customers/{customerId} {
+      allow get: if isSignedIn() && isValidId(customerId) && isSameOrg(existing().organizationId);
+      allow list: if isSignedIn() && isSameOrg(existing().organizationId);
+
+      allow create: if isVerifiedUser() && isValidId(customerId) && isValidCustomer(incoming()) &&
+                    incoming().id == customerId &&
+                    isSameOrg(incoming().organizationId);
+
+      allow update: if isVerifiedUser() && isValidId(customerId) && isValidCustomer(incoming()) &&
+                    isSameOrg(existing().organizationId) &&
+                    incoming().id == existing().id &&
+                    incoming().organizationId == existing().organizationId &&
+                    (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt) &&
+                    incoming().diff(existing()).affectedKeys().hasOnly([
+                      'name', 'email', 'phone', 'customerTier', 'lifetimeValue',
+                      'tags', 'assignedAgentId', 'assignedAgentName', 'updatedAt'
+                    ]);
+
+      allow delete: if isVerifiedUser() && isValidId(customerId) && isSameOrgAdmin(existing().organizationId);
+    }
+
+    match /tickets/{ticketId} {
+      allow get: if isSignedIn() && isValidId(ticketId) && isSameOrg(existing().organizationId);
+      allow list: if isSignedIn() && isSameOrg(existing().organizationId);
+
+      allow create: if isVerifiedUser() && isValidId(ticketId) && isValidTicket(incoming()) &&
+                    incoming().id == ticketId &&
+                    isSameOrg(incoming().organizationId);
+
+      // Terminal State Locking + Action-Based Update: Closed tickets can only be modified by Same-Org Supervisor/Admin
+      allow update: if isVerifiedUser() && isValidId(ticketId) && isValidTicket(incoming()) &&
+                    isSameOrg(existing().organizationId) &&
+                    incoming().id == existing().id &&
+                    incoming().organizationId == existing().organizationId &&
+                    incoming().customerId == existing().customerId &&
+                    (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt) &&
+                    (existing().status != 'closed' || isSameOrgSupervisorOrAbove(existing().organizationId)) &&
+                    incoming().diff(existing()).affectedKeys().hasOnly([
+                      'ticketNumber', 'customerName', 'customerPhone', 'title', 'description',
+                      'category', 'priority', 'status', 'slaStatus', 'assignedAgentId',
+                      'assignedAgent', 'assignedAgentName', 'firstResponseDueAt', 'resolutionDueAt', 'updatedAt'
+                    ]);
+
+      allow delete: if isVerifiedUser() && isValidId(ticketId) && isSameOrgAdmin(existing().organizationId);
+    }
+
+    match /conversations/{conversationId} {
+      allow get: if isSignedIn() && isValidId(conversationId) && isSameOrg(existing().organizationId);
+      allow list: if isSignedIn() && isSameOrg(existing().organizationId);
+
+      allow create: if isVerifiedUser() && isValidId(conversationId) && isValidConversation(incoming()) &&
+                    incoming().id == conversationId &&
+                    isSameOrg(incoming().organizationId);
+
+      allow update: if isVerifiedUser() && isValidId(conversationId) && isValidConversation(incoming()) &&
+                    isSameOrg(existing().organizationId) &&
+                    incoming().id == existing().id &&
+                    incoming().organizationId == existing().organizationId &&
+                    incoming().customerId == existing().customerId &&
+                    (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt) &&
+                    (existing().status != 'closed' || isSameOrgSupervisorOrAbove(existing().organizationId)) &&
+                    incoming().diff(existing()).affectedKeys().hasOnly([
+                      'channel', 'customerName', 'customerPhone', 'customerTier', 'status',
+                      'priority', 'assignedAgentId', 'subject', 'sentiment', 'intent',
+                      'slaDueAt', 'lastMessage', 'latestMessageSnippet', 'unreadCount',
+                      'lastMessageAt', 'lastUpdated', 'timestamp', 'updatedAt'
+                    ]);
+
+      allow delete: if isVerifiedUser() && isValidId(conversationId) && isSameOrgSupervisorOrAbove(existing().organizationId);
+    }
+
+    match /audit_logs/{auditId} {
+      allow get, list: if isSignedIn() && isSameOrgAdmin(existing().organizationId);
+      allow create: if isVerifiedUser() && isValidId(auditId) && isValidAuditEvent(incoming()) &&
+                    incoming().id == auditId &&
+                    isSameOrg(incoming().organizationId);
+      allow update, delete: if false;
+    }
+
+    match /audit_events/{eventId} {
+      allow get, list: if isSignedIn() && isSameOrgAdmin(existing().organizationId);
+      allow create: if isVerifiedUser() && isValidId(eventId) && isValidAuditEvent(incoming()) &&
+                    incoming().id == eventId &&
+                    isSameOrg(incoming().organizationId);
+      allow update, delete: if false;
+    }
+  }
+}

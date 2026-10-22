@@ -1,8 +1,14 @@
 node_modules/
 build/
 dist/
+dev-dist/
 coverage/
+data/
+*.lock
+bun.lock
 .DS_Store
 *.log
 .env*
 !.env.example
+.aistudio/
+

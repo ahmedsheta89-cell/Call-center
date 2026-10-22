@@ -62,7 +62,7 @@ export function initializeSeedData() {
     skills: string[];
     status: 'online' | 'busy' | 'break' | 'offline';
   }> = [
-    { id: 'usr-admin-01', email: 'director@madar.com', fullName: 'سلطان القحطاني', role: 'Owner', skills: ['Leadership', 'All'], status: 'online' },
+    { id: 'usr-admin-01', email: 'ahmedsheta89@gmail.com', fullName: 'م. أحمد شتا (Admin)', role: 'Admin', skills: ['Leadership', 'All', 'Security', 'Telecom'], status: 'online' },
     { id: 'usr-sup-01', email: 'supervisor@madar.com', fullName: 'منى الشمري', role: 'Supervisor', skills: ['Escalations', 'QA', 'Supervision'], status: 'online' },
     { id: 'usr-qa-01', email: 'qa.lead@madar.com', fullName: 'خالد العتيبي', role: 'QA', skills: ['Compliance', 'Auditing'], status: 'online' },
     { id: 'usr-analyst-01', email: 'analyst@madar.com', fullName: 'ريم الزهراني', role: 'Analyst', skills: ['BI', 'Reporting'], status: 'online' },
@@ -88,7 +88,7 @@ export function initializeSeedData() {
       fullName: u.fullName,
       role: u.role,
       avatarUrl: `https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80`,
-      phoneNumber: '+9665000000' + u.id.slice(-2),
+      phoneNumber: u.id === 'usr-admin-01' ? '01018108979' : '+9665000000' + u.id.slice(-2),
       isActive: true,
       mfaEnabled: true,
       createdAt: new Date(Date.now() - 60 * 86400000).toISOString(),
@@ -518,7 +518,32 @@ export function initializeSeedData() {
   // 13. Ensure Special Customer for 01018108979
   ensureEgyptSpecialCustomer();
 
+  // 14. Ensure Dedicated Admin Profile with phone 01018108979
+  ensureAdminUser();
+
   console.log('[Seed] Enterprise demo dataset seeded successfully with full multi-tenant records.');
+}
+
+/**
+ * Ensures the existence and attributes of the Administrator user (01018108979)
+ */
+export function ensureAdminUser(): User {
+  const adminId: UUID = 'usr-admin-01';
+  const adminUser: User = {
+    id: adminId,
+    organizationId: DEMO_ORG_ID,
+    email: 'ahmedsheta89@gmail.com',
+    fullName: 'م. أحمد شتا (Admin)',
+    role: 'Admin',
+    avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
+    phoneNumber: '01018108979',
+    isActive: true,
+    mfaEnabled: true,
+    createdAt: new Date(Date.now() - 60 * 86400000).toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  db.users.set(adminId, adminUser);
+  return adminUser;
 }
 
 /**

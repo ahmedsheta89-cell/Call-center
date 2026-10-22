@@ -22,11 +22,44 @@ async function runTests() {
     }
   }
 
+  let sessionToken = '';
+  const origFetch = globalThis.fetch;
+  const fetch = async (url: string, init?: RequestInit): Promise<Response> => {
+    if (sessionToken && url.startsWith(baseUrl)) {
+      const headers = new Headers(init?.headers || {});
+      if (!headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${sessionToken}`);
+      }
+      return origFetch(url, { ...init, headers });
+    }
+    return origFetch(url, init);
+  };
+
   // 1. Health check
   await test('GET /api/health', async () => {
-    const res = await fetch(healthUrl);
+    const res = await origFetch(healthUrl);
     const data = await res.json();
     if (data.status !== 'healthy') throw new Error(`Unexpected status: ${data.status}`);
+  });
+
+  // 1b. Unauthenticated request rejection (Phase 4 Identity Trust Gate)
+  await test('Unauthenticated GET /api/v1/auth/me rejected (HTTP 401)', async () => {
+    const res = await origFetch(`${baseUrl}/auth/me`);
+    if (res.status !== 401) throw new Error(`Expected 401 for unauthenticated request, got ${res.status}`);
+  });
+
+  // 1c. Authenticate session via POST /api/v1/auth/login
+  await test('POST /api/v1/auth/login issues signed HMAC-SHA256 session token', async () => {
+    const res = await origFetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 'usr-admin-01' }),
+    });
+    const data = await res.json();
+    if (res.status !== 200 || !data.success || !data.data?.token) {
+      throw new Error('Failed to issue signed session token');
+    }
+    sessionToken = data.data.token;
   });
 
   // 2. Auth / Identity
@@ -43,7 +76,10 @@ async function runTests() {
       body: JSON.stringify({ role: 'Supervisor' }),
     });
     const data = await res.json();
-    if (!data.success || data.data.currentActor.role !== 'Supervisor') throw new Error('Role switch failed');
+    if (!data.success || data.data.currentActor.role !== 'Supervisor' || !data.data.token) {
+      throw new Error('Role switch failed');
+    }
+    sessionToken = data.data.token;
   });
 
   // 3. Agents & Teams
@@ -337,6 +373,54 @@ async function runTests() {
     const res = await fetch(`${baseUrl}/audit/logs`);
     const data = await res.json();
     if (!data.success || !Array.isArray(data.data) || data.data.length === 0) throw new Error('Failed audit logs');
+  });
+
+  // 17. Restore Admin Role after RBAC tests
+  await test('POST /api/v1/auth/switch-role back to Admin', async () => {
+    const res = await fetch(`${baseUrl}/auth/switch-role`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'Admin' }),
+    });
+    const data = await res.json();
+    if (!data.success || data.data.currentActor.role !== 'Admin') throw new Error('Failed to restore Admin role');
+  });
+
+  // 18. Phase 4.4B.3H Legacy User Route Closure (GET /api/users & POST /api/users/sync -> 410 Gone)
+  await test('Legacy GET /api/users & POST /api/users/sync return 410 Gone across all auth states', async () => {
+    const rootUrl = 'http://127.0.0.1:3000';
+    const probes: Array<{ name: string; headers: Record<string, string> }> = [
+      { name: 'unauthenticated', headers: { Accept: 'text/html,application/json' } },
+      { name: 'invalid-token', headers: { Authorization: 'Bearer invalid.jwt.token', Accept: 'text/html,application/json' } },
+      { name: 'authenticated-admin', headers: { Authorization: `Bearer ${sessionToken}`, Accept: 'text/html,application/json' } },
+    ];
+    for (const p of probes) {
+      const getRes = await origFetch(`${rootUrl}/api/users`, { headers: p.headers });
+      const getBody = await getRes.json();
+      if (getRes.status !== 410 || getBody.error?.code !== 'LEGACY_ROUTE_GONE' || 'data' in getBody) {
+        throw new Error(`GET /api/users (${p.name}) expected 410 LEGACY_ROUTE_GONE, got ${getRes.status}`);
+      }
+      const postRes = await origFetch(`${rootUrl}/api/users/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...p.headers },
+        body: JSON.stringify({ uid: 'probe-uid', email: 'probe@example.com' }),
+      });
+      const postBody = await postRes.json();
+      if (postRes.status !== 410 || postBody.error?.code !== 'LEGACY_ROUTE_GONE' || 'data' in postBody) {
+        throw new Error(`POST /api/users/sync (${p.name}) expected 410 LEGACY_ROUTE_GONE, got ${postRes.status}`);
+      }
+    }
+  });
+
+  // 19. Phase 4.4B.3H Unknown /api/* Route 404 JSON Isolation (Blocks SPA HTML Fallback)
+  await test('Unknown /api/* routes return 404 API_ROUTE_NOT_FOUND JSON instead of SPA HTML', async () => {
+    const res = await origFetch('http://127.0.0.1:3000/api/unknown-legacy-route', {
+      headers: { Accept: 'text/html,application/xhtml+xml' },
+    });
+    const body = await res.json();
+    if (res.status !== 404 || body.error?.code !== 'API_ROUTE_NOT_FOUND') {
+      throw new Error(`Expected 404 API_ROUTE_NOT_FOUND, got ${res.status}`);
+    }
   });
 
   console.log('----------------------------------------------------');

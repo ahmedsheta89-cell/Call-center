@@ -66,16 +66,16 @@ export const ChannelIntegrationsView: React.FC = () => {
 
   // Send Template Modal State
   const [selectedTemplate, setSelectedTemplate] = useState<WhatsAppTemplate | null>(null);
-  const [recipientPhone, setRecipientPhone] = useState('+966500123456');
-  const [templateParams, setTemplateParams] = useState<string[]>(['أحمد الشهري', 'ORD-9820', 'قيد التوصيل']);
+  const [recipientPhone, setRecipientPhone] = useState('+201018108979');
+  const [templateParams, setTemplateParams] = useState<string[]>(['م. أحمد شتا (Admin)', 'ORD-2026', 'مفعل بنجاح']);
   const [sendingTemplate, setSendingTemplate] = useState(false);
   const [sendSuccess, setSendSuccess] = useState<string | null>(null);
 
   // Inbound Webhook Simulator State
   const [simChannel, setSimChannel] = useState<'whatsapp' | 'webchat' | 'voice'>('whatsapp');
-  const [simSenderName, setSimSenderName] = useState('فيصل العتيبي');
-  const [simSenderPhone, setSimSenderPhone] = useState('+966551122334');
-  const [simMessageText, setSimMessageText] = useState('السلام عليكم، واجهت مشكلة في تجديد الاشتراك وخصم المبلغ مرتين');
+  const [simSenderName, setSimSenderName] = useState('م. أحمد شتا (Admin)');
+  const [simSenderPhone, setSimSenderPhone] = useState('+201018108979');
+  const [simMessageText, setSimMessageText] = useState('السلام عليكم، أود اختبار رسائل الواتساب مع رقم الأدمن 01018108979');
   const [simulating, setSimulating] = useState(false);
   const [simResult, setSimResult] = useState<any | null>(null);
 
@@ -612,10 +612,32 @@ export const ChannelIntegrationsView: React.FC = () => {
             </div>
 
             <form onSubmit={handleSaveConfig} className="space-y-3.5">
-              <p className="text-xs text-slate-400 leading-relaxed">
-                قم بتحديث معرّفات المزود ومفاتيح الـ Webhook ورموز الـ API الخاصة بهذه القناة. يتم التحقق والتخزين المشفر
-                مباشرة على الخادم.
-              </p>
+              <div className="p-3 rounded-2xl bg-indigo-950/40 border border-indigo-500/30 text-xs space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-indigo-300">رقم مدير النظام المعتمد للاختبارات الحية:</span>
+                  <span className="font-mono bg-indigo-500/20 text-indigo-200 px-2 py-0.5 rounded text-[11px] font-bold">
+                    01018108979 (+201018108979)
+                  </span>
+                </div>
+                {configChannel.type === 'whatsapp' && (
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    💡 <strong>طريقة التفعيل الحقيقي لـ Meta WhatsApp Cloud API:</strong>
+                    <br />
+                    1. سجّل الدخول إلى <strong>developers.facebook.com</strong> وأنشئ تطبيقا تجارياً من نوع WhatsApp.
+                    <br />
+                    2. انسخ <strong>Phone Number ID</strong> و <strong>Access Token</strong> والصقهما بالأسفل.
+                    <br />
+                    3. ضع رابط الـ Webhook: <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">/api/v1/integrations/whatsapp/webhook</code> مع رمز التحقق: <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">madar_verify_token_2026</code>.
+                  </p>
+                )}
+                {configChannel.type === 'voice' && (
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    💡 <strong>للاتصال الصوتي الحقيقي (PSTN / رنين على الهواتف):</strong>
+                    <br />
+                    يمكن إدخال بيانات <strong>Twilio Account SID</strong> و <strong>Auth Token</strong> و <strong>Twilio Phone Number</strong>، ليقوم السنترال السحابي بإجراء رنين واتصال هاتفي مباشر برقمك 01018108979.
+                  </p>
+                )}
+              </div>
 
               <div className="space-y-3 max-h-[50vh] overflow-y-auto px-1 py-1">
                 {Object.keys(configForm).map((fieldKey) => (

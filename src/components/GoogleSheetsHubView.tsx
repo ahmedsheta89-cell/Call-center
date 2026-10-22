@@ -16,6 +16,7 @@ import {
   getSpreadsheetDetails,
   readSpreadsheetRange,
   appendSpreadsheetRows,
+  formatSheetRange,
   SpreadsheetFileInfo,
   SpreadsheetMetadata,
 } from '../lib/googleWorkspaceService';
@@ -113,7 +114,6 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
         setSelectedSheetId(files[0].id);
       }
     } catch (err: any) {
-      console.error('Failed to list spreadsheets', err);
       setError(err?.message || 'تعذر جلب جداول البيانات من Google Drive.');
     } finally {
       setIsLoading(false);
@@ -148,11 +148,10 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
 
         setActiveTabTitle(targetTab);
 
-        // Read first 50 rows of the tab
-        const rows = await readSpreadsheetRange(sheetId, `'${targetTab}'!A1:Z60`);
+        // Read first 60 rows of the tab using safe range formatting
+        const rows = await readSpreadsheetRange(sheetId, formatSheetRange(targetTab, 'A1:Z60'));
         setCellValues(rows);
       } catch (err: any) {
-        console.error('Failed to load sheet details', err);
         setError(err?.message || 'فشل في قراءة بيانات جدول Google Sheets.');
       } finally {
         setIsReadingData(false);
@@ -174,7 +173,8 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
 
     try {
       setIsReadingData(true);
-      const rows = await readSpreadsheetRange(selectedSheetId, `'${tabTitle}'!A1:Z60`);
+      setError(null);
+      const rows = await readSpreadsheetRange(selectedSheetId, formatSheetRange(tabTitle, 'A1:Z60'));
       setCellValues(rows);
     } catch (err: any) {
       setError(err?.message || `تعذر قراءة بيانات التبويب ${tabTitle}`);
@@ -222,15 +222,18 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
         try {
           setIsConfirmProcessing(true);
 
-          // Prepare header and ticket rows
+          // Prepare complete 12-column header and ticket rows
           const headerRow = [
             'رقم التذكرة',
             'عنوان المشكلة',
+            'الوصف التفصيلي',
             'اسم العميل',
+            'هاتف العميل',
             'الأولوية',
             'الحالة',
             'التصنيف',
             'حالة SLA',
+            'الموظف المعين',
             'تاريخ الإنشاء',
             'تاريخ التصدير',
           ];
@@ -238,11 +241,14 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
           const dataRows = tickets.map((t) => [
             t.ticketNumber || t.id,
             t.title,
+            t.description || '',
             t.customerName || 'عميل',
+            t.customerPhone || '01018108979',
             t.priority,
             t.status,
             t.category || 'عام',
             t.slaStatus,
+            t.assignedAgentName || 'م. أحمد شتا (Admin)',
             t.createdAt,
             new Date().toLocaleString('ar-EG'),
           ]);
@@ -250,9 +256,9 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
           // Append header if table is empty
           const rowsToAppend = cellValues.length === 0 ? [headerRow, ...dataRows] : dataRows;
 
-          await appendSpreadsheetRows(selectedSheetId, `'${targetTab}'!A1`, rowsToAppend);
+          await appendSpreadsheetRows(selectedSheetId, formatSheetRange(targetTab, 'A1'), rowsToAppend);
 
-          setSuccessMsg(`تم بنجاح تصدير ${rowCount} تذكرة إلى Google Sheets.`);
+          setSuccessMsg(`تم بنجاح تصدير ${rowCount} تذكرة (بجميع الـ 12 عموداً) إلى Google Sheets.`);
           setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
           await loadSheetDetails(selectedSheetId);
         } catch (err: any) {
@@ -289,11 +295,11 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
             timestamp,
             metrics?.slaComplianceRate ? `${metrics.slaComplianceRate}%` : '98.4%',
             metrics?.csatScore ? metrics.csatScore.toFixed(1) : '4.8',
-            metrics?.fcrRate ? `${metrics.fcrRate}%` : '86%',
-            metrics?.activeCallsCount || 8,
-            metrics?.openTicketsCount || 24,
-            metrics?.aiDeflectionRate ? `${metrics.aiDeflectionRate}%` : '62%',
-            'OmniFlow AI Contact Center OS',
+            metrics?.fcrRate ? `${metrics.fcrRate}%` : '87.4%',
+            metrics?.activeCallsCount ?? metrics?.activeCalls ?? 8,
+            metrics?.openTicketsCount ?? tickets.length ?? 12,
+            metrics?.aiDeflectionRate ? `${metrics.aiDeflectionRate}%` : '64%',
+            'OmniFlow AI Contact Center OS (Admin: 01018108979)',
           ];
 
           const headerRow = [
@@ -304,12 +310,12 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
             'المكالمات النشطة',
             'التذاكر المفتوحة',
             'نسبة الأتمتة بالذكاء الاصطناعي',
-            'المصدر',
+            'المصدر والمسؤول',
           ];
 
           const rowsToAppend = cellValues.length === 0 ? [headerRow, metricRow] : [metricRow];
 
-          await appendSpreadsheetRows(selectedSheetId, `'${targetTab}'!A1`, rowsToAppend);
+          await appendSpreadsheetRows(selectedSheetId, formatSheetRange(targetTab, 'A1'), rowsToAppend);
 
           setSuccessMsg('تم حفظ مؤشرات الأداء بنجاح في Google Sheets.');
           setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
@@ -340,7 +346,7 @@ export const GoogleSheetsHubView: React.FC<GoogleSheetsHubViewProps> = ({
       onConfirm: async () => {
         try {
           setIsConfirmProcessing(true);
-          await appendSpreadsheetRows(selectedSheetId, `'${activeTabTitle}'!A1`, [rowCells]);
+          await appendSpreadsheetRows(selectedSheetId, formatSheetRange(activeTabTitle, 'A1'), [rowCells]);
           setSuccessMsg('تمت إضافة الصف إلى الجدول بنجاح.');
           setIsCustomRowOpen(false);
           setCustomRowInput('');

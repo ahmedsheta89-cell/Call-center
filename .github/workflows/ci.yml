@@ -1,0 +1,71 @@
+name: Enterprise CI, Security Gate & Firestore Rules Verification Pipeline
+
+on:
+  push:
+    branches: [main, master, 'fix/**']
+  pull_request:
+    branches: [main, master, 'fix/**']
+
+permissions:
+  contents: read
+
+jobs:
+  verify-build-and-audit:
+    name: TypeScript Lint, Production Build, Static Firestore AST & E2E Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 Runtime (Temurin — Required by Firebase Firestore Emulator v1.22+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Verify Java 21 Runtime Selection
+        run: |
+          which java
+          java -version
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies (Lockfile-Free Workspace Strategy)
+        run: npm install --no-audit --no-fund
+
+      - name: TypeScript Strict Typecheck (Zero Errors)
+        run: npm run lint
+
+      - name: Build Production Frontend & Backend Bundle
+        run: npm run build
+
+      - name: Run Firestore Rules AST, Red Team & Real JVM Emulator Suite (@firebase/rules-unit-testing)
+        run: npm run test:firestore
+
+      - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
+        run: npm run test:audit
+
+      - name: Run 35-Test End-to-End Operations Suite Against Managed Local Server
+        run: |
+          PORT=3000 NODE_ENV=development npx tsx server.ts > /tmp/ci-omniflow-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "Server failed to become healthy on port 3000 within 30s:"
+            cat /tmp/ci-omniflow-server.log || true
+            exit 1
+          fi
+          npx tsx scripts/test_all_operations.ts

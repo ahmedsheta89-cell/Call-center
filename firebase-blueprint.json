@@ -2,62 +2,184 @@
   "entities": {
     "User": {
       "title": "User",
-      "description": "User profile and agent authentication credentials",
+      "description": "User profile and agent authentication credentials with strict organization isolation and atomic invitation binding",
       "type": "object",
       "properties": {
-        "uid": { "type": "string" },
-        "email": { "type": "string" },
-        "displayName": { "type": "string" },
-        "role": { "type": "string", "enum": ["agent", "supervisor", "admin", "executive"] },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "minLength": 3, "maxLength": 255 },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "phoneNumber": { "type": "string", "minLength": 3, "maxLength": 50 },
+        "role": {
+          "type": "string",
+          "enum": ["Owner", "Admin", "Supervisor", "Team Leader", "Agent", "QA", "Analyst", "Read Only"]
+        },
+        "inviteId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "teamName": { "type": "string", "maxLength": 255 },
+        "status": { "type": "string", "enum": ["online", "busy", "break", "offline"] },
+        "skills": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
-      "required": ["uid", "email"]
+      "required": ["uid", "organizationId", "email", "role"]
+    },
+    "Invitation": {
+      "title": "Invitation",
+      "description": "Single-use, time-bounded organization membership invitation issued by a Same-Org Admin",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invitedUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invitedEmail": { "type": "string", "minLength": 3, "maxLength": 255 },
+        "role": {
+          "type": "string",
+          "enum": ["Admin", "Supervisor", "Team Leader", "Agent", "QA", "Analyst", "Read Only"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "revoked", "expired"]
+        },
+        "invitedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "expiresAt": { "type": "number" },
+        "consumedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "consumedAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "organizationId", "invitedUid", "invitedEmail", "role", "status", "invitedByUid", "expiresAt", "createdAt"]
+    },
+    "Customer": {
+      "title": "Customer",
+      "description": "Customer 360 CRM profile and lifetime value record scoped by organizationId",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "email": { "type": "string", "maxLength": 255 },
+        "phone": { "type": "string", "minLength": 3, "maxLength": 50 },
+        "customerTier": { "type": "string", "enum": ["standard", "priority", "vip"] },
+        "lifetimeValue": { "type": "number" },
+        "tags": { "type": "array" },
+        "assignedAgentId": { "type": "string", "maxLength": 128 },
+        "assignedAgentName": { "type": "string", "maxLength": 255 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "organizationId", "name", "phone", "customerTier"]
     },
     "Ticket": {
       "title": "Ticket",
-      "description": "Omnichannel support and service desk ticket",
+      "description": "Omnichannel support and service desk ticket scoped by organizationId",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "customerId": { "type": "string" },
-        "title": { "type": "string" },
-        "category": { "type": "string" },
-        "priority": { "type": "string" },
-        "status": { "type": "string" },
-        "assignedAgent": { "type": "string" },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ticketNumber": { "type": "number" },
+        "customerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "customerName": { "type": "string", "maxLength": 255 },
+        "customerPhone": { "type": "string", "maxLength": 50 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "description": { "type": "string", "maxLength": 5000 },
+        "category": { "type": "string", "maxLength": 128 },
+        "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"] },
+        "status": {
+          "type": "string",
+          "enum": ["new", "open", "in_progress", "pending", "pending_customer", "waiting_on_customer", "escalated", "resolved", "closed"]
+        },
+        "slaStatus": { "type": "string", "enum": ["healthy", "warning", "at_risk", "breached"] },
+        "assignedAgentId": { "type": "string", "maxLength": 128 },
+        "assignedAgent": { "type": "string", "maxLength": 128 },
+        "assignedAgentName": { "type": "string", "maxLength": 255 },
+        "firstResponseDueAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "resolutionDueAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
-      "required": ["id", "title", "status"]
+      "required": ["id", "organizationId", "customerId", "title", "status", "priority"]
     },
     "Conversation": {
       "title": "Conversation",
-      "description": "Omnichannel customer communication thread",
+      "description": "Omnichannel customer communication thread scoped by organizationId",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "channel": { "type": "string" },
-        "customerName": { "type": "string" },
-        "customerPhone": { "type": "string" },
-        "status": { "type": "string" },
-        "lastMessage": { "type": "string" },
-        "timestamp": { "type": "string", "format": "date-time" }
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "customerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "channel": {
+          "type": "string",
+          "enum": ["whatsapp", "webchat", "voice", "email", "messenger", "instagram", "sms"]
+        },
+        "customerName": { "type": "string", "maxLength": 255 },
+        "customerPhone": { "type": "string", "maxLength": 50 },
+        "customerTier": { "type": "string", "enum": ["standard", "priority", "vip"] },
+        "status": { "type": "string", "enum": ["queued", "open", "pending", "resolved", "closed"] },
+        "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"] },
+        "assignedAgentId": { "type": "string", "maxLength": 128 },
+        "subject": { "type": "string", "maxLength": 500 },
+        "sentiment": { "type": "string", "enum": ["positive", "neutral", "negative"] },
+        "intent": { "type": "string", "maxLength": 128 },
+        "slaDueAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "lastMessage": { "type": "string", "maxLength": 4000 },
+        "latestMessageSnippet": { "type": "string", "maxLength": 4000 },
+        "unreadCount": { "type": "number" },
+        "lastMessageAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "lastUpdated": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "timestamp": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
-      "required": ["id", "channel", "status"]
+      "required": ["id", "organizationId", "customerId", "channel", "status"]
+    },
+    "AuditEvent": {
+      "title": "AuditEvent",
+      "description": "Immutable security and operational audit log entry scoped by organizationId",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "actorType": { "type": "string", "enum": ["user", "agent", "ai", "system"] },
+        "action": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "entityType": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "entityId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "prevHash": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "integrityHash": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "organizationId", "action", "entityType", "entityId", "createdAt"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "User",
-      "description": "User profiles indexed by UID"
+      "description": "User profiles indexed by UID with mandatory organizationId and atomic invitation verification"
+    },
+    "/invitations/{inviteId}": {
+      "schema": "Invitation",
+      "description": "Single-use organization invitations with atomic consumption and expiration enforcement"
+    },
+    "/customers/{customerId}": {
+      "schema": "Customer",
+      "description": "Customer 360 CRM profiles isolated by organizationId"
     },
     "/tickets/{ticketId}": {
       "schema": "Ticket",
-      "description": "Operational support tickets"
+      "description": "Operational support tickets isolated by organizationId"
     },
     "/conversations/{conversationId}": {
       "schema": "Conversation",
-      "description": "Unified communications threads"
+      "description": "Unified communications threads isolated by organizationId"
+    },
+    "/audit_logs/{auditId}": {
+      "schema": "AuditEvent",
+      "description": "Immutable security audit trail (legacy/primary path)"
+    },
+    "/audit_events/{eventId}": {
+      "schema": "AuditEvent",
+      "description": "Immutable security audit trail (PostgreSQL-aligned path)"
     }
   }
 }

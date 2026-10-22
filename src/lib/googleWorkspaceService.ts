@@ -1,10 +1,105 @@
 /**
  * @file src/lib/googleWorkspaceService.ts
  * Real Integration Service for Google Gmail API and Google Sheets API
- * Direct client-side calls using OAuth Access Token with proper error handling.
+ * Uses client-obtained OAuth Access Token with server relay fallback and safe range encoding.
  */
 
 import { getAccessToken } from './googleWorkspaceAuth';
+
+/**
+ * Formats a sheet tab title and A1 cell range safely for Google Sheets API v4.
+ * Escapes internal single quotes and wraps in single quotes only when required.
+ */
+export function formatSheetRange(tabTitle: string, cellRange: string = 'A1:Z60'): string {
+  const cleanTab = (tabTitle || 'Sheet1').trim().replace(/^'+|'+$/g, '');
+  const escapedTab = cleanTab.replace(/'/g, "''");
+  const isSimpleAlphaNumeric = /^[A-Za-z0-9_]+$/.test(cleanTab);
+  const formattedTab = isSimpleAlphaNumeric ? cleanTab : `'${escapedTab}'`;
+  return cellRange ? `${formattedTab}!${cellRange}` : formattedTab;
+}
+
+/**
+ * Executes a Google Workspace API request using the user's OAuth Access Token.
+ * Routes via the same-origin `/api/v1/workspace/relay` endpoint (passing Bearer token)
+ * to prevent browser CORS / GFE URL-path rejections, with automatic direct-fetch fallback.
+ */
+async function workspaceApiFetch(
+  targetUrl: string,
+  options: { method?: 'GET' | 'POST' | 'PUT' | 'DELETE'; body?: any } = {}
+): Promise<{ ok: boolean; status: number; data: any }> {
+  const token = await getAccessToken();
+  if (!token) {
+    throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
+  }
+
+  const method = options.method || 'GET';
+
+  // 1. Primary path: same-origin server relay with X-Google-Access-Token (immune to browser CORS / GFE path drops)
+  try {
+    const relayRes = await fetch('/api/v1/workspace/relay', {
+      method: 'POST',
+      headers: {
+        'X-Google-Access-Token': token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        targetUrl,
+        method,
+        body: options.body,
+        googleAccessToken: token,
+      }),
+    });
+
+    if (relayRes.ok) {
+      const payload = await relayRes.json().catch(() => null);
+      if (payload && typeof payload.ok === 'boolean') {
+        return {
+          ok: payload.ok,
+          status: payload.status || 200,
+          data: payload.data || {},
+        };
+      }
+    }
+  } catch {
+    // Fall through to direct browser fetch if local relay is unreachable
+  }
+
+  // 2. Fallback path: direct browser fetch to Google APIs
+  try {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token}`,
+    };
+    if (options.body !== undefined && method !== 'GET') {
+      headers['Content-Type'] = 'application/json';
+    }
+
+    const directRes = await fetch(targetUrl, {
+      method,
+      headers,
+      body: options.body !== undefined && method !== 'GET' ? JSON.stringify(options.body) : undefined,
+    });
+
+    const data = await directRes.json().catch(() => ({}));
+    return {
+      ok: directRes.ok,
+      status: directRes.status,
+      data,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 503,
+      data: {
+        error: {
+          message:
+            err?.message && !String(err.message).includes('Failed to fetch')
+              ? err.message
+              : 'تعذر الاتصال بخدمة Google السحابية، يرجى التحقق من اتصال الإنترنت أو إعادة تسجيل الدخول بحساب Google.',
+        },
+      },
+    };
+  }
+}
 
 // ==========================================
 // GMAIL TYPES & SERVICES
@@ -61,7 +156,7 @@ function base64UrlDecode(str: string): string {
       bytes[i] = binary.charCodeAt(i);
     }
     return new TextDecoder().decode(bytes);
-  } catch (e) {
+  } catch {
     return str;
   }
 }
@@ -77,7 +172,6 @@ function extractBodyFromPayload(payload: any): string {
   }
 
   if (payload.parts && Array.isArray(payload.parts)) {
-    // Look for text/plain or text/html
     for (const part of payload.parts) {
       if (part.mimeType === 'text/plain' && part.body?.data) {
         return base64UrlDecode(part.body.data);
@@ -103,19 +197,11 @@ function extractBodyFromPayload(payload: any): string {
  * Fetch Gmail user profile
  */
 export async function getGmailProfile(): Promise<GmailProfile> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
-  const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
+  const res = await workspaceApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/profile');
   if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData?.error?.message || `فشل في جلب بيانات Gmail (${res.status})`);
+    throw new Error(res.data?.error?.message || `فشل في جلب بيانات Gmail (${res.status})`);
   }
-
-  return res.json();
+  return res.data;
 }
 
 /**
@@ -125,62 +211,55 @@ export async function listGmailMessages(
   query: string = 'label:INBOX',
   maxResults: number = 15
 ): Promise<GmailMessageSummary[]> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
   const listUrl = new URL('https://gmail.googleapis.com/gmail/v1/users/me/messages');
   if (query) listUrl.searchParams.set('q', query);
   listUrl.searchParams.set('maxResults', String(maxResults));
 
-  const listRes = await fetch(listUrl.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
+  const listRes = await workspaceApiFetch(listUrl.toString());
   if (!listRes.ok) {
-    const err = await listRes.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `خطأ في استرجاع رسائل Gmail (${listRes.status})`);
+    throw new Error(listRes.data?.error?.message || `خطأ في استرجاع رسائل Gmail (${listRes.status})`);
   }
 
-  const listData = await listRes.json();
+  const listData = listRes.data;
   if (!listData.messages || listData.messages.length === 0) {
     return [];
   }
 
-  // Fetch individual details in parallel (capped at 15 for responsiveness)
-  const detailPromises = listData.messages.slice(0, maxResults).map(async (msg: { id: string; threadId: string }) => {
-    try {
-      const detailRes = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (!detailRes.ok) return null;
-      const data = await detailRes.json();
+  const detailPromises = listData.messages
+    .slice(0, maxResults)
+    .map(async (msg: { id: string; threadId: string }) => {
+      try {
+        const detailRes = await workspaceApiFetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`
+        );
+        if (!detailRes.ok) return null;
+        const data = detailRes.data;
 
-      const headers = data.payload?.headers || [];
-      const getHeader = (name: string) =>
-        headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || '';
+        const headers = data.payload?.headers || [];
+        const getHeader = (name: string) =>
+          headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 
-      const labels = data.labelIds || [];
-      const isUnread = labels.includes('UNREAD');
-      const body = extractBodyFromPayload(data.payload);
+        const labels = data.labelIds || [];
+        const isUnread = labels.includes('UNREAD');
+        const body = extractBodyFromPayload(data.payload);
 
-      return {
-        id: data.id,
-        threadId: data.threadId,
-        snippet: data.snippet || '',
-        subject: getHeader('Subject') || '(بدون عنوان)',
-        from: getHeader('From') || 'مجهول',
-        to: getHeader('To') || '',
-        date: getHeader('Date') || new Date().toLocaleString(),
-        labels,
-        isUnread,
-        body: body || data.snippet || '',
-        internalDate: data.internalDate,
-      } as GmailMessageSummary;
-    } catch {
-      return null;
-    }
-  });
+        return {
+          id: data.id,
+          threadId: data.threadId,
+          snippet: data.snippet || '',
+          subject: getHeader('Subject') || '(بدون عنوان)',
+          from: getHeader('From') || 'مجهول',
+          to: getHeader('To') || '',
+          date: getHeader('Date') || new Date().toLocaleString(),
+          labels,
+          isUnread,
+          body: body || data.snippet || '',
+          internalDate: data.internalDate,
+        } as GmailMessageSummary;
+      } catch {
+        return null;
+      }
+    });
 
   const results = await Promise.all(detailPromises);
   return results.filter((r): r is GmailMessageSummary => r !== null);
@@ -195,10 +274,6 @@ export async function sendGmailMessage(params: {
   body: string;
   threadId?: string;
 }): Promise<{ id: string; threadId: string }> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
-  // Construct standard RFC 2822 email format
   const lines = [
     `To: ${params.to}`,
     `Subject: =?utf-8?B?${btoa(unescape(encodeURIComponent(params.subject)))}?=`,
@@ -220,38 +295,32 @@ export async function sendGmailMessage(params: {
     payload.threadId = params.threadId;
   }
 
-  const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
+  const res = await workspaceApiFetch(
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+    {
+      method: 'POST',
+      body: payload,
+    }
+  );
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `فشل إرسال البريد (${res.status})`);
+    throw new Error(res.data?.error?.message || `فشل إرسال البريد (${res.status})`);
   }
 
-  return res.json();
+  return res.data;
 }
 
 /**
  * Move message to trash in Gmail
  */
 export async function trashGmailMessage(messageId: string): Promise<boolean> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
-  const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/trash`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const res = await workspaceApiFetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/trash`,
+    { method: 'POST' }
+  );
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `فشل حذف الرسالة (${res.status})`);
+    throw new Error(res.data?.error?.message || `فشل حذف الرسالة (${res.status})`);
   }
 
   return true;
@@ -288,9 +357,6 @@ export interface SheetRangeValues {
  * List spreadsheets owned or accessible by user via Google Drive API
  */
 export async function listUserSpreadsheets(): Promise<SpreadsheetFileInfo[]> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
   const url = new URL('https://www.googleapis.com/drive/v3/files');
   url.searchParams.set(
     'q',
@@ -300,17 +366,13 @@ export async function listUserSpreadsheets(): Promise<SpreadsheetFileInfo[]> {
   url.searchParams.set('orderBy', 'modifiedTime desc');
   url.searchParams.set('pageSize', '20');
 
-  const res = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const res = await workspaceApiFetch(url.toString());
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `فشل استرجاع جداول البيانات (${res.status})`);
+    throw new Error(res.data?.error?.message || `فشل استرجاع جداول البيانات (${res.status})`);
   }
 
-  const data = await res.json();
-  return data.files || [];
+  return res.data?.files || [];
 }
 
 /**
@@ -319,16 +381,9 @@ export async function listUserSpreadsheets(): Promise<SpreadsheetFileInfo[]> {
 export async function createSpreadsheet(
   title: string = 'OmniFlow Contact Center Reports'
 ): Promise<{ spreadsheetId: string; spreadsheetUrl: string; title: string }> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
-  const res = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+  const res = await workspaceApiFetch('https://sheets.googleapis.com/v4/spreadsheets', {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
+    body: {
       properties: {
         title,
       },
@@ -346,19 +401,18 @@ export async function createSpreadsheet(
           },
         },
       ],
-    }),
+    },
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `فشل إنشاء جدول البيانات (${res.status})`);
+    throw new Error(res.data?.error?.message || `فشل إنشاء جدول البيانات (${res.status})`);
   }
 
-  const data = await res.json();
+  const data = res.data;
   return {
     spreadsheetId: data.spreadsheetId,
     spreadsheetUrl: data.spreadsheetUrl,
-    title: data.properties.title,
+    title: data.properties?.title || title,
   };
 }
 
@@ -366,56 +420,68 @@ export async function createSpreadsheet(
  * Fetch spreadsheet metadata to dynamically get tab names
  */
 export async function getSpreadsheetDetails(spreadsheetId: string): Promise<SpreadsheetMetadata> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const cleanId = encodeURIComponent(spreadsheetId.trim());
+  const res = await workspaceApiFetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${cleanId}`
+  );
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `فشل جلب تفاصيل الجدول (${res.status})`);
+    throw new Error(res.data?.error?.message || `فشل جلب تفاصيل الجدول (${res.status})`);
   }
 
-  const data = await res.json();
+  const data = res.data;
   return {
-    spreadsheetId: data.spreadsheetId,
-    title: data.properties.title,
+    spreadsheetId: data.spreadsheetId || spreadsheetId,
+    title: data.properties?.title || 'جدول بيانات Google',
     sheets: (data.sheets || []).map((s: any) => ({
-      sheetId: s.properties.sheetId,
-      title: s.properties.title,
-      rowCount: s.properties.gridProperties?.rowCount,
-      columnCount: s.properties.gridProperties?.columnCount,
+      sheetId: s.properties?.sheetId ?? 0,
+      title: s.properties?.title || 'Sheet1',
+      rowCount: s.properties?.gridProperties?.rowCount,
+      columnCount: s.properties?.gridProperties?.columnCount,
     })),
   };
 }
 
 /**
- * Read values from a spreadsheet range
+ * Read values from a spreadsheet range using query-parameter `values:batchGet`
+ * so special characters, spaces, colons, or Arabic sheet names never break URL path routing.
  */
 export async function readSpreadsheetRange(
   spreadsheetId: string,
   range: string
 ): Promise<string[][]> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
+  const cleanId = encodeURIComponent(spreadsheetId.trim());
 
-  const encodedRange = encodeURIComponent(range);
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
-    }
+  // Use values:batchGet with query parameter `ranges` to avoid URL path encoding / GFE issues
+  const batchUrl = new URL(
+    `https://sheets.googleapis.com/v4/spreadsheets/${cleanId}/values:batchGet`
   );
+  batchUrl.searchParams.set('ranges', range);
+  batchUrl.searchParams.set('valueRenderOption', 'FORMATTED_VALUE');
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `فشل قراءة خلايا الجدول (${res.status})`);
+  const res = await workspaceApiFetch(batchUrl.toString());
+
+  if (res.ok) {
+    const firstRange = res.data?.valueRanges?.[0];
+    return firstRange?.values || [];
   }
 
-  const data = await res.json();
-  return data.values || [];
+  // Fallback: if the specific tab range syntax had a mismatch, try reading the default first tab range A1:Z60
+  const fallbackUrl = new URL(
+    `https://sheets.googleapis.com/v4/spreadsheets/${cleanId}/values:batchGet`
+  );
+  fallbackUrl.searchParams.set('ranges', 'A1:Z60');
+  fallbackUrl.searchParams.set('valueRenderOption', 'FORMATTED_VALUE');
+
+  const fallbackRes = await workspaceApiFetch(fallbackUrl.toString());
+  if (fallbackRes.ok) {
+    const firstRange = fallbackRes.data?.valueRanges?.[0];
+    return firstRange?.values || [];
+  }
+
+  throw new Error(
+    res.data?.error?.message || `فشل قراءة خلايا الجدول (${res.status})`
+  );
 }
 
 /**
@@ -426,29 +492,22 @@ export async function appendSpreadsheetRows(
   range: string,
   values: (string | number)[][]
 ): Promise<{ updatedRows: number; updatedRange: string }> {
-  const token = await getAccessToken();
-  if (!token) throw new Error('يرجى تسجيل الدخول بحساب Google أولاً.');
-
+  const cleanId = encodeURIComponent(spreadsheetId.trim());
   const encodedRange = encodeURIComponent(range);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${cleanId}/values/${encodedRange}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
 
-  const res = await fetch(url, {
+  const res = await workspaceApiFetch(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
+    body: {
       values,
-    }),
+    },
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `فشل إضافة صفوف إلى الجدول (${res.status})`);
+    throw new Error(res.data?.error?.message || `فشل إضافة صفوف إلى الجدول (${res.status})`);
   }
 
-  const data = await res.json();
+  const data = res.data;
   return {
     updatedRows: data.updates?.updatedRows || values.length,
     updatedRange: data.updates?.updatedRange || range,

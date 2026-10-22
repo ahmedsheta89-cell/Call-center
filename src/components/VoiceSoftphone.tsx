@@ -36,7 +36,7 @@ export const VoiceSoftphone: React.FC<VoiceSoftphoneProps> = ({
   onControlCall,
   userRole,
 }) => {
-  const [dialNumber, setDialNumber] = useState('');
+  const [dialNumber, setDialNumber] = useState('01018108979');
   const [isMuted, setIsMuted] = useState(false);
   const [isHold, setIsHold] = useState(false);
   const [selectedCallId, setSelectedCallId] = useState<string>(activeCalls[0]?.id || '');
@@ -270,6 +270,14 @@ export const VoiceSoftphone: React.FC<VoiceSoftphoneProps> = ({
                 placeholder="أدخل رقم الهاتف..."
                 className="w-full bg-slate-950 border border-slate-800 rounded-2xl p-4 text-center text-lg font-mono font-bold text-white focus:outline-none focus:border-emerald-500"
               />
+              <button
+                type="button"
+                onClick={() => setDialNumber('01018108979')}
+                className="mt-2 w-full py-1.5 px-3 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/30 text-indigo-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+              >
+                <span>رقم الأدمن السريع:</span>
+                <span className="font-mono font-bold">01018108979</span>
+              </button>
             </div>
           )}
 

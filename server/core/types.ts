@@ -33,6 +33,7 @@ export interface Organization {
 export interface User {
   id: UUID;
   organizationId: UUID;
+  firebaseUid?: string;
   email: string;
   fullName: string;
   role: string;
@@ -134,6 +135,7 @@ export interface CallSession {
   id: UUID;
   organizationId: UUID;
   customerId?: UUID;
+  customerName?: string;
   agentId?: UUID;
   direction: 'inbound' | 'outbound';
   status: 'ringing' | 'in_progress' | 'hold' | 'completed' | 'missed' | 'abandoned';
@@ -184,5 +186,7 @@ export interface AuditEvent {
   userAgent?: string;
   requestId?: string;
   reason?: string;
+  prevHash?: string;
+  integrityHash?: string;
   createdAt: string;
 }

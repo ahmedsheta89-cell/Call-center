@@ -5,8 +5,15 @@
 
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { initializeFirestore, getFirestore, Firestore } from 'firebase/firestore';
+import { initializeFirestore, getFirestore, Firestore, setLogLevel } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+
+// Suppress internal @firebase/firestore connection retry warnings in sandboxed/offline environments
+try {
+  setLogLevel('silent');
+} catch {
+  // Ignore if log level cannot be set
+}
 
 // Initialize Firebase App
 export const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
@@ -27,7 +34,13 @@ export const FIRESTORE_DATABASE_ID = firestoreDatabaseId;
  */
 let firestoreInstance: Firestore;
 try {
-  firestoreInstance = initializeFirestore(app, {}, firestoreDatabaseId);
+  firestoreInstance = initializeFirestore(
+    app,
+    {
+      experimentalAutoDetectLongPolling: true,
+    },
+    firestoreDatabaseId
+  );
 } catch {
   // If already initialized with these settings, retrieve existing instance
   firestoreInstance = getFirestore(app, firestoreDatabaseId);

@@ -38,8 +38,8 @@ export const GoogleWorkspaceAuthButton: React.FC<GoogleWorkspaceAuthButtonProps>
       setIsProcessing(true);
       await googleSignIn();
       onSuccess?.();
-    } catch (err) {
-      console.error('Sign-in failed', err);
+    } catch {
+      // Handled by googleWorkspaceAuth state
     } finally {
       setIsProcessing(false);
     }
@@ -49,8 +49,8 @@ export const GoogleWorkspaceAuthButton: React.FC<GoogleWorkspaceAuthButtonProps>
     try {
       setIsProcessing(true);
       await googleSignOut();
-    } catch (err) {
-      console.error('Sign-out failed', err);
+    } catch {
+      // Handled by googleWorkspaceAuth state
     } finally {
       setIsProcessing(false);
     }

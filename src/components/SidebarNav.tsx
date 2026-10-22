@@ -40,6 +40,8 @@ import {
   PanelLeftOpen,
   Mail,
   FileSpreadsheet,
+  GitBranch,
+  Smartphone,
 } from 'lucide-react';
 
 export type ActiveTab =
@@ -56,6 +58,8 @@ export type ActiveTab =
   | 'agentic_ai'
   | 'predictive_cx'
   | 'enterprise_scale'
+  | 'github_qa_hub'
+  | 'cross_platform_hub'
   | 'knowledge_base'
   | 'integrations'
   | 'wfm'
@@ -212,6 +216,22 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
         icon: Gauge,
         accentColor: 'text-teal-400 border-teal-500/30 bg-teal-500/10',
         items: [
+          {
+            id: 'cross_platform_hub',
+            label: 'تطبيق الأندرويد والويندوز والأجهزة',
+            shortLabel: 'Android & Win',
+            icon: Smartphone,
+            tag: 'APK + EXE',
+            tagColor: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30',
+          },
+          {
+            id: 'github_qa_hub',
+            label: 'مزامنة GitHub والرابط العام والاختبارات',
+            shortLabel: 'GitHub & QA',
+            icon: GitBranch,
+            tag: '100% QA',
+            tagColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
+          },
           {
             id: 'enterprise_scale',
             label: 'التكامل المؤسسي واختبار الإجهاد',

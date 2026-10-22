@@ -150,7 +150,6 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 
     return { user: result.user, accessToken: cachedAccessToken };
   } catch (error: any) {
-    console.error('Google Workspace Sign-in error:', error);
     const errorMessage = error?.message || 'فشل تسجيل الدخول باستخدام حساب Google';
     currentState = {
       ...currentState,
@@ -181,7 +180,6 @@ export const googleSignOut = async (): Promise<void> => {
     };
     notifySubscribers(currentState);
   } catch (error) {
-    console.error('Sign out error:', error);
     throw error;
   }
 };

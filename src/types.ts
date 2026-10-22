@@ -115,6 +115,11 @@ export interface LiveMetrics {
   serviceAvailabilityPercent: number;
   aiComplianceAlerts: number;
   openTicketsCount: number;
+  slaComplianceRate?: number;
+  csatScore?: number;
+  fcrRate?: number;
+  activeCallsCount?: number;
+  aiDeflectionRate?: number;
 }
 
 export type RecommendationDomain =

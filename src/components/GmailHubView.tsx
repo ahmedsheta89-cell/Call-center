@@ -123,7 +123,6 @@ export const GmailHubView: React.FC<GmailHubViewProps> = ({ onConvertToTicket })
         setSelectedMessage(null);
       }
     } catch (err: any) {
-      console.error('Failed to load Gmail messages', err);
       setError(err?.message || 'تعذر استرجاع رسائل Gmail. يرجى التحقق من الصلاحيات.');
     } finally {
       setIsLoading(false);

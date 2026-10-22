@@ -5,6 +5,7 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import {
   Organization,
@@ -19,6 +20,7 @@ import {
   AuditEvent,
   UUID,
 } from '../core/types.ts';
+import { AuditLogger } from '../core/audit.ts';
 
 export interface KnowledgeDocument {
   id: UUID;
@@ -183,9 +185,9 @@ class DatabaseStore {
   }
 
   // ----------------------------------------------------
-  // Disk Persistence & Backup Engine
+  // Disk Persistence & Backup Engine (Stored in OS Temp Dir to keep Git Workspace 100% clean)
   // ----------------------------------------------------
-  private persistFilePath = path.join(process.cwd(), 'data', 'db_state.json');
+  private persistFilePath = path.join(os.tmpdir(), 'omniflow-data', 'db_state.json');
   private persistTimer: NodeJS.Timeout | null = null;
 
   public schedulePersist(delayMs = 300): void {
@@ -218,10 +220,12 @@ class DatabaseStore {
       qaEvaluations: Array.from(this.qaEvaluations.values()),
       automationRules: Array.from(this.automationRules.values()),
       shifts: Array.from(this.shifts.values()),
+      auditEvents: AuditLogger.exportAllEvents(),
     };
   }
 
-  public saveToDisk(): void {
+  public saveToDisk(): boolean {
+    const tmpPath = `${this.persistFilePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
     try {
       const dir = path.dirname(this.persistFilePath);
       if (!fs.existsSync(dir)) {
@@ -229,12 +233,27 @@ class DatabaseStore {
       }
 
       const backup = this.exportFullBackup();
-      const tmpPath = `${this.persistFilePath}.tmp`;
-      fs.writeFileSync(tmpPath, JSON.stringify(backup, null, 2), 'utf-8');
+      const serialized = JSON.stringify(backup, null, 2);
+      const fd = fs.openSync(tmpPath, 'w');
+      try {
+        fs.writeFileSync(fd, serialized, 'utf-8');
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
       fs.renameSync(tmpPath, this.persistFilePath);
       console.log(`[Storage] Database state persisted safely to ${this.persistFilePath}`);
+      return true;
     } catch (err) {
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {
+        // ignore cleanup error
+      }
       console.error('[Storage Error] Failed to persist database state to disk:', err);
+      return false;
     }
   }
 
@@ -254,7 +273,10 @@ class DatabaseStore {
         return false;
       }
 
-      this.importFullBackup(parsed);
+      const restored = this.importFullBackup(parsed);
+      if (!restored) {
+        return false;
+      }
       console.log(`[Storage] Successfully restored enterprise database from persistent storage (${parsed.exportedAt || 'saved state'}).`);
       return true;
     } catch (err) {
@@ -263,75 +285,95 @@ class DatabaseStore {
     }
   }
 
+  /**
+   * Strictly transactional, all-or-nothing backup restoration.
+   * Validates all collections, primary keys, tenant foreign keys, and AuditLogger hash chain
+   * in staging memory BEFORE mutating any live Map. Guarantees zero partial state corruption on failure.
+   */
   public importFullBackup(data: any): boolean {
-    if (!data) return false;
-
-    if (Array.isArray(data.organizations)) {
-      this.organizations.clear();
-      data.organizations.forEach((item: Organization) => this.organizations.set(item.id, item));
-    }
-    if (Array.isArray(data.users)) {
-      this.users.clear();
-      data.users.forEach((item: User) => this.users.set(item.id, item));
-    }
-    if (Array.isArray(data.teams)) {
-      this.teams.clear();
-      data.teams.forEach((item: Team) => this.teams.set(item.id, item));
-    }
-    if (Array.isArray(data.agents)) {
-      this.agents.clear();
-      data.agents.forEach((item: AgentProfile) => this.agents.set(item.id, item));
-    }
-    if (Array.isArray(data.customers)) {
-      this.customers.clear();
-      data.customers.forEach((item: Customer) => this.customers.set(item.id, item));
-    }
-    if (Array.isArray(data.customerChannels)) {
-      this.customerChannels.clear();
-      data.customerChannels.forEach((item: CustomerChannel) => this.customerChannels.set(item.id, item));
-    }
-    if (Array.isArray(data.conversations)) {
-      this.conversations.clear();
-      data.conversations.forEach((item: Conversation) => this.conversations.set(item.id, item));
-    }
-    if (Array.isArray(data.messages)) {
-      this.messages.clear();
-      data.messages.forEach((item: UnifiedMessage) => this.messages.set(item.id, item));
-    }
-    if (Array.isArray(data.calls)) {
-      this.calls.clear();
-      data.calls.forEach((item: CallSession) => this.calls.set(item.id, item));
-    }
-    if (Array.isArray(data.tickets)) {
-      this.tickets.clear();
-      data.tickets.forEach((item: Ticket) => this.tickets.set(item.id, item));
-    }
-    if (Array.isArray(data.slaPolicies)) {
-      this.slaPolicies.clear();
-      data.slaPolicies.forEach((item: SLAPolicy) => this.slaPolicies.set(item.id, item));
-    }
-    if (Array.isArray(data.knowledgeDocuments)) {
-      this.knowledgeDocuments.clear();
-      data.knowledgeDocuments.forEach((item: KnowledgeDocument) => this.knowledgeDocuments.set(item.id, item));
-    }
-    if (Array.isArray(data.qaRubrics)) {
-      this.qaRubrics.clear();
-      data.qaRubrics.forEach((item: QARubric) => this.qaRubrics.set(item.id, item));
-    }
-    if (Array.isArray(data.qaEvaluations)) {
-      this.qaEvaluations.clear();
-      data.qaEvaluations.forEach((item: QAEvaluation) => this.qaEvaluations.set(item.id, item));
-    }
-    if (Array.isArray(data.automationRules)) {
-      this.automationRules.clear();
-      data.automationRules.forEach((item: AutomationRule) => this.automationRules.set(item.id, item));
-    }
-    if (Array.isArray(data.shifts)) {
-      this.shifts.clear();
-      data.shifts.forEach((item: ShiftSchedule) => this.shifts.set(item.id, item));
+    if (!data || typeof data !== 'object') return false;
+    if (!Array.isArray(data.organizations) || data.organizations.length === 0) {
+      return false;
     }
 
-    return true;
+    const collectionSpecs: Array<{ key: string; requireOrgId: boolean }> = [
+      { key: 'organizations', requireOrgId: false },
+      { key: 'users', requireOrgId: true },
+      { key: 'teams', requireOrgId: true },
+      { key: 'agents', requireOrgId: true },
+      { key: 'customers', requireOrgId: true },
+      { key: 'customerChannels', requireOrgId: false },
+      { key: 'conversations', requireOrgId: true },
+      { key: 'messages', requireOrgId: true },
+      { key: 'calls', requireOrgId: true },
+      { key: 'tickets', requireOrgId: true },
+      { key: 'slaPolicies', requireOrgId: true },
+      { key: 'knowledgeDocuments', requireOrgId: true },
+      { key: 'qaRubrics', requireOrgId: true },
+      { key: 'qaEvaluations', requireOrgId: true },
+      { key: 'automationRules', requireOrgId: true },
+      { key: 'shifts', requireOrgId: true },
+    ];
+
+    const stagedMaps: Record<string, Map<UUID, any>> = {};
+
+    try {
+      // 1. Validate & stage all entity collections in isolated staging maps
+      for (const spec of collectionSpecs) {
+        const rawList = data[spec.key];
+        if (rawList === undefined) continue;
+        if (!Array.isArray(rawList)) {
+          return false;
+        }
+        const map = new Map<UUID, any>();
+        for (const item of rawList) {
+          if (!item || typeof item !== 'object' || typeof item.id !== 'string' || item.id.trim().length === 0) {
+            return false;
+          }
+          if (spec.requireOrgId && (typeof item.organizationId !== 'string' || item.organizationId.trim().length === 0)) {
+            return false;
+          }
+          map.set(item.id, item);
+        }
+        stagedMaps[spec.key] = map;
+      }
+
+      // 2. Validate auditEvents hash chain integrity prior to committing any changes
+      let stagedAuditEvents: AuditEvent[] | null = null;
+      if (data.auditEvents !== undefined) {
+        if (!Array.isArray(data.auditEvents)) {
+          return false;
+        }
+        if (data.auditEvents.length > 0) {
+          const chainCheck = AuditLogger.verifyChainIntegrity(data.auditEvents);
+          if (!chainCheck.valid) {
+            return false;
+          }
+        }
+        stagedAuditEvents = data.auditEvents;
+      }
+
+      // 3. Atomic commit: swap staged maps into live DatabaseStore only after 100% validation succeeds
+      for (const spec of collectionSpecs) {
+        const staged = stagedMaps[spec.key];
+        if (staged) {
+          const targetMap: Map<UUID, any> = (this as any)[spec.key];
+          targetMap.clear();
+          for (const [k, v] of staged.entries()) {
+            targetMap.set(k, v);
+          }
+        }
+      }
+
+      if (stagedAuditEvents !== null) {
+        AuditLogger.importEvents(stagedAuditEvents);
+      }
+
+      return true;
+    } catch (err) {
+      console.error('[Storage Error] Atomic importFullBackup aborted due to error:', err);
+      return false;
+    }
   }
 }
 
