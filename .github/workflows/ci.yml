@@ -51,7 +51,7 @@ jobs:
           key: firebase-emulators-${{ runner.os }}-v1
 
       - name: Pre-download Firestore Emulator JAR
-        run: npx firebase setup:emulators:firestore
+        run: npx firebase-tools setup:emulators:firestore
         continue-on-error: false
 
       - name: Run Firestore Rules AST, Red Team & Real JVM Emulator Suite (@firebase/rules-unit-testing)

@@ -1249,7 +1249,7 @@ function findFirestoreEmulatorJar(): string {
       }
     }
   }
-  const setupCommand = 'npx firebase setup:emulators:firestore';
+  const setupCommand = 'npx firebase-tools setup:emulators:firestore';
   try {
     execSync(setupCommand, {
       stdio: 'inherit',
