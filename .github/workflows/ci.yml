@@ -44,6 +44,16 @@ jobs:
       - name: Build Production Frontend & Backend Bundle
         run: npm run build
 
+      - name: Cache Firebase Emulators
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}-v1
+
+      - name: Pre-download Firestore Emulator JAR
+        run: npx firebase setup:emulators:firestore
+        continue-on-error: false
+
       - name: Run Firestore Rules AST, Red Team & Real JVM Emulator Suite (@firebase/rules-unit-testing)
         run: npm run test:firestore
 

@@ -1249,7 +1249,41 @@ function findFirestoreEmulatorJar(): string {
       }
     }
   }
-  execSync('npx firebase setup:emulators:firestore', { stdio: 'ignore' });
+  const setupCommand = 'npx firebase setup:emulators:firestore';
+  try {
+    execSync(setupCommand, {
+      stdio: 'inherit',
+      encoding: 'utf-8',
+    });
+  } catch (err: unknown) {
+    const execErr = err as {
+      status?: number | null;
+      code?: string | number;
+      stdout?: string | Buffer | null;
+      stderr?: string | Buffer | null;
+      message?: string;
+    };
+    const exitCode = execErr.status ?? execErr.code ?? 'unknown';
+    const stdoutText =
+      execErr.stdout !== undefined && execErr.stdout !== null && String(execErr.stdout).length > 0
+        ? String(execErr.stdout)
+        : '<empty / inherited directly to console>';
+    const stderrText =
+      execErr.stderr !== undefined && execErr.stderr !== null && String(execErr.stderr).length > 0
+        ? String(execErr.stderr)
+        : '<empty / inherited directly to console>';
+    console.error(
+      `[Firestore Emulator Setup Failure]\n` +
+        `  Command   : ${setupCommand}\n` +
+        `  Exit Code : ${String(exitCode)}\n` +
+        `  stdout    : ${stdoutText}\n` +
+        `  stderr    : ${stderrText}`
+    );
+    throw new Error(
+      `Failed to execute "${setupCommand}" (exit code: ${String(exitCode)}). ` +
+        `stdout: ${stdoutText} | stderr: ${stderrText}`
+    );
+  }
   for (const dir of cacheDirs) {
     if (fs.existsSync(dir)) {
       const jars = fs
