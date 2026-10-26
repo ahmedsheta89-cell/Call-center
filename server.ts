@@ -100,16 +100,22 @@ async function bootstrapModules() {
   // 1. Initialize Seed Data or Load from Persistent Storage
   const restored = db.loadFromDisk();
   if (!restored) {
-    console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
-    initializeSeedData();
-    db.saveToDisk();
+    if (db.isDiskOverwriteProtected()) {
+      console.error(
+        `[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`
+      );
+    } else {
+      console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
+      initializeSeedData();
+      db.saveToDisk();
+      ensureEgyptSpecialCustomer();
+      ensureAdminUser();
+    }
   } else {
     console.log('[Storage] Loaded live state from disk successfully.');
+    ensureEgyptSpecialCustomer();
+    ensureAdminUser();
   }
-
-  // Ensure Egypt special test customer (01018108979) and Admin user (01018108979) are always initialized
-  ensureEgyptSpecialCustomer();
-  ensureAdminUser();
 
   // 2. Dynamic PWA Binary Icon Serving
   ensurePwaIconsGenerated();

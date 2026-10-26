@@ -4,13 +4,31 @@
  * Complies with Rule 43: Organization, 10 Agents, 3 Teams, 100 Customers, Conversations, Tickets, Calls, KB, QA.
  */
 
-import { db, SLAPolicy } from './store.ts';
+import crypto from 'crypto';
+import {
+  db,
+  SLAPolicy,
+  ChannelConfigRecord,
+  RecommendationRecord,
+  CoachingPlanRecord,
+  MacroRecord,
+  TeamQAFeedbackRecord,
+  ConnectedDeviceRecord,
+  CrossDeviceSyncEventRecord,
+} from './store.ts';
 import { UUID, Organization, User, AgentProfile, Customer, CustomerChannel, Conversation, UnifiedMessage, CallSession, Ticket } from '../core/types.ts';
 
 export const DEMO_ORG_ID: UUID = 'org-madar-enterprise-001';
 
 export function initializeSeedData() {
+  if (db.isDiskOverwriteProtected()) {
+    console.warn(
+      '[Seed] Skipping initializeSeedData because an existing persistence file failed load/migration and is protected from overwrite.'
+    );
+    return;
+  }
   if (db.organizations.has(DEMO_ORG_ID)) {
+    ensureConsolidatedCollectionsSeeded();
     return; // Already initialized
   }
 
@@ -521,7 +539,384 @@ export function initializeSeedData() {
   // 14. Ensure Dedicated Admin Profile with phone 01018108979
   ensureAdminUser();
 
+  // 15. Ensure Phase P.1 Consolidated Runtime Collections are seeded for DEMO_ORG_ID
+  ensureConsolidatedCollectionsSeeded();
+
   console.log('[Seed] Enterprise demo dataset seeded successfully with full multi-tenant records.');
+}
+
+/**
+ * Seeds the 6 Phase P.1 consolidated collections (channelConfigs, recommendations,
+ * coachingPlans, macros, teamQaFeedback, connectedDevices) + crossDeviceSyncEvents
+ * strictly under DEMO_ORG_ID if not yet populated in the runtime store.
+ */
+export function ensureConsolidatedCollectionsSeeded(): void {
+  if (!db.organizations.has(DEMO_ORG_ID)) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+
+  // 1. Channel Configurations (scoped to DEMO_ORG_ID)
+  const defaultChannelConfigs: Array<{ channelId: string; config: Record<string, any> }> = [
+    {
+      channelId: 'chan-whatsapp',
+      config: {
+        wabaId: 'WABA-902184920194',
+        phoneNumberId: 'PNID-8820194829',
+        displayNumber: '+20 101 810 8979 (م. أحمد شتا - Admin)',
+        adminPhone: '01018108979',
+        apiToken: 'EAAG...sec_meta_token',
+        webhookSecret: 'madar_verify_token_2026',
+        webhookUrl: '/api/v1/integrations/whatsapp/webhook',
+        verified: true,
+        lastCheckedAt: nowIso,
+      },
+    },
+    {
+      channelId: 'chan-webchat',
+      config: {
+        widgetId: 'widget-madar-portal-v2',
+        domainWhitelist: ['madar.sa', 'app.madar.sa', 'localhost'],
+        sslEnabled: true,
+        verified: true,
+        lastCheckedAt: nowIso,
+      },
+    },
+    {
+      channelId: 'chan-voice',
+      config: {
+        sipServer: 'sip.madar.sa:5060',
+        trunkUsername: 'madar_sip_trunk_01',
+        authSecret: '********',
+        codec: 'Opus, G.711u',
+        webrtcGateway: 'wss://sip-edge.madar.sa/ws',
+        verified: true,
+        lastCheckedAt: nowIso,
+      },
+    },
+    {
+      channelId: 'chan-email',
+      config: {
+        smtpHost: 'smtp.madar.sa',
+        smtpPort: 587,
+        smtpUser: 'support@madar.sa',
+        imapHost: 'imap.madar.sa',
+        imapPort: 993,
+        verified: true,
+        lastCheckedAt: nowIso,
+      },
+    },
+    {
+      channelId: 'chan-messenger',
+      config: {
+        pageId: '1092837465',
+        pageName: 'Madar Telecom Official',
+        igHandle: '@madar_sa',
+        verified: true,
+        lastCheckedAt: nowIso,
+      },
+    },
+  ];
+
+  for (const item of defaultChannelConfigs) {
+    const id = `${DEMO_ORG_ID}::${item.channelId}`;
+    if (!db.channelConfigs.has(id)) {
+      const record: ChannelConfigRecord = {
+        id,
+        organizationId: DEMO_ORG_ID,
+        channelId: item.channelId,
+        config: item.config,
+        updatedAt: nowIso,
+      };
+      db.channelConfigs.set(id, record);
+    }
+  }
+
+  // 2. Intelligent NBA & Operational Recommendations (scoped to DEMO_ORG_ID)
+  const defaultRecommendations: RecommendationRecord[] = [
+    {
+      id: 'rec-op-01',
+      organizationId: DEMO_ORG_ID,
+      domain: 'operational',
+      title: 'تحويل آلي للمحادثات المتأخرة في طابور الواتساب',
+      description: 'ارتفع متوسط زمن انتظار الواتساب إلى 52 ثانية (الحد الأقصى المسموح 40 ثانية). يُوصى بتفعيل الرد الآلي الذكي للفرز الأولي.',
+      priority: 'critical',
+      impact: 'تقليص زمن الانتظار بنسبة 65% والامتثال لمعايير SLA',
+      actionLabel: 'تفعيل التوجيه الذكي الآلي',
+      applied: false,
+      targetEntity: { type: 'channel', id: 'whatsapp', name: 'واتساب الأعمال الرسمي' },
+    },
+    {
+      id: 'rec-wfm-01',
+      organizationId: DEMO_ORG_ID,
+      domain: 'wfm',
+      title: 'إعادة توازن ورديات الاستراحة لتغطية ذروة 14:00',
+      description: 'نموذج Erlang C يتوقع عجزاً بمقدار 2 وكلاء خلال الساعة القادمة. يُوصى بتأخير استراحة وكيلين لمدة 30 دقيقة.',
+      priority: 'high',
+      impact: 'رفع معدل مستوى الخدمة (SL%) من 68% إلى 86%',
+      actionLabel: 'إعادة جدولة الاستراحات بنقرة واحدة',
+      applied: false,
+      targetEntity: { type: 'shift', id: 'shift-peak-14', name: 'مناوبة الظهيرة' },
+    },
+    {
+      id: 'rec-nba-01',
+      organizationId: DEMO_ORG_ID,
+      domain: 'customer_nba',
+      title: 'سارة العتيبي (VIP) - إجراء استبقاء استباقي (Churn Prevention)',
+      description: 'تم رصد مؤشر عدم رضا 68% ناتج عن تأخر تركيب ألياف فايبر. يُوصى بتقديم خصم استبقاء 20% وترقية الراوتر لموديل Wi-Fi 6 مجاناً.',
+      priority: 'critical',
+      impact: 'حماية قيمة حساب العميل (LTV: 14,800 ر.س)',
+      actionLabel: 'اعتماد باقة الاستبقاء وتوليد رمز الخصم',
+      applied: false,
+      targetEntity: { type: 'customer', id: 'cust-001', name: 'سارة العتيبي' },
+    },
+    {
+      id: 'rec-qa-01',
+      organizationId: DEMO_ORG_ID,
+      domain: 'qa_coaching',
+      title: 'خطة تدريبية للوكيلة سارة أحمد: تقليص وقت الصمت وإرشاد العميل',
+      description: 'سجلت المكالمات الأخيرة فترات صمت بلغت 28 ثانية أثناء البحث في النظام. يُوصى بتدريب مكثف على اختصارات لوحة المفاتيح والـ AI Copilot.',
+      priority: 'medium',
+      impact: 'تقليص متوسط زمن المعالجة (AHT) بـ 45 ثانية',
+      actionLabel: 'تعيين خطة التدريب في ملف الوكيل',
+      applied: false,
+      targetEntity: { type: 'agent', id: 'agt-sarah', name: 'سارة أحمد' },
+    },
+    {
+      id: 'rec-kb-01',
+      organizationId: DEMO_ORG_ID,
+      domain: 'knowledge_gap',
+      title: 'سد فجوة معرفية: آلية التعويض عند انقطاعات الكيبل البحري',
+      description: 'تكرر استفسار العملاء 38 مرة خلال الـ 48 ساعة الماضية دون مقال معتمد في قاعدة المعرفة. يُوصى باعتماد ونشر المقال التوجيهي المرفق.',
+      priority: 'high',
+      impact: 'منع تضارب الإجابات بين الوكلاء ورفع دقة الدعم بنسبة 100%',
+      actionLabel: 'اعتماد ونشر المقال في مستودع المعرفة',
+      applied: false,
+      targetEntity: { type: 'kb', id: 'kb-draft-cable', name: 'سياسة تعويضات الكيابل البحرية' },
+    },
+    {
+      id: 'rec-cost-01',
+      organizationId: DEMO_ORG_ID,
+      domain: 'cost_optimization',
+      title: 'تفعيل التخزين الدلالي المؤقت (Semantic Cache) لخفض استهلاك الذكاء الاصطناعي',
+      description: '42% من الاستفسارات الواردة تتعلق بالاستعلام عن الرصيد وأسعار الباقات، ويمكن الإجابة عليها فورياً من الكاش دون استدعاء LLM.',
+      priority: 'medium',
+      impact: 'توفير ما يقارب $48 شهرياً من ميزانية الذكاء الاصطناعي مع تقليل زمن الاستجابة إلى 80ms',
+      actionLabel: 'تفعيل الكاش الدلالي المتقدم',
+      applied: false,
+    },
+  ];
+
+  for (const rec of defaultRecommendations) {
+    if (!db.recommendations.has(rec.id)) {
+      db.recommendations.set(rec.id, rec);
+    }
+  }
+
+  // 3. QA Coaching Plans (scoped to DEMO_ORG_ID)
+  const defaultCoachingPlans: CoachingPlanRecord[] = [
+    {
+      id: 'cp-01',
+      organizationId: DEMO_ORG_ID,
+      agentId: 'agt-sarah',
+      agentName: 'سارة أحمد',
+      title: 'خطة تقليص فترات الصمت وسرعة الاستجابة',
+      focusArea: 'تقليص زمن الصمت في المكالمات',
+      recommendationText: 'استخدام خاصية البحث اللحظي في مستودع المعرفة وتجنب وضع العميل في وضع الانتظار الصامت بدون إشعار صوتي لطيف.',
+      targetMetric: 'أقل من 15 ثانية صمت',
+      status: 'in_progress',
+      assignedBy: 'سلطان القحطاني (مشرف)',
+      dueDate: '2026-09-25',
+      targetDate: '2026-09-25',
+      progressPercent: 65,
+      recommendedActions: [
+        'الاستماع لتسجيلين نموذجيين لمكالمات de-escalation',
+        'التدريب على اختصارات البحث في قاعدة المعرفة',
+      ],
+    },
+    {
+      id: 'cp-02',
+      organizationId: DEMO_ORG_ID,
+      agentId: 'agt-omar',
+      agentName: 'عمر خالد',
+      title: 'خطة الامتثال الأمني والتحقق من الهوية',
+      focusArea: 'الامتثال للتحقق من هوية المتصل وسرية البيانات',
+      recommendationText: 'طلب الرقم التعريفي المؤقت عبر تطبيق مدار أو نفاذ قبل الإفصاح عن تفاصيل الفواتير أو العنوان المسجل.',
+      targetMetric: '100% نسبة الامتثال الأمني',
+      status: 'active',
+      assignedBy: 'مسؤول الجودة (QA Officer)',
+      dueDate: '2026-09-30',
+      targetDate: '2026-09-30',
+      progressPercent: 40,
+      recommendedActions: [
+        'مراجعة ضوابط الأمن السيبراني للهيئة الوطنية',
+        'محاكاة سيناريوهات التحقق الآمن مع المدرب الآلي',
+      ],
+    },
+  ];
+
+  for (const plan of defaultCoachingPlans) {
+    if (!db.coachingPlans.has(plan.id)) {
+      db.coachingPlans.set(plan.id, plan);
+    }
+  }
+
+  // 4. Canned Responses & Quick Macros (scoped to DEMO_ORG_ID)
+  const defaultMacros: MacroRecord[] = [
+    {
+      id: 'macro-welcome',
+      organizationId: DEMO_ORG_ID,
+      shortcut: '/welcome',
+      title: 'ترحيب رسمي معتمد (CST Compliant)',
+      category: 'عام',
+      text: 'أهلاً بك في مدار كير للاتصالات والتقنية، يسعدني جداً خدمتك اليوم. كيف يمكنني مساعدتك؟',
+    },
+    {
+      id: 'macro-apology',
+      organizationId: DEMO_ORG_ID,
+      shortcut: '/apology',
+      title: 'اعتذار عن التأخير وعرض تعويض معتمد',
+      category: 'شكاوى',
+      text: 'نعتذر بشدة عن التأخير غير المقصود في تفعيل الخدمة. وبحسب معايير هيئة الاتصالات والفضاء والتقنية (CST)، تم تسجيل طلبكم بأولوية قصوى واحتساب رصيد تعويضي على فاتورتكم القادمة.',
+      actions: {
+        setPriority: 'urgent',
+      },
+    },
+    {
+      id: 'macro-esim',
+      organizationId: DEMO_ORG_ID,
+      shortcut: '/esim',
+      title: 'خطوات تفعيل وتثبيت شريحة eSIM',
+      category: 'الدعم الفني',
+      text: 'لتثبيت شريحة الـ eSIM، يرجى التوجه إلى: الإعدادات > البيانات الخلوية > إضافة باقة خلوية، ومسح رمز الاستجابة السريعة (QR Code) المرسل إلى بريدك المعتمد مع التأكد من الاتصال بشبكة Wi-Fi مستقرة.',
+    },
+    {
+      id: 'macro-escalate',
+      organizationId: DEMO_ORG_ID,
+      shortcut: '/escalate',
+      title: 'إشعار تصعيد إلى الدعم الميداني المتقدم',
+      category: 'تصعيد',
+      text: 'تم رفع تذكرتكم مباشرة إلى فريق المهندسين الميدانيين للمعاينة الفنية السريعة. سيصلك إشعار SMS برقم الموعد المحدد خلال ساعتين.',
+      actions: {
+        setPriority: 'urgent',
+        setStatus: 'escalated',
+        escalate: true,
+      },
+    },
+    {
+      id: 'macro-close',
+      organizationId: DEMO_ORG_ID,
+      shortcut: '/close',
+      title: 'إغلاق المحادثة وطلب تقييم الخدمة (CSAT)',
+      category: 'إغلاق',
+      text: 'سعدنا بخدمتكم في مدار كير! نرجو أن نكون وفقنا في حل استفساركم بالكامل. نرجو التكرم بتقييم مستوى الخدمة من 1 إلى 5 بالرد المباشر على هذه الرسالة.',
+      actions: {
+        setStatus: 'resolved',
+      },
+    },
+  ];
+
+  for (const macro of defaultMacros) {
+    if (!db.macros.has(macro.id)) {
+      db.macros.set(macro.id, macro);
+    }
+  }
+
+  // 5. Team QA Feedback Ledger (scoped to DEMO_ORG_ID)
+  if (!db.teamQaFeedback.has('qa-fb-001')) {
+    const defaultFeedback: TeamQAFeedbackRecord = {
+      id: 'qa-fb-001',
+      organizationId: DEMO_ORG_ID,
+      reviewerName: 'System Administrator',
+      reviewerRole: 'Owner / Lead Architect',
+      moduleId: 'live_ops',
+      moduleName: 'مركز العمليات المباشر والـ 21 وحدة',
+      verdict: 'passed_100',
+      comment: 'تم مراجعة وتدقيق الترابط اللحظي بين الواجهة والخادم وقواعد البيانات (Cloud SQL + Firestore) وإشعار الإدارة [REDACTED_PHONE].',
+      notifiedAdminPhone: '[REDACTED_PHONE]',
+      createdAt: new Date(Date.now() - 15 * 60000).toISOString(),
+    };
+    db.teamQaFeedback.set(defaultFeedback.id, defaultFeedback);
+  }
+
+  // 6. Connected Devices Registry & Cross-Device Sync Events (scoped to DEMO_ORG_ID)
+  const defaultDevices: ConnectedDeviceRecord[] = [
+    {
+      id: 'DEV-WIN11-HQ01',
+      organizationId: DEMO_ORG_ID,
+      deviceId: 'DEV-WIN11-HQ01',
+      deviceName: 'محطة عمل المسؤول الرئيسية — Windows 11 Pro Desktop',
+      osName: 'Windows',
+      formFactor: 'desktop',
+      appRuntime: 'Windows Desktop EXE',
+      browserName: 'Electron 34 / Edge WebView2',
+      screenResolution: '2560x1440',
+      activeTab: 'live_ops',
+      operatorRole: 'Owner / Admin (م. أحمد شتا)',
+      adminPhone: '01018108979',
+      status: 'online_synced',
+      latencyMs: 5,
+      lastHeartbeatAt: nowIso,
+    },
+    {
+      id: 'DEV-AND15-MOB01',
+      organizationId: DEMO_ORG_ID,
+      deviceId: 'DEV-AND15-MOB01',
+      deviceName: 'هاتف المسؤول المحمول — Android 15 Enterprise App',
+      osName: 'Android',
+      formFactor: 'mobile',
+      appRuntime: 'Android APK / TWA',
+      browserName: 'Android System WebView / Chrome 134',
+      screenResolution: '1080x2400 (44px Touch Safe)',
+      activeTab: 'inbox',
+      operatorRole: 'Owner / Admin (01018108979)',
+      adminPhone: '01018108979',
+      status: 'online_synced',
+      latencyMs: 9,
+      lastHeartbeatAt: nowIso,
+    },
+    {
+      id: 'DEV-TAB-SUP02',
+      organizationId: DEMO_ORG_ID,
+      deviceId: 'DEV-TAB-SUP02',
+      deviceName: 'جهاز لوحي مشرف المناوبة — Galaxy Tab S9 Ultra',
+      osName: 'Android',
+      formFactor: 'tablet',
+      appRuntime: 'Standalone PWA',
+      browserName: 'Chrome 134 Standalone',
+      screenResolution: '2960x1848',
+      activeTab: 'tickets',
+      operatorRole: 'Supervisor (مشرف عمليات)',
+      adminPhone: '01018108979',
+      status: 'online_synced',
+      latencyMs: 11,
+      lastHeartbeatAt: nowIso,
+    },
+  ];
+
+  for (const dev of defaultDevices) {
+    if (!db.connectedDevices.has(dev.id)) {
+      db.connectedDevices.set(dev.id, dev);
+    }
+  }
+
+  if (!db.crossDeviceSyncEvents.has('SYNC-INIT-901')) {
+    const defaultSyncEvt: CrossDeviceSyncEventRecord = {
+      id: 'SYNC-INIT-901',
+      organizationId: DEMO_ORG_ID,
+      syncId: 'SYNC-INIT-901',
+      sourceDeviceId: 'DEV-WIN11-HQ01',
+      sourcePlatform: 'Windows 11 Desktop EXE',
+      targetPlatforms: ['Android 15 App', 'Web Cloud PWA', 'Firestore + Cloud SQL'],
+      actionType: 'INITIAL_CLUSTER_HANDSHAKE',
+      payloadSummary: 'توحيد الحالة التشغيلية (25 محادثة، 12 تذكرة، 9 وكلاء) بين برنامج الويندوز وتطبيق الأندرويد والويب.',
+      sha256Receipt: crypto.createHash('sha256').update('omniflow-init-sync-01018108979').digest('hex').slice(0, 16),
+      roundtripLatencyMs: 8,
+      timestamp: nowIso,
+    };
+    db.crossDeviceSyncEvents.set(defaultSyncEvt.id, defaultSyncEvt);
+  }
 }
 
 /**
@@ -543,6 +938,7 @@ export function ensureAdminUser(): User {
     updatedAt: new Date().toISOString(),
   };
   db.users.set(adminId, adminUser);
+  ensureConsolidatedCollectionsSeeded();
   return adminUser;
 }
 

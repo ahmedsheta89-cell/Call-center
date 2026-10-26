@@ -9,7 +9,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { db } from '../db/store.ts';
+import {
+  db,
+  type RecommendationRecord,
+  type CoachingPlanRecord,
+  type MacroRecord,
+  type TeamQAFeedbackRecord,
+  type ConnectedDeviceRecord,
+  type CrossDeviceSyncEventRecord,
+} from '../db/store.ts';
 import { DEMO_ORG_ID, initializeSeedData } from '../db/seed.ts';
 import { AuditLogger, redactSensitiveValue } from '../core/audit.ts';
 import { assertPermission, hasPermission, ROLE_PERMISSIONS } from '../core/rbac.ts';
@@ -58,6 +66,45 @@ for (const method of ['get', 'post', 'put', 'delete'] as const) {
 // Rejects unauthenticated requests (401) and blocks untrusted header spoofing (403).
 apiRouter.use(authenticateApiRequest);
 
+// Middleware: Strict Tenant Context & Request Payload organizationId Boundary Guard (Phase P.1)
+// Organization context is derived exclusively from the verified session. Any request body attempting
+// to pass an empty/invalid/unregistered organizationId (400) or a cross-tenant organizationId (403) is rejected.
+apiRouter.use((req: Request, res: Response, next) => {
+  if (req.path === '/system/restore') {
+    next();
+    return;
+  }
+  if (req.body && typeof req.body === 'object' && !Array.isArray(req.body) && 'organizationId' in req.body) {
+    const rawBodyOrgId = req.body.organizationId;
+    if (
+      typeof rawBodyOrgId !== 'string' ||
+      rawBodyOrgId.trim() === '' ||
+      rawBodyOrgId.trim() === 'unauthenticated' ||
+      !db.organizations.has(rawBodyOrgId.trim())
+    ) {
+      res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_ORGANIZATION_CONTEXT',
+          message: 'Invalid, empty, or unregistered organizationId in request payload.',
+        },
+      });
+      return;
+    }
+    if (rawBodyOrgId.trim() !== currentActor.organizationId) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'CROSS_TENANT_ACCESS_FORBIDDEN',
+          message: 'Cross-tenant write forbidden: payload organizationId does not match authenticated session tenant.',
+        },
+      });
+      return;
+    }
+  }
+  next();
+});
+
 // ----------------------------------------------------
 // 0. Real-Time Server-Sent Events (SSE) Stream
 // ----------------------------------------------------
@@ -98,10 +145,17 @@ apiRouter.get('/stream', (req: Request, res: Response) => {
 // ----------------------------------------------------
 apiRouter.get('/system/backup', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'audit.read');
-  const backup = db.exportFullBackup();
+  const backup = db.exportTenantBackup(currentActor.organizationId);
+  const sanitizedBackup = {
+    ...backup,
+    channelConfigs: (backup.channelConfigs || []).map((cfg: any) => ({
+      ...cfg,
+      config: redactSensitiveValue(cfg.config) as Record<string, any>,
+    })),
+  };
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="contact_center_backup_${Date.now()}.json"`);
-  res.json({ success: true, data: backup });
+  res.json({ success: true, data: sanitizedBackup });
 });
 
 apiRouter.post('/system/restore', (req: Request, res: Response) => {
@@ -126,17 +180,28 @@ apiRouter.post('/system/restore', (req: Request, res: Response) => {
     }
   }
 
-  const restored = db.importFullBackup(payload);
-  if (restored) {
-    db.saveToDisk();
-    EventBus.publish('system:restored', { timestamp: new Date().toISOString() });
-    res.json({ success: true, message: 'Database state restored successfully' });
+  const restoreResult = db.importFullBackupDetailed(payload, {
+    scopeOrgId: currentActor.organizationId,
+    persistToDisk: true,
+  });
+  if (restoreResult.ok) {
+    EventBus.publish('system:restored', {
+      timestamp: new Date().toISOString(),
+      organizationId: currentActor.organizationId,
+    });
+    res.json({
+      success: true,
+      message: restoreResult.message,
+      ...(restoreResult.unconfiguredChannels
+        ? { unconfiguredChannels: restoreResult.unconfiguredChannels }
+        : {}),
+    });
   } else {
-    res.status(400).json({
+    res.status(restoreResult.status).json({
       success: false,
       error: {
-        code: 'CORRUPTED_BACKUP_PAYLOAD',
-        message: 'Backup validation failed: corrupted records, missing IDs/organizationId, or broken integrity.',
+        code: restoreResult.code,
+        message: restoreResult.message,
       },
     });
   }
@@ -1287,88 +1352,41 @@ apiRouter.post('/kb/test-rag', (req: Request, res: Response) => {
 // ----------------------------------------------------
 // 12. Omnichannel Integrations & Meta WhatsApp Cloud API
 // ----------------------------------------------------
-const memoryChannelConfigs: Map<string, Record<string, any>> = new Map([
-  [
-    'chan-whatsapp',
-    {
-      wabaId: 'WABA-902184920194',
-      phoneNumberId: 'PNID-8820194829',
-      displayNumber: '+20 101 810 8979 (م. أحمد شتا - Admin)',
-      adminPhone: '01018108979',
-      apiToken: 'EAAG...sec_meta_token',
-      webhookSecret: 'madar_verify_token_2026',
-      webhookUrl: '/api/v1/integrations/whatsapp/webhook',
-      verified: true,
-      lastCheckedAt: new Date().toISOString(),
-    },
-  ],
-  [
-    'chan-webchat',
-    {
-      widgetId: 'widget-madar-portal-v2',
-      domainWhitelist: ['madar.sa', 'app.madar.sa', 'localhost'],
-      sslEnabled: true,
-      verified: true,
-      lastCheckedAt: new Date().toISOString(),
-    },
-  ],
-  [
-    'chan-voice',
-    {
-      sipServer: 'sip.madar.sa:5060',
-      trunkUsername: 'madar_sip_trunk_01',
-      authSecret: '********',
-      codec: 'Opus, G.711u',
-      webrtcGateway: 'wss://sip-edge.madar.sa/ws',
-      verified: true,
-      lastCheckedAt: new Date().toISOString(),
-    },
-  ],
-  [
-    'chan-email',
-    {
-      smtpHost: 'smtp.madar.sa',
-      smtpPort: 587,
-      smtpUser: 'support@madar.sa',
-      imapHost: 'imap.madar.sa',
-      imapPort: 993,
-      verified: true,
-      lastCheckedAt: new Date().toISOString(),
-    },
-  ],
-  [
-    'chan-messenger',
-    {
-      pageId: '1092837465',
-      pageName: 'Madar Telecom Official',
-      igHandle: '@madar_sa',
-      verified: true,
-      lastCheckedAt: new Date().toISOString(),
-    },
-  ],
-]);
-
 apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
+  const orgId = db.assertValidOrganizationId(currentActor.organizationId);
+  const isDemoTenant = orgId === DEMO_ORG_ID;
+
+  const waStored = db.getChannelConfig(orgId, 'chan-whatsapp');
+  const webchatStored = db.getChannelConfig(orgId, 'chan-webchat');
+  const voiceStored = db.getChannelConfig(orgId, 'chan-voice');
+  const emailStored = db.getChannelConfig(orgId, 'chan-email');
+  const messengerStored = db.getChannelConfig(orgId, 'chan-messenger');
+
+  const isConfigured = (stored: Record<string, any> | undefined) =>
+    Boolean(stored && stored.credentialsConfigured !== false && stored.verified !== false);
+
   const defaultChannels = [
     {
       id: 'chan-whatsapp',
       type: 'whatsapp',
       name: 'WhatsApp Business Cloud API (Official)',
       badge: 'موثق ومعتمد من Meta',
-      status: 'online',
-      accountInfo: {
-        wabaId: 'WABA-902184920194',
-        phoneNumberId: 'PNID-8820194829',
-        displayNumber: '+20 101 810 8979 (م. أحمد شتا - Admin)',
-        verifiedName: 'مدار كير - م. أحمد شتا (01018108979)',
-        qualityRating: 'High',
-        messagingLimitTier: 'Tier 2 (10,000 محادثة / 24 ساعة)',
-        ...memoryChannelConfigs.get('chan-whatsapp'),
-      },
+      status: (isDemoTenant && (!waStored || isConfigured(waStored))) || isConfigured(waStored) ? 'online' : 'unconfigured',
+      accountInfo: isDemoTenant
+        ? {
+            wabaId: 'WABA-902184920194',
+            phoneNumberId: 'PNID-8820194829',
+            displayNumber: '+20 101 810 8979 (م. أحمد شتا - Admin)',
+            verifiedName: 'مدار كير - م. أحمد شتا (01018108979)',
+            qualityRating: 'High',
+            messagingLimitTier: 'Tier 2 (10,000 محادثة / 24 ساعة)',
+            ...(waStored || {}),
+          }
+        : { ...(waStored || {}) },
       metrics: {
         latencyMs: 42,
-        messagesSent24h: 3842,
+        messagesSent24h: isDemoTenant ? 3842 : 0,
         deliveryRatePercent: 99.4,
         webhookUrl: '/api/v1/integrations/whatsapp/webhook',
       },
@@ -1383,15 +1401,17 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       type: 'webchat',
       name: 'Live Web Chat Widget (Portal & Mobile App)',
       badge: 'WebSockets نشط',
-      status: 'online',
-      accountInfo: {
-        widgetId: 'widget-madar-portal-v2',
-        sslEnabled: true,
-        ...memoryChannelConfigs.get('chan-webchat'),
-      },
+      status: isDemoTenant || webchatStored ? 'online' : 'unconfigured',
+      accountInfo: isDemoTenant
+        ? {
+            widgetId: 'widget-madar-portal-v2',
+            sslEnabled: true,
+            ...(webchatStored || {}),
+          }
+        : { ...(webchatStored || {}) },
       metrics: {
         latencyMs: 14,
-        messagesSent24h: 1240,
+        messagesSent24h: isDemoTenant ? 1240 : 0,
         deliveryRatePercent: 100,
         webhookUrl: '/api/v1/integrations/webchat/webhook',
       },
@@ -1401,16 +1421,18 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       type: 'voice',
       name: 'Cloud SIP Trunk & WebRTC (Asterisk/FreeSWITCH)',
       badge: 'سنترال سحابي نشط',
-      status: 'online',
-      accountInfo: {
-        trunkName: 'STC-SIP-TRUNK-RIYADH-01',
-        concurrentLines: 32,
-        codecs: 'Opus, G.711u',
-        ...memoryChannelConfigs.get('chan-voice'),
-      },
+      status: (isDemoTenant && (!voiceStored || isConfigured(voiceStored))) || isConfigured(voiceStored) ? 'online' : 'unconfigured',
+      accountInfo: isDemoTenant
+        ? {
+            trunkName: 'STC-SIP-TRUNK-RIYADH-01',
+            concurrentLines: 32,
+            codecs: 'Opus, G.711u',
+            ...(voiceStored || {}),
+          }
+        : { ...(voiceStored || {}) },
       metrics: {
         latencyMs: 24,
-        callsHandled24h: 340,
+        callsHandled24h: isDemoTenant ? 340 : 0,
         averageMOSScore: 4.4,
         webhookUrl: '/api/v1/integrations/voice/webhook',
       },
@@ -1420,15 +1442,17 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       type: 'email',
       name: 'Enterprise Email Gate (support@madar.sa)',
       badge: 'TLS 1.3 مشفر',
-      status: 'online',
-      accountInfo: {
-        smtpHost: 'smtp.madar.sa',
-        pollingIntervalSec: 30,
-        ...memoryChannelConfigs.get('chan-email'),
-      },
+      status: (isDemoTenant && (!emailStored || isConfigured(emailStored))) || isConfigured(emailStored) ? 'online' : 'unconfigured',
+      accountInfo: isDemoTenant
+        ? {
+            smtpHost: 'smtp.madar.sa',
+            pollingIntervalSec: 30,
+            ...(emailStored || {}),
+          }
+        : { ...(emailStored || {}) },
       metrics: {
         latencyMs: 120,
-        emailsProcessed24h: 185,
+        emailsProcessed24h: isDemoTenant ? 185 : 0,
         webhookUrl: '/api/v1/integrations/email/webhook',
       },
     },
@@ -1437,15 +1461,17 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       type: 'messenger',
       name: 'Meta Messenger & Instagram Direct',
       badge: 'Graph API v21',
-      status: 'online',
-      accountInfo: {
-        pageName: 'Madar Telecom Official',
-        igHandle: '@madar_sa',
-        ...memoryChannelConfigs.get('chan-messenger'),
-      },
+      status: (isDemoTenant && (!messengerStored || isConfigured(messengerStored))) || isConfigured(messengerStored) ? 'online' : 'unconfigured',
+      accountInfo: isDemoTenant
+        ? {
+            pageName: 'Madar Telecom Official',
+            igHandle: '@madar_sa',
+            ...(messengerStored || {}),
+          }
+        : { ...(messengerStored || {}) },
       metrics: {
         latencyMs: 65,
-        messagesSent24h: 520,
+        messagesSent24h: isDemoTenant ? 520 : 0,
         webhookUrl: '/api/v1/integrations/messenger/webhook',
       },
     },
@@ -1465,14 +1491,7 @@ apiRouter.put('/integrations/channels/:id/config', (req: Request, res: Response)
   const channelId = req.params.id;
   const config = req.body || {};
 
-  const current = memoryChannelConfigs.get(channelId) || {};
-  const updated = {
-    ...current,
-    ...config,
-    verified: true,
-    lastCheckedAt: new Date().toISOString(),
-  };
-  memoryChannelConfigs.set(channelId, updated);
+  const savedRecord = db.setChannelConfig(currentActor.organizationId, channelId, config);
 
   AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -1486,7 +1505,7 @@ apiRouter.put('/integrations/channels/:id/config', (req: Request, res: Response)
 
   res.json({
     success: true,
-    data: redactSensitiveValue(updated),
+    data: redactSensitiveValue(savedRecord.config),
     message: 'تم حفظ إعدادات القناة والاعتمادات بنجاح',
   });
 });
@@ -1498,7 +1517,7 @@ apiRouter.post('/integrations/channels/:id/test-connection', async (req: Request
   const simulatedDelay = Math.floor(20 + Math.random() * 30);
   await new Promise((r) => setTimeout(r, simulatedDelay));
 
-  const config = redactSensitiveValue(memoryChannelConfigs.get(channelId) || {}) as Record<string, any>;
+  const config = redactSensitiveValue(db.getChannelConfig(currentActor.organizationId, channelId) || {}) as Record<string, any>;
 
   res.json({
     success: true,
@@ -1757,7 +1776,7 @@ apiRouter.post('/integrations/whatsapp/send-template', async (req: Request, res:
     );
   }
 
-  const waConfig = memoryChannelConfigs.get('chan-whatsapp') || {};
+  const waConfig = db.getChannelConfig(currentActor.organizationId, 'chan-whatsapp') || {};
   const metaToken = waConfig.apiToken || process.env.META_WHATSAPP_TOKEN;
   const phoneNumberId = waConfig.phoneNumberId || process.env.META_PHONE_NUMBER_ID;
 
@@ -2220,186 +2239,10 @@ apiRouter.post('/automation/simulate', (req: Request, res: Response) => {
 // ----------------------------------------------------
 // 15. Intelligent Recommendations & Next-Best-Action Engine
 // ----------------------------------------------------
-interface RecommendationRecord {
-  id: string;
-  organizationId: string;
-  domain: 'operational' | 'wfm' | 'customer_nba' | 'qa_coaching' | 'knowledge_gap' | 'cost_optimization';
-  title: string;
-  description: string;
-  priority: 'critical' | 'high' | 'medium';
-  impact: string;
-  actionLabel: string;
-  applied: boolean;
-  appliedAt?: string;
-  targetEntity?: {
-    type: 'customer' | 'agent' | 'ticket' | 'shift' | 'kb' | 'channel';
-    id: string;
-    name?: string;
-  };
-}
-
-interface CoachingPlanRecord {
-  id: string;
-  organizationId: string;
-  agentId: string;
-  agentName: string;
-  title?: string;
-  focusArea: string;
-  recommendationText: string;
-  targetMetric: string;
-  status: 'active' | 'in_progress' | 'completed';
-  assignedBy: string;
-  dueDate: string;
-  targetDate?: string;
-  progressPercent: number;
-  recommendedActions?: string[];
-}
-
-const memoryRecommendations: Map<string, RecommendationRecord> = new Map([
-  [
-    'rec-op-01',
-    {
-      id: 'rec-op-01',
-      organizationId: DEMO_ORG_ID,
-      domain: 'operational',
-      title: 'تحويل آلي للمحادثات المتأخرة في طابور الواتساب',
-      description: 'ارتفع متوسط زمن انتظار الواتساب إلى 52 ثانية (الحد الأقصى المسموح 40 ثانية). يُوصى بتفعيل الرد الآلي الذكي للفرز الأولي.',
-      priority: 'critical',
-      impact: 'تقليص زمن الانتظار بنسبة 65% والامتثال لمعايير SLA',
-      actionLabel: 'تفعيل التوجيه الذكي الآلي',
-      applied: false,
-      targetEntity: { type: 'channel', id: 'whatsapp', name: 'واتساب الأعمال الرسمي' },
-    },
-  ],
-  [
-    'rec-wfm-01',
-    {
-      id: 'rec-wfm-01',
-      organizationId: DEMO_ORG_ID,
-      domain: 'wfm',
-      title: 'إعادة توازن ورديات الاستراحة لتغطية ذروة 14:00',
-      description: 'نموذج Erlang C يتوقع عجزاً بمقدار 2 وكلاء خلال الساعة القادمة. يُوصى بتأخير استراحة وكيلين لمدة 30 دقيقة.',
-      priority: 'high',
-      impact: 'رفع معدل مستوى الخدمة (SL%) من 68% إلى 86%',
-      actionLabel: 'إعادة جدولة الاستراحات بنقرة واحدة',
-      applied: false,
-      targetEntity: { type: 'shift', id: 'shift-peak-14', name: 'مناوبة الظهيرة' },
-    },
-  ],
-  [
-    'rec-nba-01',
-    {
-      id: 'rec-nba-01',
-      organizationId: DEMO_ORG_ID,
-      domain: 'customer_nba',
-      title: 'سارة العتيبي (VIP) - إجراء استبقاء استباقي (Churn Prevention)',
-      description: 'تم رصد مؤشر عدم رضا 68% ناتج عن تأخر تركيب ألياف فايبر. يُوصى بتقديم خصم استبقاء 20% وترقية الراوتر لموديل Wi-Fi 6 مجاناً.',
-      priority: 'critical',
-      impact: 'حماية قيمة حساب العميل (LTV: 14,800 ر.س)',
-      actionLabel: 'اعتماد باقة الاستبقاء وتوليد رمز الخصم',
-      applied: false,
-      targetEntity: { type: 'customer', id: 'cust-001', name: 'سارة العتيبي' },
-    },
-  ],
-  [
-    'rec-qa-01',
-    {
-      id: 'rec-qa-01',
-      organizationId: DEMO_ORG_ID,
-      domain: 'qa_coaching',
-      title: 'خطة تدريبية للوكيلة سارة أحمد: تقليص وقت الصمت وإرشاد العميل',
-      description: 'سجلت المكالمات الأخيرة فترات صمت بلغت 28 ثانية أثناء البحث في النظام. يُوصى بتدريب مكثف على اختصارات لوحة المفاتيح والـ AI Copilot.',
-      priority: 'medium',
-      impact: 'تقليص متوسط زمن المعالجة (AHT) بـ 45 ثانية',
-      actionLabel: 'تعيين خطة التدريب في ملف الوكيل',
-      applied: false,
-      targetEntity: { type: 'agent', id: 'agt-sarah', name: 'سارة أحمد' },
-    },
-  ],
-  [
-    'rec-kb-01',
-    {
-      id: 'rec-kb-01',
-      organizationId: DEMO_ORG_ID,
-      domain: 'knowledge_gap',
-      title: 'سد فجوة معرفية: آلية التعويض عند انقطاعات الكيبل البحري',
-      description: 'تكرر استفسار العملاء 38 مرة خلال الـ 48 ساعة الماضية دون مقال معتمد في قاعدة المعرفة. يُوصى باعتماد ونشر المقال التوجيهي المرفق.',
-      priority: 'high',
-      impact: 'منع تضارب الإجابات بين الوكلاء ورفع دقة الدعم بنسبة 100%',
-      actionLabel: 'اعتماد ونشر المقال في مستودع المعرفة',
-      applied: false,
-      targetEntity: { type: 'kb', id: 'kb-draft-cable', name: 'سياسة تعويضات الكيابل البحرية' },
-    },
-  ],
-  [
-    'rec-cost-01',
-    {
-      id: 'rec-cost-01',
-      organizationId: DEMO_ORG_ID,
-      domain: 'cost_optimization',
-      title: 'تفعيل التخزين الدلالي المؤقت (Semantic Cache) لخفض استهلاك الذكاء الاصطناعي',
-      description: '42% من الاستفسارات الواردة تتعلق بالاستعلام عن الرصيد وأسعار الباقات، ويمكن الإجابة عليها فورياً من الكاش دون استدعاء LLM.',
-      priority: 'medium',
-      impact: 'توفير ما يقارب $48 شهرياً من ميزانية الذكاء الاصطناعي مع تقليل زمن الاستجابة إلى 80ms',
-      actionLabel: 'تفعيل الكاش الدلالي المتقدم',
-      applied: false,
-    },
-  ],
-]);
-
-const memoryCoachingPlans: Map<string, CoachingPlanRecord> = new Map([
-  [
-    'cp-01',
-    {
-      id: 'cp-01',
-      organizationId: DEMO_ORG_ID,
-      agentId: 'agt-sarah',
-      agentName: 'سارة أحمد',
-      title: 'خطة تقليص فترات الصمت وسرعة الاستجابة',
-      focusArea: 'تقليص زمن الصمت في المكالمات',
-      recommendationText: 'استخدام خاصية البحث اللحظي في مستودع المعرفة وتجنب وضع العميل في وضع الانتظار الصامت بدون إشعار صوتي لطيف.',
-      targetMetric: 'أقل من 15 ثانية صمت',
-      status: 'in_progress',
-      assignedBy: 'سلطان القحطاني (مشرف)',
-      dueDate: '2026-09-25',
-      targetDate: '2026-09-25',
-      progressPercent: 65,
-      recommendedActions: [
-        'الاستماع لتسجيلين نموذجيين لمكالمات de-escalation',
-        'التدريب على اختصارات البحث في قاعدة المعرفة',
-      ],
-    },
-  ],
-  [
-    'cp-02',
-    {
-      id: 'cp-02',
-      organizationId: DEMO_ORG_ID,
-      agentId: 'agt-omar',
-      agentName: 'عمر خالد',
-      title: 'خطة الامتثال الأمني والتحقق من الهوية',
-      focusArea: 'الامتثال للتحقق من هوية المتصل وسرية البيانات',
-      recommendationText: 'طلب الرقم التعريفي المؤقت عبر تطبيق مدار أو نفاذ قبل الإفصاح عن تفاصيل الفواتير أو العنوان المسجل.',
-      targetMetric: '100% نسبة الامتثال الأمني',
-      status: 'active',
-      assignedBy: 'مسؤول الجودة (QA Officer)',
-      dueDate: '2026-09-30',
-      targetDate: '2026-09-30',
-      progressPercent: 40,
-      recommendedActions: [
-        'مراجعة ضوابط الأمن السيبراني للهيئة الوطنية',
-        'محاكاة سيناريوهات التحقق الآمن مع المدرب الآلي',
-      ],
-    },
-  ],
-]);
-
 apiRouter.get('/recommendations', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
   const domain = req.query.domain as string;
-  let list = Array.from(memoryRecommendations.values()).filter(
-    (r) => r.organizationId === currentActor.organizationId
-  );
+  let list = db.getRecommendations(currentActor.organizationId);
   if (domain && domain !== 'all') {
     list = list.filter((r) => r.domain === domain);
   }
@@ -2408,16 +2251,20 @@ apiRouter.get('/recommendations', (req: Request, res: Response) => {
 
 apiRouter.post('/recommendations/:id/apply', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'settings.manage');
-  const rec = memoryRecommendations.get(req.params.id);
-  if (!rec || rec.organizationId !== currentActor.organizationId) {
+  const rec = db.getRecommendation(currentActor.organizationId, req.params.id);
+  if (!rec) {
     res.status(404).json({ success: false, error: { message: 'Recommendation not found' } });
     return;
   }
 
-  rec.applied = true;
-  rec.appliedAt = new Date().toISOString();
+  const updatedRec: RecommendationRecord = {
+    ...rec,
+    applied: true,
+    appliedAt: new Date().toISOString(),
+  };
+  db.saveRecommendation(currentActor.organizationId, updatedRec);
 
-  EventBus.publish('recommendation:applied', rec);
+  EventBus.publish('recommendation:applied', updatedRec);
 
   AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -2425,28 +2272,27 @@ apiRouter.post('/recommendations/:id/apply', (req: Request, res: Response) => {
     actorType: 'user',
     action: 'recommendation.apply',
     entityType: 'recommendation',
-    entityId: rec.id,
-    afterState: { domain: rec.domain, title: rec.title, applied: true },
+    entityId: updatedRec.id,
+    afterState: { domain: updatedRec.domain, title: updatedRec.title, applied: true },
   });
 
   res.json({
     success: true,
-    data: rec,
-    message: `تم تطبيق التوصية بنجاح: ${rec.title}`,
+    data: updatedRec,
+    message: `تم تطبيق التوصية بنجاح: ${updatedRec.title}`,
   });
 });
 
 apiRouter.get('/qa/coaching-plans', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
-  const plans = Array.from(memoryCoachingPlans.values()).filter(
-    (p) => p.organizationId === currentActor.organizationId
-  );
+  const plans = db.getCoachingPlans(currentActor.organizationId);
   res.json({ success: true, data: plans });
 });
 
 apiRouter.post('/qa/coaching-plans', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'qa.rubric.manage');
   const {
+    id: requestedId,
     agentId,
     agentName,
     focusArea,
@@ -2456,7 +2302,7 @@ apiRouter.post('/qa/coaching-plans', (req: Request, res: Response) => {
     dueDate,
     targetDate,
     recommendedActions,
-  } = req.body;
+  } = req.body || {};
 
   const resolvedText = recommendationText || title || 'خطة تدريبية وتطويرية مخصصة';
   const resolvedTitle = title || recommendationText || 'خطة تطوير الأداء والجودة';
@@ -2466,7 +2312,10 @@ apiRouter.post('/qa/coaching-plans', (req: Request, res: Response) => {
     return;
   }
 
-  const id = `cp-dyn-${Date.now().toString(36)}`;
+  const id =
+    typeof requestedId === 'string' && requestedId.trim() !== ''
+      ? requestedId.trim()
+      : `cp-dyn-${Date.now().toString(36)}`;
   const resolvedDueDate = dueDate || targetDate || new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10);
   const plan: CoachingPlanRecord = {
     id,
@@ -2482,12 +2331,13 @@ apiRouter.post('/qa/coaching-plans', (req: Request, res: Response) => {
     dueDate: resolvedDueDate,
     targetDate: resolvedDueDate,
     progressPercent: 0,
-    recommendedActions: recommendedActions && recommendedActions.length > 0
-      ? recommendedActions
-      : ['مراجعة سيناريوهات الدعم المعتمدة', 'جلسة تدريب مع مشرف الجودة'],
+    recommendedActions:
+      recommendedActions && recommendedActions.length > 0
+        ? recommendedActions
+        : ['مراجعة سيناريوهات الدعم المعتمدة', 'جلسة تدريب مع مشرف الجودة'],
   };
 
-  memoryCoachingPlans.set(id, plan);
+  db.saveCoachingPlan(currentActor.organizationId, plan);
 
   AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -2504,116 +2354,61 @@ apiRouter.post('/qa/coaching-plans', (req: Request, res: Response) => {
 
 apiRouter.post('/qa/coaching-plans/:id/progress', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'coaching.plan.manage');
-  const plan = memoryCoachingPlans.get(req.params.id);
-  if (!plan || plan.organizationId !== currentActor.organizationId) {
+  const plan = db.getCoachingPlan(currentActor.organizationId, req.params.id);
+  if (!plan) {
     res.status(404).json({ success: false, error: { message: 'Coaching plan not found' } });
     return;
   }
-  const { progressPercent, status } = req.body;
+  const { progressPercent, status } = req.body || {};
+  const updatedPlan: CoachingPlanRecord = { ...plan };
   if (typeof progressPercent === 'number') {
-    plan.progressPercent = Math.min(100, Math.max(0, progressPercent));
-    if (plan.progressPercent === 100) plan.status = 'completed';
-    else if (plan.progressPercent > 0) plan.status = 'in_progress';
+    updatedPlan.progressPercent = Math.min(100, Math.max(0, progressPercent));
+    if (updatedPlan.progressPercent === 100) updatedPlan.status = 'completed';
+    else if (updatedPlan.progressPercent > 0) updatedPlan.status = 'in_progress';
   }
-  if (status) plan.status = status;
+  if (status) updatedPlan.status = status;
 
-  res.json({ success: true, data: plan });
+  db.saveCoachingPlan(currentActor.organizationId, updatedPlan);
+
+  res.json({ success: true, data: updatedPlan });
 });
 
 // ----------------------------------------------------
 // 21. Canned Responses, Quick Macros & Guided Scenarios
 // ----------------------------------------------------
-interface MacroItem {
-  id: string;
-  shortcut: string;
-  title: string;
-  category: string;
-  text: string;
-  actions?: {
-    setStatus?: string;
-    setPriority?: string;
-    escalate?: boolean;
-    assignTo?: string;
-  };
-}
-
-const memoryMacros: MacroItem[] = [
-  {
-    id: 'macro-welcome',
-    shortcut: '/welcome',
-    title: 'ترحيب رسمي معتمد (CST Compliant)',
-    category: 'عام',
-    text: 'أهلاً بك في مدار كير للاتصالات والتقنية، يسعدني جداً خدمتك اليوم. كيف يمكنني مساعدتك؟',
-  },
-  {
-    id: 'macro-apology',
-    shortcut: '/apology',
-    title: 'اعتذار عن التأخير وعرض تعويض معتمد',
-    category: 'شكاوى',
-    text: 'نعتذر بشدة عن التأخير غير المقصود في تفعيل الخدمة. وبحسب معايير هيئة الاتصالات والفضاء والتقنية (CST)، تم تسجيل طلبكم بأولوية قصوى واحتساب رصيد تعويضي على فاتورتكم القادمة.',
-    actions: {
-      setPriority: 'urgent',
-    },
-  },
-  {
-    id: 'macro-esim',
-    shortcut: '/esim',
-    title: 'خطوات تفعيل وتثبيت شريحة eSIM',
-    category: 'الدعم الفني',
-    text: 'لتثبيت شريحة الـ eSIM، يرجى التوجه إلى: الإعدادات > البيانات الخلوية > إضافة باقة خلوية، ومسح رمز الاستجابة السريعة (QR Code) المرسل إلى بريدك المعتمد مع التأكد من الاتصال بشبكة Wi-Fi مستقرة.',
-  },
-  {
-    id: 'macro-escalate',
-    shortcut: '/escalate',
-    title: 'إشعار تصعيد إلى الدعم الميداني المتقدم',
-    category: 'تصعيد',
-    text: 'تم رفع تذكرتكم مباشرة إلى فريق المهندسين الميدانيين للمعاينة الفنية السريعة. سيصلك إشعار SMS برقم الموعد المحدد خلال ساعتين.',
-    actions: {
-      setPriority: 'urgent',
-      setStatus: 'escalated',
-      escalate: true,
-    },
-  },
-  {
-    id: 'macro-close',
-    shortcut: '/close',
-    title: 'إغلاق المحادثة وطلب تقييم الخدمة (CSAT)',
-    category: 'إغلاق',
-    text: 'سعدنا بخدمتكم في مدار كير! نرجو أن نكون وفقنا في حل استفساركم بالكامل. نرجو التكرم بتقييم مستوى الخدمة من 1 إلى 5 بالرد المباشر على هذه الرسالة.',
-    actions: {
-      setStatus: 'resolved',
-    },
-  },
-];
-
 apiRouter.get('/macros', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
-  res.json({ success: true, data: memoryMacros });
+  res.json({ success: true, data: db.getMacros(currentActor.organizationId) });
 });
 
 apiRouter.post('/macros', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'settings.manage');
-  const { shortcut, title, category, text, actions } = req.body;
+  const { id: requestedId, shortcut, title, category, text, actions } = req.body || {};
   if (!shortcut || !title || !text) {
     res.status(400).json({ success: false, error: { message: 'Shortcut, title, and text required' } });
     return;
   }
-  const newMacro: MacroItem = {
-    id: `macro-${Date.now().toString(36)}`,
+  const id =
+    typeof requestedId === 'string' && requestedId.trim() !== ''
+      ? requestedId.trim()
+      : `macro-${Date.now().toString(36)}`;
+  const newMacro: MacroRecord = {
+    id,
+    organizationId: currentActor.organizationId,
     shortcut: shortcut.startsWith('/') ? shortcut : `/${shortcut}`,
     title,
     category: category || 'عام',
     text,
     actions,
   };
-  memoryMacros.push(newMacro);
+  db.saveMacro(currentActor.organizationId, newMacro);
   res.json({ success: true, data: newMacro });
 });
 
 apiRouter.post('/macros/:id/execute', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.reply');
   const { conversationId } = req.body || {};
-  const macro = memoryMacros.find((m) => m.id === req.params.id);
+  const macro = db.getMacro(currentActor.organizationId, req.params.id);
   if (!macro) {
     res.status(404).json({ success: false, error: { message: 'Macro not found' } });
     return;
@@ -2991,9 +2786,7 @@ apiRouter.post('/system/execute-function', async (req: Request, res: Response) =
     }
     case 'recommendations': {
       apiRoute = 'GET /api/v1/recommendations';
-      const recs = Array.from(memoryRecommendations.values()).filter(
-        (r) => r.organizationId === currentActor.organizationId
-      );
+      const recs = db.getRecommendations(currentActor.organizationId);
       summary = `تم تحديث مركز التوصيات الذكية (${recs.length} توصيات تنفيذية جاهزة للتطبيق بنقرة واحدة لتحسين SLA وWFM)`;
       affectedEntity = 'recommendations_engine';
       details = { totalRecommendations: recs.length, appliedCount: recs.filter((r) => r.applied).length };
@@ -3072,7 +2865,11 @@ apiRouter.post('/system/execute-function', async (req: Request, res: Response) =
       apiRoute = 'POST /api/v1/ai/copilot/suggest (Training Simulator)';
       summary = 'تم تشغيل محاكي أكاديمية التدريب وتقييم استجابة الوكيل الآلية وفق معايير الجودة المعتمدة';
       affectedEntity = 'training_arena';
-      details = { scenarioStatus: 'active', evaluationReady: true, macrosLoaded: memoryMacros.length };
+      details = {
+        scenarioStatus: 'active',
+        evaluationReady: true,
+        macrosLoaded: db.getMacros(currentActor.organizationId).length,
+      };
       break;
     }
     case 'wfm': {
@@ -3091,9 +2888,7 @@ apiRouter.post('/system/execute-function', async (req: Request, res: Response) =
       const evalsCount = Array.from(db.qaEvaluations.values()).filter(
         (e) => e.organizationId === currentActor.organizationId
       ).length;
-      const coachingCount = Array.from(memoryCoachingPlans.values()).filter(
-        (p) => p.organizationId === currentActor.organizationId
-      ).length;
+      const coachingCount = db.getCoachingPlans(currentActor.organizationId).length;
       summary = `تم تشغيل محرك تقييم الجودة الآلي (QA) ومراجعة ${evalsCount} بطاقة تقييم وخطط التوجيه النشطة`;
       affectedEntity = 'qa_coaching';
       details = { evaluationsCount: evalsCount, coachingPlansCount: coachingCount };
@@ -3232,20 +3027,6 @@ interface GitHubSyncCommitRecord {
   timestamp: string;
 }
 
-interface TeamQAFeedbackItem {
-  id: string;
-  reviewerName: string;
-  reviewerRole: string;
-  moduleId: string;
-  moduleName: string;
-  verdict: 'passed_100' | 'minor_suggestion' | 'bug_report';
-  comment: string;
-  githubIssueUrl?: string;
-  githubIssueNumber?: number;
-  notifiedAdminPhone: string;
-  createdAt: string;
-}
-
 const PUBLIC_SHARED_APP_URL =
   process.env.SHARED_APP_URL ||
   'https://ais-pre-gqer3k5difwfcjdekzfmz2-100774856489.europe-west1.run.app';
@@ -3318,20 +3099,6 @@ let githubSyncState = {
 };
 
 const syncCommitsLedger: GitHubSyncCommitRecord[] = [];
-
-const teamQaFeedbackLedger: TeamQAFeedbackItem[] = [
-  {
-    id: 'qa-fb-001',
-    reviewerName: 'System Administrator',
-    reviewerRole: 'Owner / Lead Architect',
-    moduleId: 'live_ops',
-    moduleName: 'مركز العمليات المباشر والـ 21 وحدة',
-    verdict: 'passed_100',
-    comment: 'تم مراجعة وتدقيق الترابط اللحظي بين الواجهة والخادم وقواعد البيانات (Cloud SQL + Firestore) وإشعار الإدارة [REDACTED_PHONE].',
-    notifiedAdminPhone: '[REDACTED_PHONE]',
-    createdAt: new Date(Date.now() - 15 * 60000).toISOString(),
-  },
-];
 
 const ALLOWED_GITHUB_REPOS = new Set(['ahmedsheta89-cell/call-center']);
 const FORBIDDEN_DIRECT_SYNC_BRANCHES = new Set([
@@ -3872,7 +3639,7 @@ apiRouter.get('/github/project-files', (_req: Request, res: Response) => {
       },
       files: scan.files,
       commits: syncCommitsLedger.slice(0, 15),
-      teamFeedbackCount: teamQaFeedbackLedger.length,
+      teamFeedbackCount: db.getTeamQaFeedback(currentActor.organizationId).length,
     },
   });
 });
@@ -4476,7 +4243,7 @@ apiRouter.get('/qa/code-and-columns-audit', (_req: Request, res: Response) => {
       drizzlePgColumnsCount: 80,
       liveCloudSqlDeployedTablesCount: 3,
       liveCloudSqlDeployedColumnsCount: 22,
-      runtimeStoreCollectionsCount: 10,
+      runtimeStoreCollectionsCount: 16,
       runtimeStoreColumnsCount: 124,
       firestoreBlueprintEntitiesCount: 5,
       gitRepositoryStatus: {
@@ -4502,7 +4269,7 @@ apiRouter.get('/qa/feedback', (_req: Request, res: Response) => {
   res.json({
     success: true,
     data: {
-      items: teamQaFeedbackLedger,
+      items: db.getTeamQaFeedback(currentActor.organizationId),
       publicSharedAppUrl: PUBLIC_SHARED_APP_URL,
       adminPhone: '[REDACTED_PHONE]',
     },
@@ -4512,6 +4279,7 @@ apiRouter.get('/qa/feedback', (_req: Request, res: Response) => {
 apiRouter.post('/qa/feedback', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'qa.evaluate');
   const {
+    id: requestedId,
     reviewerName,
     reviewerRole,
     moduleId,
@@ -4535,8 +4303,14 @@ apiRouter.post('/qa/feedback', async (req: Request, res: Response) => {
   void githubToken;
   void createGithubIssue;
 
-  const newFeedback: TeamQAFeedbackItem = {
-    id: `qa-fb-${Date.now().toString().slice(-5)}`,
+  const feedbackId =
+    typeof requestedId === 'string' && requestedId.trim() !== ''
+      ? requestedId.trim()
+      : `qa-fb-${Date.now().toString().slice(-5)}`;
+
+  const newFeedback: TeamQAFeedbackRecord = {
+    id: feedbackId,
+    organizationId: currentActor.organizationId,
     reviewerName: AIGateway.redactPII(String(reviewerName).trim()),
     reviewerRole: String(reviewerRole || 'زميل فريق الاختبار (QA Reviewer)').trim(),
     moduleId: moduleId || 'live_ops',
@@ -4549,15 +4323,16 @@ apiRouter.post('/qa/feedback', async (req: Request, res: Response) => {
     createdAt: new Date().toISOString(),
   };
 
-  teamQaFeedbackLedger.unshift(newFeedback);
+  db.saveTeamQaFeedback(currentActor.organizationId, newFeedback);
 
   // Also create an urgent ticket automatically if a colleague reports a bug!
   if (verdict === 'bug_report') {
     const newTicketId = `tck-qa-${Date.now().toString().slice(-4)}`;
+    const tenantFeedbackCount = db.getTeamQaFeedback(currentActor.organizationId).length;
     db.tickets.set(newTicketId, {
       id: newTicketId,
       organizationId: currentActor.organizationId,
-      ticketNumber: 9000 + teamQaFeedbackLedger.length,
+      ticketNumber: 9000 + tenantFeedbackCount,
       title: `[بلاغ فحص الزملاء] ${newFeedback.moduleName} - ${newFeedback.reviewerName}`,
       description: newFeedback.comment,
       category: 'فحص جودة المنصة (Team QA)',
@@ -4570,6 +4345,7 @@ apiRouter.post('/qa/feedback', async (req: Request, res: Response) => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
+    db.schedulePersist();
   }
 
   await AuditLogger.log({
@@ -4675,107 +4451,10 @@ apiRouter.post('/workspace/relay', async (req: Request, res: Response) => {
 // 29. CROSS-PLATFORM ECOSYSTEM HUB (ANDROID APK/TWA + WINDOWS EXE + WEB PWA)
 // ============================================================================
 
-interface ConnectedDeviceSession {
-  deviceId: string;
-  deviceName: string;
-  osName: 'Android' | 'Windows' | 'iOS' | 'macOS' | 'Linux';
-  formFactor: 'mobile' | 'tablet' | 'desktop';
-  appRuntime: 'Android APK / TWA' | 'Windows Desktop EXE' | 'Standalone PWA' | 'Web Browser';
-  browserName: string;
-  screenResolution: string;
-  activeTab: string;
-  operatorRole: string;
-  adminPhone: string;
-  status: 'online_synced' | 'standby';
-  latencyMs: number;
-  lastHeartbeatAt: string;
-}
-
-interface CrossDeviceSyncEventRecord {
-  syncId: string;
-  sourceDeviceId: string;
-  sourcePlatform: string;
-  targetPlatforms: string[];
-  actionType: string;
-  payloadSummary: string;
-  sha256Receipt: string;
-  roundtripLatencyMs: number;
-  timestamp: string;
-}
-
-const connectedDevicesRegistry = new Map<string, ConnectedDeviceSession>([
-  [
-    'DEV-WIN11-HQ01',
-    {
-      deviceId: 'DEV-WIN11-HQ01',
-      deviceName: 'محطة عمل المسؤول الرئيسية — Windows 11 Pro Desktop',
-      osName: 'Windows',
-      formFactor: 'desktop',
-      appRuntime: 'Windows Desktop EXE',
-      browserName: 'Electron 34 / Edge WebView2',
-      screenResolution: '2560x1440',
-      activeTab: 'live_ops',
-      operatorRole: 'Owner / Admin (م. أحمد شتا)',
-      adminPhone: '01018108979',
-      status: 'online_synced',
-      latencyMs: 5,
-      lastHeartbeatAt: new Date().toISOString(),
-    },
-  ],
-  [
-    'DEV-AND15-MOB01',
-    {
-      deviceId: 'DEV-AND15-MOB01',
-      deviceName: 'هاتف المسؤول المحمول — Android 15 Enterprise App',
-      osName: 'Android',
-      formFactor: 'mobile',
-      appRuntime: 'Android APK / TWA',
-      browserName: 'Android System WebView / Chrome 134',
-      screenResolution: '1080x2400 (44px Touch Safe)',
-      activeTab: 'inbox',
-      operatorRole: 'Owner / Admin (01018108979)',
-      adminPhone: '01018108979',
-      status: 'online_synced',
-      latencyMs: 9,
-      lastHeartbeatAt: new Date().toISOString(),
-    },
-  ],
-  [
-    'DEV-TAB-SUP02',
-    {
-      deviceId: 'DEV-TAB-SUP02',
-      deviceName: 'جهاز لوحي مشرف المناوبة — Galaxy Tab S9 Ultra',
-      osName: 'Android',
-      formFactor: 'tablet',
-      appRuntime: 'Standalone PWA',
-      browserName: 'Chrome 134 Standalone',
-      screenResolution: '2960x1848',
-      activeTab: 'tickets',
-      operatorRole: 'Supervisor (مشرف عمليات)',
-      adminPhone: '01018108979',
-      status: 'online_synced',
-      latencyMs: 11,
-      lastHeartbeatAt: new Date().toISOString(),
-    },
-  ],
-]);
-
-const crossDeviceSyncLedger: CrossDeviceSyncEventRecord[] = [
-  {
-    syncId: 'SYNC-INIT-901',
-    sourceDeviceId: 'DEV-WIN11-HQ01',
-    sourcePlatform: 'Windows 11 Desktop EXE',
-    targetPlatforms: ['Android 15 App', 'Web Cloud PWA', 'Firestore + Cloud SQL'],
-    actionType: 'INITIAL_CLUSTER_HANDSHAKE',
-    payloadSummary: 'توحيد الحالة التشغيلية (25 محادثة، 12 تذكرة، 9 وكلاء) بين برنامج الويندوز وتطبيق الأندرويد والويب.',
-    sha256Receipt: crypto.createHash('sha256').update('omniflow-init-sync-01018108979').digest('hex').slice(0, 16),
-    roundtripLatencyMs: 8,
-    timestamp: new Date().toISOString(),
-  },
-];
-
 apiRouter.get('/platforms/devices', (_req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
+  const tenantDevices = db.getConnectedDevices(currentActor.organizationId);
+  const tenantSyncLedger = db.getCrossDeviceSyncEvents(currentActor.organizationId).slice(0, 20);
   res.json({
     success: true,
     data: {
@@ -4784,8 +4463,8 @@ apiRouter.get('/platforms/devices', (_req: Request, res: Response) => {
       adminPhone: '01018108979',
       adminEmail: 'ahmedsheta89@gmail.com',
       firestoreDbId: 'ai-studio-omniflowaios-c7e77753-7b8a-41c8-a9ca-10f723452807',
-      devices: Array.from(connectedDevicesRegistry.values()),
-      syncLedger: crossDeviceSyncLedger.slice(0, 20),
+      devices: tenantDevices,
+      syncLedger: tenantSyncLedger,
     },
   });
 });
@@ -4805,7 +4484,7 @@ apiRouter.post('/platforms/register-device', (req: Request, res: Response) => {
   } = req.body || {};
 
   const finalId = String(deviceId || `DEV-${Date.now().toString().slice(-5)}`).trim();
-  const appRuntime: ConnectedDeviceSession['appRuntime'] = isStandalonePWA
+  const appRuntime: ConnectedDeviceRecord['appRuntime'] = isStandalonePWA
     ? osName === 'Android'
       ? 'Android APK / TWA'
       : osName === 'Windows'
@@ -4813,8 +4492,10 @@ apiRouter.post('/platforms/register-device', (req: Request, res: Response) => {
       : 'Standalone PWA'
     : 'Web Browser';
 
-  const session: ConnectedDeviceSession = {
+  const session: ConnectedDeviceRecord = {
+    id: finalId,
     deviceId: finalId,
+    organizationId: currentActor.organizationId,
     deviceName:
       deviceName ||
       `جهاز متصل حي (${osName} · ${formFactor === 'mobile' ? 'هاتف محمول' : formFactor === 'tablet' ? 'تابلت' : 'كمبيوتر سطح مكتب'})`,
@@ -4831,14 +4512,15 @@ apiRouter.post('/platforms/register-device', (req: Request, res: Response) => {
     lastHeartbeatAt: new Date().toISOString(),
   };
 
-  connectedDevicesRegistry.set(finalId, session);
+  db.saveConnectedDevice(currentActor.organizationId, session);
   EventBus.publish('device:connected', session);
 
+  const tenantDevices = db.getConnectedDevices(currentActor.organizationId);
   res.json({
     success: true,
     data: {
       device: session,
-      totalDevices: connectedDevicesRegistry.size,
+      totalDevices: tenantDevices.length,
     },
   });
 });
@@ -4854,14 +4536,16 @@ apiRouter.post('/platforms/sync-state', async (req: Request, res: Response) => {
     activeTab = 'cross_platform_hub',
   } = req.body || {};
 
-  // Update timestamps on all connected devices
+  // Update timestamps on tenant-scoped connected devices only
   const nowIso = new Date().toISOString();
-  for (const [, dev] of connectedDevicesRegistry.entries()) {
-    dev.lastHeartbeatAt = nowIso;
-    dev.activeTab = activeTab;
-  }
-
-  db.saveToDisk();
+  const tenantDevices = db.getConnectedDevices(currentActor.organizationId).map((dev) => {
+    const updated: ConnectedDeviceRecord = {
+      ...dev,
+      lastHeartbeatAt: nowIso,
+      activeTab,
+    };
+    return db.saveConnectedDevice(currentActor.organizationId, updated);
+  });
 
   const orgConvsCount = db.getConversations(currentActor.organizationId).length;
   const orgTicketsCount = db.getTickets(currentActor.organizationId).length;
@@ -4880,14 +4564,15 @@ apiRouter.post('/platforms/sync-state', async (req: Request, res: Response) => {
     .slice(0, 16);
 
   const roundtripLatencyMs = Math.max(5, Date.now() - t0 + 4);
+  const syncId = `SYNC-${Date.now().toString().slice(-6)}`;
 
   const syncEvent: CrossDeviceSyncEventRecord = {
-    syncId: `SYNC-${Date.now().toString().slice(-6)}`,
+    id: syncId,
+    syncId,
+    organizationId: currentActor.organizationId,
     sourceDeviceId,
     sourcePlatform,
-    targetPlatforms: Array.from(connectedDevicesRegistry.values()).map(
-      (d) => `${d.osName} (${d.deviceId})`
-    ),
+    targetPlatforms: tenantDevices.map((d) => `${d.osName} (${d.deviceId})`),
     actionType,
     payloadSummary,
     sha256Receipt,
@@ -4895,7 +4580,8 @@ apiRouter.post('/platforms/sync-state', async (req: Request, res: Response) => {
     timestamp: nowIso,
   };
 
-  crossDeviceSyncLedger.unshift(syncEvent);
+  db.saveCrossDeviceSyncEvent(currentActor.organizationId, syncEvent);
+  db.saveToDisk();
   EventBus.publish('device:state_sync', syncEvent);
 
   await AuditLogger.log({
@@ -4912,8 +4598,8 @@ apiRouter.post('/platforms/sync-state', async (req: Request, res: Response) => {
     success: true,
     data: {
       syncEvent,
-      devicesSyncedCount: connectedDevicesRegistry.size,
-      devices: Array.from(connectedDevicesRegistry.values()),
+      devicesSyncedCount: tenantDevices.length,
+      devices: tenantDevices,
     },
   });
 });
@@ -5285,10 +4971,12 @@ apiRouter.post('/platforms/verify-all', (req: Request, res: Response) => {
       id: 'xp-sync-01',
       platform: 'Cross-Device Real-Time Sync',
       name: 'اختبار الترابط اللحظي بين الأندرويد والويندوز والويب عبر SSE وقاعدة البيانات المزدوجة',
-      passed: connectedDevicesRegistry.size >= 3 && db.tickets.size > 0,
+      passed:
+        db.getConnectedDevices(currentActor.organizationId).length >= 3 &&
+        db.getTickets(currentActor.organizationId).length > 0,
       assertionsCount: 16,
       durationMs: 9,
-      evidenceProof: `Connected Nodes: ${connectedDevicesRegistry.size} (Windows 11 EXE + Android 15 APK + Tablet PWA) | Firestore DB: ai-studio-omniflowaios-c7e77753-7b8a-41c8-a9ca-10f723452807`,
+      evidenceProof: `Connected Nodes: ${db.getConnectedDevices(currentActor.organizationId).length} (Windows 11 EXE + Android 15 APK + Tablet PWA) | Firestore DB: ai-studio-omniflowaios-c7e77753-7b8a-41c8-a9ca-10f723452807`,
     },
     {
       id: 'xp-sync-02',

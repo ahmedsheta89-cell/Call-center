@@ -6,6 +6,7 @@
 
 import crypto from 'crypto';
 import { AuditEvent, UUID } from './types.ts';
+import { CHANNEL_SECRET_KEY_REGEX, isChannelSecretField, isEncryptedSecretEnvelope } from './channelCrypto.ts';
 
 export interface AuditParams {
   organizationId: UUID;
@@ -22,7 +23,7 @@ export interface AuditParams {
   reason?: string;
 }
 
-const SENSITIVE_KEY_PATTERN = /password|secret|token|apikey|api_key|authorization|privatekey|creditcard|cvv/i;
+const SENSITIVE_KEY_PATTERN = CHANNEL_SECRET_KEY_REGEX;
 const CARD_NUMBER_REGEX = /\b(?:\d[ -]*?){13,16}\b/g;
 
 export function redactSensitiveValue(val: unknown): unknown {
@@ -33,9 +34,12 @@ export function redactSensitiveValue(val: unknown): unknown {
     return val.map(redactSensitiveValue);
   }
   if (val && typeof val === 'object') {
+    if (isEncryptedSecretEnvelope(val)) {
+      return '[REDACTED_SECRET]';
+    }
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-      if (SENSITIVE_KEY_PATTERN.test(k)) {
+      if (isChannelSecretField(k) || SENSITIVE_KEY_PATTERN.test(k)) {
         out[k] = '[REDACTED_SECRET]';
       } else {
         out[k] = redactSensitiveValue(v);
