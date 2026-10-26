@@ -157,6 +157,7 @@ async function runComprehensiveEnterpriseAudit() {
 
     const authHeaders = (token: string, extra: Record<string, string> = {}) => ({
       'Content-Type': 'application/json',
+      Connection: 'close',
       Authorization: `Bearer ${token}`,
       ...extra,
     });
@@ -1437,8 +1438,14 @@ async function runComprehensiveEnterpriseAudit() {
         );
       }
 
-      // Now point persistence to an unwritable kernel procfs path to force write failure
-      const unwritablePath = '/proc/omniflow_forbidden_dir/db_state.json';
+      // Now point persistence to a deterministic unwritable path (regular file used as parent directory -> ENOTDIR)
+      const p1UnwritableBlockerFile = path.join(
+        os.tmpdir(),
+        'omniflow-data',
+        `p1_unwritable_blocker_${Date.now()}`
+      );
+      fs.writeFileSync(p1UnwritableBlockerFile, 'not-a-directory', 'utf-8');
+      const unwritablePath = path.join(p1UnwritableBlockerFile, 'db_state.json');
       db.setPersistFilePathForTesting(unwritablePath);
       const unwritableSaveResult = db.saveToDisk();
       const writeErrorDiag = db.getLastStorageError();
@@ -1460,8 +1467,13 @@ async function runComprehensiveEnterpriseAudit() {
       });
       const failedDiskRestoreJson = await failedDiskRestoreRes.json();
 
-      // Restore valid test disk path
+      // Restore valid test disk path and remove blocker file
       db.setPersistFilePathForTesting(p1TempDiskPath);
+      try {
+        if (fs.existsSync(p1UnwritableBlockerFile)) fs.unlinkSync(p1UnwritableBlockerFile);
+      } catch {
+        // ignore
+      }
 
       if (
         unwritableSaveResult !== false ||
@@ -1609,12 +1621,22 @@ async function runComprehensiveEnterpriseAudit() {
     }
 
     // -------------------------------------------------------------------------
-    // 3E.3 PHASE P.1.2 — CHANNEL SECRET ENCRYPTION & BACKUP/RESTORE INTEGRITY SUITE (AT-01..AT-16)
+    // 3E.3 PHASE P.1.2 — CHANNEL SECRET ENCRYPTION & BACKUP/RESTORE INTEGRITY SUITE (AT-01..AT-17)
     // -------------------------------------------------------------------------
-    console.log('\n  [PHASE P.1.2] 🔐 CHANNEL SECRET ENCRYPTION & BACKUP/RESTORE INTEGRITY SUITE (AT-01..AT-16):');
+    console.log('\n  [PHASE P.1.2] 🔐 CHANNEL SECRET ENCRYPTION & BACKUP/RESTORE INTEGRITY SUITE (AT-01..AT-17):');
     const preP12FullSnapshot = db.exportFullBackup();
     try {
-      await runPhaseP12AcceptanceSuite({ existingBaseUrl: baseUrl });
+      const p12Results = await runPhaseP12AcceptanceSuite({ existingBaseUrl: baseUrl });
+      if (p12Results.length !== 17 || p12Results.some((r) => !r.passed || !r.readAfterDeleteVerified)) {
+        throw new Error(
+          `[PHASE P.1.2] Acceptance suite did not pass all 17 tests! Count=${p12Results.length}`
+        );
+      }
+      for (const r of p12Results) {
+        console.log(
+          `  ✅ [${r.id}] ${r.title} -> PASS (Read-After-Delete=${r.readAfterDeleteVerified})`
+        );
+      }
     } finally {
       db.setPersistFilePathForTesting(auditSuiteDiskPath);
       db.importFullBackup(preP12FullSnapshot);
@@ -2223,11 +2245,16 @@ async function runComprehensiveEnterpriseAudit() {
     if (!hadExternalEncryptionKey) {
       delete process.env.CHANNEL_SECRET_ENCRYPTION_KEY;
     }
+    server.closeAllConnections?.();
     server.close();
   }
 }
 
-runComprehensiveEnterpriseAudit().catch((err) => {
-  console.error('❌ Audit Runner Failed:', err);
-  process.exit(1);
-});
+runComprehensiveEnterpriseAudit()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error('❌ Audit Runner Failed:', err);
+    process.exit(1);
+  });

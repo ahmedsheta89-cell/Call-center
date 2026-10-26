@@ -327,6 +327,7 @@ class DatabaseStore implements IDataStore {
   private persistTimer: NodeJS.Timeout | null = null;
   private lastStorageError: StorageDiagnosticError | null = null;
   private existingFileProtected = false;
+  private existingFileProtectionReason: 'NONE' | 'CORRUPTED_OR_EMPTY' | 'SECRET_KEY_PROTECTED' = 'NONE';
 
   private recordStorageError(
     operation: StorageDiagnosticError['operation'],
@@ -360,6 +361,7 @@ class DatabaseStore implements IDataStore {
       this.persistTimer = null;
     }
     this.existingFileProtected = false;
+    this.existingFileProtectionReason = 'NONE';
     this.persistFilePath = customPath ? customPath : this.defaultPersistFilePath;
   }
 
@@ -859,6 +861,7 @@ class DatabaseStore implements IDataStore {
       this.saveToDisk();
       this.persistTimer = null;
     }, delayMs);
+    this.persistTimer.unref?.();
   }
 
   private sanitizeChannelConfigsForExport(records: ChannelConfigRecord[]): ChannelConfigRecord[] {
@@ -1025,12 +1028,17 @@ class DatabaseStore implements IDataStore {
 
   public saveToDisk(): boolean {
     if (this.existingFileProtected) {
-      this.recordStorageError(
-        'saveToDisk',
-        'DISK_OVERWRITE_BLOCKED_UNMIGRATED_FILE',
-        'Refusing to overwrite existing persistence file because a previous load or secret migration failed. Fix CHANNEL_SECRET_ENCRYPTION_KEY or file integrity first.'
-      );
-      return false;
+      if (!fs.existsSync(this.persistFilePath)) {
+        this.existingFileProtected = false;
+        this.existingFileProtectionReason = 'NONE';
+      } else {
+        this.recordStorageError(
+          'saveToDisk',
+          'DISK_OVERWRITE_BLOCKED_UNMIGRATED_FILE',
+          'Refusing to overwrite existing persistence file because a previous load or secret migration failed. Fix CHANNEL_SECRET_ENCRYPTION_KEY or file integrity first.'
+        );
+        return false;
+      }
     }
 
     const tmpPath = `${this.persistFilePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
@@ -1078,6 +1086,7 @@ class DatabaseStore implements IDataStore {
     try {
       if (!fs.existsSync(this.persistFilePath)) {
         this.existingFileProtected = false;
+        this.existingFileProtectionReason = 'NONE';
         this.recordStorageError('loadFromDisk', 'DISK_FILE_NOT_FOUND', `Persistence file not found at ${this.persistFilePath}`);
         return false;
       }
@@ -1085,6 +1094,7 @@ class DatabaseStore implements IDataStore {
       const content = fs.readFileSync(this.persistFilePath, 'utf-8');
       if (!content || content.trim().length === 0) {
         this.existingFileProtected = true;
+        this.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY';
         this.recordStorageError('loadFromDisk', 'DISK_FILE_EMPTY', 'Persistence file is empty');
         return false;
       }
@@ -1094,6 +1104,7 @@ class DatabaseStore implements IDataStore {
         parsed = JSON.parse(content);
       } catch (parseErr) {
         this.existingFileProtected = true;
+        this.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY';
         this.recordStorageError('loadFromDisk', 'DISK_PERSISTENCE_READ_FAILED', parseErr);
         console.error('[Storage Error] Corrupted JSON in persistence file:', sanitizeStorageDiagnosticMessage(parseErr));
         return false;
@@ -1101,6 +1112,7 @@ class DatabaseStore implements IDataStore {
 
       if (!parsed || !Array.isArray(parsed.organizations) || parsed.organizations.length === 0) {
         this.existingFileProtected = true;
+        this.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY';
         this.recordStorageError('loadFromDisk', 'DISK_LOAD_INVALID_SCHEMA', 'Parsed JSON missing valid organizations array');
         return false;
       }
@@ -1121,6 +1133,7 @@ class DatabaseStore implements IDataStore {
         const keyCheck = validateChannelEncryptionKey();
         if (!keyCheck.valid) {
           this.existingFileProtected = true;
+          this.existingFileProtectionReason = 'SECRET_KEY_PROTECTED';
           const contextMsg = hasLegacyPlaintextSecrets
             ? `Legacy plain-text channel secrets detected in persistence file, but migration cannot proceed: ${keyCheck.reason} Recovery: configure a valid 64-character lowercase hex CHANNEL_SECRET_ENCRYPTION_KEY and reload.`
             : `Encrypted channel secrets in persistence file cannot be decrypted: ${keyCheck.reason} Recovery: configure the matching 64-character lowercase hex CHANNEL_SECRET_ENCRYPTION_KEY and reload.`;
@@ -1173,6 +1186,12 @@ class DatabaseStore implements IDataStore {
       });
       if (!importRes.ok) {
         this.existingFileProtected = true;
+        this.existingFileProtectionReason =
+          importRes.code === 'AUTH_TAG_MISMATCH' ||
+          importRes.code.startsWith('CHANNEL_SECRET_') ||
+          importRes.code.startsWith('INVALID_')
+            ? 'SECRET_KEY_PROTECTED'
+            : 'CORRUPTED_OR_EMPTY';
         this.recordStorageError('loadFromDisk', importRes.code, importRes.message);
         return false;
       }
@@ -1182,6 +1201,7 @@ class DatabaseStore implements IDataStore {
       // If the migration disk write fails, roll back memory and keep the original file untouched.
       if (hasLegacyPlaintextSecrets) {
         this.existingFileProtected = false;
+        this.existingFileProtectionReason = 'NONE';
         const migrated = this.saveToDisk();
         if (!migrated) {
           for (const k of collectionKeys) {
@@ -1194,6 +1214,7 @@ class DatabaseStore implements IDataStore {
           }
           AuditLogger.importEvents(preLoadAuditEvents);
           this.existingFileProtected = true;
+          this.existingFileProtectionReason = 'SECRET_KEY_PROTECTED';
           const prevErr = this.getLastStorageError();
           this.recordStorageError(
             'loadFromDisk',
@@ -1206,10 +1227,12 @@ class DatabaseStore implements IDataStore {
       }
 
       this.existingFileProtected = false;
+      this.existingFileProtectionReason = 'NONE';
       console.log(`[Storage] Successfully restored enterprise database from persistent storage (${parsed.exportedAt || 'saved state'}).`);
       return true;
     } catch (err: any) {
       this.existingFileProtected = true;
+      this.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY';
       const errCode = typeof err?.code === 'string' ? err.code : 'DISK_LOAD_FAILED';
       this.recordStorageError('loadFromDisk', errCode, err);
       console.error('[Storage Error] Failed to load database state from disk:', sanitizeStorageDiagnosticMessage(err));
@@ -1603,8 +1626,18 @@ class DatabaseStore implements IDataStore {
       }
 
       if (options?.persistToDisk) {
+        const wasCorruptProtected =
+          this.existingFileProtected && this.existingFileProtectionReason === 'CORRUPTED_OR_EMPTY';
+        if (wasCorruptProtected) {
+          this.existingFileProtected = false;
+          this.existingFileProtectionReason = 'NONE';
+        }
         const saved = this.saveToDisk();
         if (!saved) {
+          if (wasCorruptProtected) {
+            this.existingFileProtected = true;
+            this.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY';
+          }
           // Roll back in-memory state if disk write fails!
           for (const spec of collectionSpecs) {
             const targetMap: Map<UUID, any> = (this as any)[spec.key];

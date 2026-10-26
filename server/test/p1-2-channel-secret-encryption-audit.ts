@@ -31,8 +31,10 @@ import {
 
 export const P1_2_TEST_ORG_ID = 'org-p1-2-encryption-audit-temp';
 export const P1_2_PEER_ORG_ID = 'org-p1-2-encryption-audit-temp-peer';
+export const P1_2_HANG_FIX_ORG_ID = 'org-p1-2-hang-fix-temp';
 const P1_2_ADMIN_USER_ID = 'usr-p1-2-encryption-admin';
 const P1_2_PEER_ADMIN_USER_ID = 'usr-p1-2-encryption-peer-admin';
+const P1_2_HANG_FIX_USER_ID = 'usr-p1-2-hang-fix-admin';
 
 export interface AcceptanceTestResult {
   id: string;
@@ -53,9 +55,11 @@ async function httpJson(
     method,
     headers: {
       'Content-Type': 'application/json',
+      Connection: 'close',
       ...headers,
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(10000),
   });
   const rawText = await res.text();
   let parsed: any = null;
@@ -878,7 +882,9 @@ export async function runPhaseP12AcceptanceSuite(options?: {
       },
     ];
 
-    db.setPersistFilePathForTesting('/proc/omniflow_forbidden_p1_2/db_state.json');
+    const at11BlockerFile = path.join(p12TempDir, 'at11_not_a_directory_blocker');
+    fs.writeFileSync(at11BlockerFile, 'regular-file-blocker', 'utf-8');
+    db.setPersistFilePathForTesting(path.join(at11BlockerFile, 'db_state.json'));
     const at11RestoreFailRes = await httpJson(
       baseUrl,
       'POST',
@@ -1188,12 +1194,176 @@ export async function runPhaseP12AcceptanceSuite(options?: {
       readAfterDeleteVerified: at16Clean,
     });
 
+    // =========================================================================
+    // AT-17: Corrupted/Invalid JSON Persistence File Fast-Fail (<5s) & Zero-Hang Recovery (Hotfix Gate)
+    // Uses strictly isolated synthetic organization: `org-p1-2-hang-fix-temp`
+    // =========================================================================
+    const at17StartMs = performance.now();
+    const at17CorruptFile = path.join(p12TempDir, 'at17_corrupted_persistence.json');
+
+    db.organizations.set(P1_2_HANG_FIX_ORG_ID, {
+      id: P1_2_HANG_FIX_ORG_ID,
+      name: 'Synthetic P.1.2 Hotfix Hang Audit Tenant',
+      slug: 'p1-2-hang-fix-temp',
+      plan: 'enterprise',
+      settings: {
+        timezone: 'Africa/Cairo',
+        defaultLanguage: 'ar',
+        workingHours: { start: '09:00', end: '17:00', days: [0, 1, 2, 3, 4] },
+        zeroCostMode: false,
+        aiMonthlyBudgetUsd: 50,
+        aiCurrentMonthSpendUsd: 0,
+      },
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    db.users.set(P1_2_HANG_FIX_USER_ID, {
+      id: P1_2_HANG_FIX_USER_ID,
+      organizationId: P1_2_HANG_FIX_ORG_ID,
+      email: 'admin@p1-2-hang-fix.local',
+      fullName: 'P.1.2 Hotfix Hang Auditor',
+      role: 'Admin',
+      isActive: true,
+      mfaEnabled: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const hangFixSession = issueSessionToken({
+      userId: P1_2_HANG_FIX_USER_ID,
+    });
+    const hangFixHeaders = {
+      Authorization: `Bearer ${hangFixSession.token}`,
+      'X-CSRF-Token': hangFixSession.csrfToken,
+    };
+
+    const at17Secret = 'SYNTH-P12-AT17-HANG-FIX-SECRET-777';
+    db.setChannelConfig(P1_2_HANG_FIX_ORG_ID, 'chan-whatsapp', {
+      wabaId: 'WABA-AT17-HANGFIX',
+      apiToken: at17Secret,
+    });
+    const at17ValidTenantBackup = db.exportTenantBackup(P1_2_HANG_FIX_ORG_ID);
+
+    // 17A: Truncated JSON at position 74 (exact reproduction of CI log error)
+    fs.writeFileSync(
+      at17CorruptFile,
+      '{"version":"1.1.0-enterprise-p1","organizations":[{"id":"truncated_json...',
+      'utf-8'
+    );
+    db.setPersistFilePathForTesting(at17CorruptFile);
+    const t0Truncated = performance.now();
+    const truncatedLoadResult = db.loadFromDisk();
+    const truncatedLoadDurationMs = performance.now() - t0Truncated;
+    const truncatedDiag = db.getLastStorageError();
+
+    // 17B: Random malformed garbage payload
+    fs.writeFileSync(at17CorruptFile, '\x00\xFF{{{corrupted_non_json_payload_at17', 'utf-8');
+    const t0Garbage = performance.now();
+    const garbageLoadResult = db.loadFromDisk();
+    const garbageLoadDurationMs = performance.now() - t0Garbage;
+    const garbageDiag = db.getLastStorageError();
+
+    // 17C: Verify that once the corrupted file is removed on disk, saveToDisk() recovers immediately without permanent lockout
+    fs.unlinkSync(at17CorruptFile);
+    const saveAfterCorruptUnlink = db.saveToDisk();
+
+    // 17D: Verify that if the file on disk is corrupted again, an explicit HTTP POST /system/restore recovers cleanly within <5s
+    fs.writeFileSync(
+      at17CorruptFile,
+      '{"version":"1.2.0-enterprise-p1-2","organizations":[{"id":"org-p1-2-hang-fix-temp"',
+      'utf-8'
+    );
+    db.loadFromDisk(); // Sets CORRUPTED_OR_EMPTY protection
+    const at17RestoreRes = await httpJson(
+      baseUrl,
+      'POST',
+      '/system/restore',
+      hangFixHeaders,
+      at17ValidTenantBackup
+    );
+
+    const at17TotalElapsedMs = performance.now() - at17StartMs;
+
+    if (
+      truncatedLoadResult !== false ||
+      truncatedDiag?.operation !== 'loadFromDisk' ||
+      truncatedDiag?.code !== 'DISK_PERSISTENCE_READ_FAILED' ||
+      truncatedLoadDurationMs >= 5000 ||
+      garbageLoadResult !== false ||
+      garbageDiag?.code !== 'DISK_PERSISTENCE_READ_FAILED' ||
+      garbageLoadDurationMs >= 5000 ||
+      saveAfterCorruptUnlink !== true ||
+      at17RestoreRes.status !== 200 ||
+      at17TotalElapsedMs >= 5000
+    ) {
+      throw new Error(
+        `[AT-17] Corrupted JSON fast-fail & recovery check failed: truncated=${truncatedLoadResult} (${truncatedLoadDurationMs.toFixed(2)}ms, code=${truncatedDiag?.code}), garbage=${garbageLoadResult} (${garbageLoadDurationMs.toFixed(2)}ms), saveAfterUnlink=${saveAfterCorruptUnlink}, restoreStatus=${at17RestoreRes.status}, totalMs=${at17TotalElapsedMs.toFixed(2)}ms`
+      );
+    }
+
+    // Strict cleanup & Read-After-Delete proof for `org-p1-2-hang-fix-temp`
+    db.purgeOrganizationData(P1_2_HANG_FIX_ORG_ID);
+    db.users.delete(P1_2_HANG_FIX_USER_ID);
+    db.organizations.delete(P1_2_HANG_FIX_ORG_ID);
+    AuditLogger.importEvents(
+      AuditLogger.exportAllEvents().filter((e) => e.organizationId !== P1_2_HANG_FIX_ORG_ID)
+    );
+    if (fs.existsSync(at17CorruptFile)) {
+      fs.unlinkSync(at17CorruptFile);
+    }
+    db.setPersistFilePathForTesting(suiteDiskPath);
+    db.saveToDisk();
+
+    const at17ReadAfterDeleteHttp = await httpJson(
+      baseUrl,
+      'GET',
+      '/integrations/channels',
+      hangFixHeaders
+    );
+    const at17ReadAfterDeleteVerified =
+      !db.organizations.has(P1_2_HANG_FIX_ORG_ID) &&
+      !db.users.has(P1_2_HANG_FIX_USER_ID) &&
+      !db.channelConfigs.has(`${P1_2_HANG_FIX_ORG_ID}::chan-whatsapp`) &&
+      !fs.existsSync(at17CorruptFile) &&
+      at17ReadAfterDeleteHttp.status === 401 &&
+      !fs.readFileSync(suiteDiskPath, 'utf-8').includes(at17Secret) &&
+      !fs.readFileSync(suiteDiskPath, 'utf-8').includes(P1_2_HANG_FIX_ORG_ID);
+
+    if (!at17ReadAfterDeleteVerified) {
+      throw new Error('[AT-17] Read-After-Delete verification failed for org-p1-2-hang-fix-temp');
+    }
+
+    if (verbose) {
+      console.log('=== [RAW AT-17] Corrupted JSON Fast-Fail & Recovery Diagnostic ===\n', {
+        tenantId: P1_2_HANG_FIX_ORG_ID,
+        truncatedLoadResult,
+        truncatedLoadDurationMs: Number(truncatedLoadDurationMs.toFixed(3)),
+        truncatedErrorCode: truncatedDiag?.code,
+        garbageLoadResult,
+        garbageLoadDurationMs: Number(garbageLoadDurationMs.toFixed(3)),
+        saveAfterCorruptUnlink,
+        restoreOverCorruptStatus: at17RestoreRes.status,
+        totalElapsedMs: Number(at17TotalElapsedMs.toFixed(3)),
+        readAfterDeleteVerified: at17ReadAfterDeleteVerified,
+      });
+    }
+
+    results.push({
+      id: 'AT-17',
+      title: 'ملف استمرارية تالف/JSON غير صالح يجب أن يُرفض خلال زمن محدود (<5 ثوانٍ) برسالة خطأ صريحة، ولا يُسبب تعليقًا لانهائيًا أبدًا',
+      passed: true,
+      evidenceSummary: `Corrupted/truncated JSON rejected in ${truncatedLoadDurationMs.toFixed(2)}ms (<5000ms) with DISK_PERSISTENCE_READ_FAILED; total AT-17 duration=${at17TotalElapsedMs.toFixed(2)}ms; unlink/restore recovery=PASS; Read-After-Delete(${P1_2_HANG_FIX_ORG_ID})=true`,
+      readAfterDeleteVerified: at17ReadAfterDeleteVerified,
+    });
+
     return results;
   } finally {
     // Restore original store state and remove temporary test directory and synthetic organizations
     db.setPersistFilePathForTesting(originalPersistPath);
     db.purgeOrganizationData(P1_2_TEST_ORG_ID);
     db.purgeOrganizationData(P1_2_PEER_ORG_ID);
+    db.purgeOrganizationData(P1_2_HANG_FIX_ORG_ID);
 
     db.organizations.clear();
     for (const [k, v] of preSuiteOrgs.entries()) db.organizations.set(k, v);
@@ -1218,6 +1388,7 @@ export async function runPhaseP12AcceptanceSuite(options?: {
     }
 
     if (localServer) {
+      localServer.closeAllConnections?.();
       localServer.close();
     }
   }
@@ -1230,13 +1401,14 @@ const isDirectExecution =
 if (isDirectExecution) {
   runPhaseP12AcceptanceSuite({ verboseRawDump: true })
     .then((res) => {
-      console.log('\n=== PHASE P.1.2 ACCEPTANCE SUITE SUMMARY (AT-01 .. AT-16) ===');
+      console.log('\n=== PHASE P.1.2 ACCEPTANCE SUITE SUMMARY (AT-01 .. AT-17) ===');
       for (const r of res) {
         console.log(
           `  ✅ [${r.id}] ${r.title} -> PASS (Read-After-Delete=${r.readAfterDeleteVerified}) | ${r.evidenceSummary}`
         );
       }
-      console.log(`TOTAL: ${res.length}/16 PASSED`);
+      console.log(`TOTAL: ${res.length}/17 PASSED`);
+      process.exit(0);
     })
     .catch((err) => {
       console.error('PHASE P.1.2 ACCEPTANCE SUITE FAILED:', err);
