@@ -166,20 +166,6 @@ apiRouter.post('/system/restore', (req: Request, res: Response) => {
     return;
   }
 
-  if (Array.isArray(payload.auditEvents) && payload.auditEvents.length > 0) {
-    const chainCheck = AuditLogger.verifyChainIntegrity(payload.auditEvents);
-    if (!chainCheck.valid) {
-      res.status(400).json({
-        success: false,
-        error: {
-          code: 'TAMPERED_AUDIT_CHAIN',
-          message: `Audit chain integrity verification failed: ${chainCheck.failureReason || 'Invalid hash chain'}`,
-        },
-      });
-      return;
-    }
-  }
-
   const restoreResult = db.importFullBackupDetailed(payload, {
     scopeOrgId: currentActor.organizationId,
     persistToDisk: true,

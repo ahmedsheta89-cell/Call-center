@@ -34,6 +34,7 @@ import {
 import firebaseConfig from '../../firebase-applet-config.json';
 import { runFirestoreSecurityGateAudit, runFirestoreEmulatorSecuritySuite } from './firestore-rules-audit.ts';
 import { runPhaseP12AcceptanceSuite } from './p1-2-channel-secret-encryption-audit.ts';
+import { runPhaseP13AuditChainSuite } from './p1-3-audit-chain-integrity-audit.ts';
 import * as dbSchema from '../../src/db/schema.ts';
 
 process.stdout.on('error', (err: NodeJS.ErrnoException) => {
@@ -42,9 +43,18 @@ process.stdout.on('error', (err: NodeJS.ErrnoException) => {
 
 async function runComprehensiveEnterpriseAudit() {
   const hadExternalEncryptionKey = Boolean(process.env.CHANNEL_SECRET_ENCRYPTION_KEY?.trim());
+  const hadExternalAuditHmacKey = Boolean(process.env.AUDIT_CHECKPOINT_HMAC_KEY?.trim());
+  const hadExternalAuditHmacKeyId = Boolean(process.env.AUDIT_CHECKPOINT_HMAC_KEY_ID?.trim());
   if (!hadExternalEncryptionKey) {
     process.env.CHANNEL_SECRET_ENCRYPTION_KEY =
       'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  }
+  if (!hadExternalAuditHmacKey) {
+    process.env.AUDIT_CHECKPOINT_HMAC_KEY =
+      '7f8e9d0c1b2a39485766758493a2b1c0f0e1d2c3b4a5968778695a4b3c2d1e0f';
+  }
+  if (!hadExternalAuditHmacKeyId) {
+    process.env.AUDIT_CHECKPOINT_HMAC_KEY_ID = 'audit-hmac-enterprise-test-v1';
   }
   const auditSuiteDiskPath = path.join(
     os.tmpdir(),
@@ -1643,6 +1653,40 @@ async function runComprehensiveEnterpriseAudit() {
       db.saveToDisk();
     }
 
+    // -------------------------------------------------------------------------
+    // 3E.4 PHASE P.1.3 / P.1.3.1 / P.1.3.2 — AUDIT CHAIN INTEGRITY, CHECKPOINT AUTHENTICATION & ATOMIC RESTORE SUITE (AC-01..AC-32)
+    // -------------------------------------------------------------------------
+    console.log('\n  [PHASE P.1.3.2] 🔗 AUDIT CHAIN INTEGRITY, CHECKPOINT AUTHENTICATION & ATOMIC RESTORE SUITE (AC-01..AC-32):');
+    const preP13FullSnapshot = db.exportFullBackup();
+    const preP13AuditSnapshot = AuditLogger.captureSnapshot();
+    try {
+      const p13Results = await runPhaseP13AuditChainSuite({ existingBaseUrl: baseUrl });
+      if (p13Results.length !== 32 || p13Results.some((r) => !r.passed || !r.readAfterDeleteVerified)) {
+        throw new Error(
+          `[PHASE P.1.3.2] Audit chain suite did not pass all 32 tests! Count=${p13Results.length}`
+        );
+      }
+      for (const r of p13Results) {
+        console.log(
+          `  ✅ [${r.id}] ${r.title} -> PASS (Read-After-Delete=${r.readAfterDeleteVerified})`
+        );
+      }
+    } finally {
+      db.setPersistFilePathForTesting(auditSuiteDiskPath);
+      db.importFullBackup(preP13FullSnapshot);
+      AuditLogger.restoreSnapshot(preP13AuditSnapshot);
+      db.saveToDisk();
+      const postP13ChainCheck = AuditLogger.verifyChainIntegrity();
+      if (!postP13ChainCheck.valid) {
+        throw new Error(
+          `[PHASE P.1.3] Post-cleanup AuditLogger.verifyChainIntegrity() failed: ${JSON.stringify(postP13ChainCheck)}`
+        );
+      }
+      console.log(
+        `  ✅ [P1-3-CHAIN-VERIFY] Post-cleanup AuditLogger.verifyChainIntegrity() verified: ${JSON.stringify(postP13ChainCheck)}`
+      );
+    }
+
     // 3F. Secondary Endpoint RBAC Guards & Workspace Relay Header Separation
     const roExportBundleRes = await fetch(`${baseUrl}/github/export-bundle`, {
       headers: authHeaders(readOnlySession.token),
@@ -2244,6 +2288,12 @@ async function runComprehensiveEnterpriseAudit() {
     }
     if (!hadExternalEncryptionKey) {
       delete process.env.CHANNEL_SECRET_ENCRYPTION_KEY;
+    }
+    if (!hadExternalAuditHmacKey) {
+      delete process.env.AUDIT_CHECKPOINT_HMAC_KEY;
+    }
+    if (!hadExternalAuditHmacKeyId) {
+      delete process.env.AUDIT_CHECKPOINT_HMAC_KEY_ID;
     }
     server.closeAllConnections?.();
     server.close();

@@ -84,16 +84,21 @@ export async function runPhaseP12AcceptanceSuite(options?: {
   const results: AcceptanceTestResult[] = [];
 
   const originalEnvKey = process.env[CHANNEL_SECRET_ENV_VAR];
+  const originalAuditHmacKey = process.env.AUDIT_CHECKPOINT_HMAC_KEY;
+  const originalAuditHmacKeyId = process.env.AUDIT_CHECKPOINT_HMAC_KEY_ID;
   const originalPersistPath = db.getPersistFilePath();
   const VALID_HEX_KEY_64 = 'a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f809';
+  const VALID_AUDIT_HMAC_KEY_64 = 'f0e1d2c3b4a5968778695a4b3c2d1e0f102132435465768798a9bacbdcedfe01';
   process.env[CHANNEL_SECRET_ENV_VAR] = VALID_HEX_KEY_64;
+  process.env.AUDIT_CHECKPOINT_HMAC_KEY = VALID_AUDIT_HMAC_KEY_64;
+  process.env.AUDIT_CHECKPOINT_HMAC_KEY_ID = 'audit-hmac-p12-test-v1';
 
   // Snapshot existing store state before running isolated P.1.2 tests
   const preSuiteOrgs = new Map(db.organizations.entries());
   const preSuiteUsers = new Map(db.users.entries());
   const preSuiteChannelConfigs = new Map(db.channelConfigs.entries());
   const preSuiteMacros = new Map(db.macros.entries());
-  const preSuiteAuditEvents = AuditLogger.exportAllEvents();
+  const preSuiteAuditSnapshot = AuditLogger.captureSnapshot();
 
   let localServer: http.Server | null = null;
   let baseUrl = options?.existingBaseUrl || '';
@@ -204,11 +209,7 @@ export async function runPhaseP12AcceptanceSuite(options?: {
     db.setPersistFilePathForTesting(suiteDiskPath);
     db.purgeOrganizationData(P1_2_TEST_ORG_ID);
     db.purgeOrganizationData(P1_2_PEER_ORG_ID);
-    AuditLogger.importEvents(
-      AuditLogger.exportAllEvents().filter(
-        (e) => e.organizationId !== P1_2_TEST_ORG_ID && e.organizationId !== P1_2_PEER_ORG_ID
-      )
-    );
+    AuditLogger.restoreSnapshot(preSuiteAuditSnapshot);
     seedSyntheticTenants();
     db.saveToDisk();
 
@@ -1306,9 +1307,7 @@ export async function runPhaseP12AcceptanceSuite(options?: {
     db.purgeOrganizationData(P1_2_HANG_FIX_ORG_ID);
     db.users.delete(P1_2_HANG_FIX_USER_ID);
     db.organizations.delete(P1_2_HANG_FIX_ORG_ID);
-    AuditLogger.importEvents(
-      AuditLogger.exportAllEvents().filter((e) => e.organizationId !== P1_2_HANG_FIX_ORG_ID)
-    );
+    AuditLogger.restoreSnapshot(preSuiteAuditSnapshot);
     if (fs.existsSync(at17CorruptFile)) {
       fs.unlinkSync(at17CorruptFile);
     }
@@ -1373,7 +1372,7 @@ export async function runPhaseP12AcceptanceSuite(options?: {
     for (const [k, v] of preSuiteChannelConfigs.entries()) db.channelConfigs.set(k, v);
     db.macros.clear();
     for (const [k, v] of preSuiteMacros.entries()) db.macros.set(k, v);
-    AuditLogger.importEvents(preSuiteAuditEvents);
+    AuditLogger.restoreSnapshot(preSuiteAuditSnapshot);
 
     try {
       fs.rmSync(p12TempDir, { recursive: true, force: true });
@@ -1385,6 +1384,16 @@ export async function runPhaseP12AcceptanceSuite(options?: {
       delete process.env[CHANNEL_SECRET_ENV_VAR];
     } else {
       process.env[CHANNEL_SECRET_ENV_VAR] = originalEnvKey;
+    }
+    if (originalAuditHmacKey === undefined) {
+      delete process.env.AUDIT_CHECKPOINT_HMAC_KEY;
+    } else {
+      process.env.AUDIT_CHECKPOINT_HMAC_KEY = originalAuditHmacKey;
+    }
+    if (originalAuditHmacKeyId === undefined) {
+      delete process.env.AUDIT_CHECKPOINT_HMAC_KEY_ID;
+    } else {
+      process.env.AUDIT_CHECKPOINT_HMAC_KEY_ID = originalAuditHmacKeyId;
     }
 
     if (localServer) {

@@ -186,7 +186,12 @@ export interface AuditEvent {
   userAgent?: string;
   requestId?: string;
   reason?: string;
+  schemaVersion?: 1 | 2 | 3;
+  globalSeq?: number;
   prevHash?: string;
+  tenantSeq?: number;
+  tenantPrevHash?: string;
   integrityHash?: string;
   createdAt: string;
 }
+

@@ -276,10 +276,18 @@ export interface IDataStore {
 }
 
 const SENSITIVE_LOG_PATTERN =
-  /(apiToken|webhookSecret|authSecret|accessToken|refreshToken|verifyToken|appSecret|clientSecret|sipPassword|smtpPassword|imapPassword|apiKey|api_key|privateKey|private_key|passphrase|credential(?!sConfigured\b)|password|secret|token|authorization|CHANNEL_SECRET_ENCRYPTION_KEY)["']?\s*[:=]\s*["']?[^\s,"'}]+/gi;
+  /(apiToken|webhookSecret|authSecret|accessToken|refreshToken|verifyToken|appSecret|clientSecret|sipPassword|smtpPassword|imapPassword|apiKey|api_key|privateKey|private_key|passphrase|credential(?!sConfigured\b)|password|secret|token|authorization|CHANNEL_SECRET_ENCRYPTION_KEY|AUDIT_CHECKPOINT_HMAC_KEY|AUDIT_CHECKPOINT_HMAC_VERIFY_KEYS)["']?\s*[:=]\s*["']?[^\s,"'}]+/gi;
 
 function sanitizeStorageDiagnosticMessage(raw: unknown): string {
-  const str = raw instanceof Error ? raw.message : String(raw || 'Unknown storage error');
+  let str = raw instanceof Error ? raw.message : String(raw || 'Unknown storage error');
+  const rawAuditKey = process.env.AUDIT_CHECKPOINT_HMAC_KEY?.trim();
+  if (rawAuditKey && rawAuditKey.length >= 8) {
+    str = str.split(rawAuditKey).join('[REDACTED_SECRET]');
+  }
+  const rawChannelKey = process.env.CHANNEL_SECRET_ENCRYPTION_KEY?.trim();
+  if (rawChannelKey && rawChannelKey.length >= 8) {
+    str = str.split(rawChannelKey).join('[REDACTED_SECRET]');
+  }
   return str
     .replace(SENSITIVE_LOG_PATTERN, '$1=[REDACTED_SECRET]')
     .replace(/\b01[0125][0-9]{8}\b/g, '[REDACTED_PHONE]')
@@ -872,9 +880,19 @@ class DatabaseStore implements IDataStore {
   }
 
   public exportFullBackup(): Record<string, any> {
+    const exportedAt = new Date().toISOString();
+    const auditEvents = AuditLogger.exportAllEvents();
+    const auditCheckpoint = AuditLogger.exportCheckpoint();
+    const auditIntegrityManifest = AuditLogger.exportIntegrityManifest({
+      artifactType: 'FULL_BACKUP',
+      scopeOrgId: null,
+      events: auditEvents,
+      checkpoint: auditCheckpoint,
+      issuedAt: exportedAt,
+    });
     return {
-      version: '1.2.0-enterprise-p1-2',
-      exportedAt: new Date().toISOString(),
+      version: '1.3.2-enterprise-p1-3-2',
+      exportedAt,
       organizations: Array.from(this.organizations.values()),
       users: Array.from(this.users.values()),
       teams: Array.from(this.teams.values()),
@@ -898,24 +916,37 @@ class DatabaseStore implements IDataStore {
       teamQaFeedback: Array.from(this.teamQaFeedback.values()),
       connectedDevices: Array.from(this.connectedDevices.values()),
       crossDeviceSyncEvents: Array.from(this.crossDeviceSyncEvents.values()),
-      auditEvents: AuditLogger.exportAllEvents(),
+      auditEvents,
+      auditCheckpoint,
+      auditIntegrityManifest,
     };
   }
 
   /**
    * Exports a strictly tenant-isolated backup containing ONLY records owned by `orgId`.
-   * Channel secrets are redacted (`[REDACTED_SECRET]`) in the exported backup representation.
+   * Channel secrets are redacted (`[REDACTED_SECRET]`) in the exported backup representation,
+   * and the tenant audit chain + checkpoint are cryptographically signed in `auditIntegrityManifest`.
    */
   public exportTenantBackup(orgId: UUID): Record<string, any> {
     const validOrgId = this.assertValidOrganizationId(orgId);
+    const exportedAt = new Date().toISOString();
     const orgCustomerIds = new Set(
       Array.from(this.customers.values())
         .filter((c) => c.organizationId === validOrgId)
         .map((c) => c.id)
     );
+    const tenantAuditEvents = AuditLogger.exportAllEvents().filter((e) => e.organizationId === validOrgId);
+    const auditTenantCheckpoint = AuditLogger.exportTenantCheckpoint(validOrgId);
+    const auditIntegrityManifest = AuditLogger.exportIntegrityManifest({
+      artifactType: 'TENANT_BACKUP',
+      scopeOrgId: validOrgId,
+      events: tenantAuditEvents,
+      tenantCheckpoint: auditTenantCheckpoint,
+      issuedAt: exportedAt,
+    });
     return {
-      version: '1.2.0-enterprise-p1-2',
-      exportedAt: new Date().toISOString(),
+      version: '1.3.2-enterprise-p1-3-2',
+      exportedAt,
       scopeOrganizationId: validOrgId,
       organizations: Array.from(this.organizations.values()).filter((o) => o.id === validOrgId),
       users: Array.from(this.users.values()).filter((u) => u.organizationId === validOrgId),
@@ -958,7 +989,9 @@ class DatabaseStore implements IDataStore {
       crossDeviceSyncEvents: Array.from(this.crossDeviceSyncEvents.values()).filter(
         (e) => e.organizationId === validOrgId
       ),
-      auditEvents: AuditLogger.exportAllEvents().filter((e) => e.organizationId === validOrgId),
+      auditEvents: tenantAuditEvents,
+      auditTenantCheckpoint,
+      auditIntegrityManifest,
     };
   }
 
@@ -996,9 +1029,20 @@ class DatabaseStore implements IDataStore {
       }
     }
 
+    const exportedAt = new Date().toISOString();
+    const auditEvents = AuditLogger.exportAllEvents();
+    const auditCheckpoint = AuditLogger.exportCheckpoint();
+    const auditIntegrityManifest = AuditLogger.exportIntegrityManifest({
+      artifactType: 'DISK_SNAPSHOT',
+      scopeOrgId: null,
+      events: auditEvents,
+      checkpoint: auditCheckpoint,
+      issuedAt: exportedAt,
+    });
+
     return {
-      version: '1.2.0-enterprise-p1-2',
-      exportedAt: new Date().toISOString(),
+      version: '1.3.2-enterprise-p1-3-2',
+      exportedAt,
       organizations: Array.from(this.organizations.values()),
       users: Array.from(this.users.values()),
       teams: Array.from(this.teams.values()),
@@ -1022,7 +1066,9 @@ class DatabaseStore implements IDataStore {
       teamQaFeedback: Array.from(this.teamQaFeedback.values()),
       connectedDevices: Array.from(this.connectedDevices.values()),
       crossDeviceSyncEvents: Array.from(this.crossDeviceSyncEvents.values()),
-      auditEvents: AuditLogger.exportAllEvents(),
+      auditEvents,
+      auditCheckpoint,
+      auditIntegrityManifest,
     };
   }
 
@@ -1071,6 +1117,7 @@ class DatabaseStore implements IDataStore {
       const errCode =
         typeof err?.code === 'string' &&
         (err.code.startsWith('CHANNEL_SECRET_') ||
+          err.code.startsWith('AUDIT_') ||
           err.code.startsWith('INVALID_') ||
           err.code === 'AUTH_TAG_MISMATCH' ||
           err.code === 'ENCRYPTION_VERIFICATION_FAILED')
@@ -1178,17 +1225,25 @@ class DatabaseStore implements IDataStore {
         const liveMap: Map<UUID, any> = (this as any)[k];
         preLoadSnapshots[k] = new Map(liveMap.entries());
       }
-      const preLoadAuditEvents = AuditLogger.exportAllEvents();
+      const preLoadAuditSnapshot = AuditLogger.captureSnapshot();
+
+      const isLegacyChannelSecretMigration =
+        parsed.version === '1.1.0-enterprise-p1' &&
+        hasLegacyPlaintextSecrets &&
+        parsed.auditEvents === undefined &&
+        parsed.auditIntegrityManifest === undefined;
 
       const importRes = this.importFullBackupDetailed(parsed, {
         persistToDisk: false,
         isDiskLoad: true,
+        allowLegacyUnsignedMigration: isLegacyChannelSecretMigration,
       });
       if (!importRes.ok) {
         this.existingFileProtected = true;
         this.existingFileProtectionReason =
           importRes.code === 'AUTH_TAG_MISMATCH' ||
           importRes.code.startsWith('CHANNEL_SECRET_') ||
+          importRes.code.startsWith('AUDIT_KEY_') ||
           importRes.code.startsWith('INVALID_')
             ? 'SECRET_KEY_PROTECTED'
             : 'CORRUPTED_OR_EMPTY';
@@ -1212,7 +1267,7 @@ class DatabaseStore implements IDataStore {
               targetMap.set(id, val);
             }
           }
-          AuditLogger.importEvents(preLoadAuditEvents);
+          AuditLogger.restoreSnapshot(preLoadAuditSnapshot);
           this.existingFileProtected = true;
           this.existingFileProtectionReason = 'SECRET_KEY_PROTECTED';
           const prevErr = this.getLastStorageError();
@@ -1243,13 +1298,18 @@ class DatabaseStore implements IDataStore {
   /**
    * Strictly transactional, all-or-nothing backup restoration.
    * Validates all collections, primary keys, tenant foreign keys (never assigning a default org),
-   * channel secret integrity/preservation rules (Section 5), and AuditLogger hash chain in staging memory
-   * BEFORE mutating any live Map.
+   * channel secret integrity/preservation rules (Section 5), and AuditLogger hash chain + HMAC manifest
+   * in staging memory BEFORE mutating any live Map.
    * Guarantees zero partial state corruption on failure (including disk write rollback when persistToDisk=true).
    */
   public importFullBackupDetailed(
     data: any,
-    options?: { scopeOrgId?: UUID; persistToDisk?: boolean; isDiskLoad?: boolean }
+    options?: {
+      scopeOrgId?: UUID;
+      persistToDisk?: boolean;
+      isDiskLoad?: boolean;
+      allowLegacyUnsignedMigration?: boolean;
+    }
   ): BackupImportResult {
     if (!data || typeof data !== 'object') {
       this.recordStorageError('importFullBackup', 'CORRUPTED_BACKUP_PAYLOAD', 'Backup payload is not a valid object');
@@ -1491,7 +1551,110 @@ class DatabaseStore implements IDataStore {
         stagedMaps[spec.key] = map;
       }
 
-      // 3. Pass 2: Tenant-Scope Authorization (HTTP 403 if authenticated tenant attempts to restore another tenant's data)
+      // 3. Validate auditEvents, checkpoint, and HMAC-SHA-256 auditIntegrityManifest prior to committing any changes
+      let stagedAuditEvents: AuditEvent[] | null = null;
+      const isLegacyUnsignedAllowed =
+        options?.allowLegacyUnsignedMigration === true &&
+        data.auditEvents === undefined &&
+        data.auditIntegrityManifest === undefined;
+
+      if (!isLegacyUnsignedAllowed) {
+        if (data.auditEvents === undefined) {
+          const missingCode =
+            data.auditIntegrityManifest === undefined ? 'AUDIT_MANIFEST_MISSING' : 'CORRUPTED_BACKUP_PAYLOAD';
+          const missingMsg =
+            missingCode === 'AUDIT_MANIFEST_MISSING'
+              ? 'Backup validation failed: auditEvents and auditIntegrityManifest are required.'
+              : 'Backup validation failed: auditEvents array is missing.';
+          this.recordStorageError('importFullBackup', missingCode, missingMsg);
+          return {
+            ok: false,
+            status: 400,
+            code: missingCode,
+            message: missingMsg,
+          };
+        }
+        if (!Array.isArray(data.auditEvents)) {
+          this.recordStorageError('importFullBackup', 'CORRUPTED_BACKUP_PAYLOAD', 'auditEvents is not an array');
+          return {
+            ok: false,
+            status: 400,
+            code: 'CORRUPTED_BACKUP_PAYLOAD',
+            message: 'Backup validation failed: auditEvents must be an array.',
+          };
+        }
+        if (scopeOrgId) {
+          const tenantAuditCheck = AuditLogger.verifyTenantBackupIntegrity(
+            scopeOrgId,
+            data.auditEvents,
+            data.auditTenantCheckpoint,
+            data.auditIntegrityManifest,
+            { requireManifest: true }
+          );
+          if (!tenantAuditCheck.valid) {
+            this.recordStorageError(
+              'importFullBackup',
+              tenantAuditCheck.code,
+              tenantAuditCheck.failureReason || 'Invalid tenant audit chain or manifest in backup'
+            );
+            return {
+              ok: false,
+              status: tenantAuditCheck.status,
+              code: tenantAuditCheck.code,
+              message:
+                tenantAuditCheck.code === 'CROSS_TENANT_RESTORE_FORBIDDEN'
+                  ? 'Cross-tenant restore forbidden in auditEvents or auditIntegrityManifest.'
+                  : `Audit chain integrity verification failed (${tenantAuditCheck.code}): ${tenantAuditCheck.failureReason || 'Invalid tenant audit hash chain or manifest'}`,
+            };
+          }
+        } else {
+          const chainCheck = AuditLogger.verifyChainIntegrity(
+            data.auditEvents,
+            data.auditCheckpoint,
+            data.auditIntegrityManifest
+          );
+          if (!chainCheck.valid) {
+            const failCode =
+              typeof chainCheck.code === 'string' &&
+              (chainCheck.code.startsWith('AUDIT_') || chainCheck.code === 'UNSUPPORTED_AUDIT_SCHEMA_VERSION')
+                ? chainCheck.code
+                : 'TAMPERED_AUDIT_CHAIN';
+            const failStatus =
+              failCode === 'AUDIT_KEY_UNAVAILABLE' ||
+              failCode === 'AUDIT_KEY_INVALID' ||
+              failCode === 'AUDIT_KEY_REUSE_FORBIDDEN'
+                ? 503
+                : 400;
+            this.recordStorageError(
+              'importFullBackup',
+              failCode,
+              chainCheck.failureReason || 'Invalid audit hash chain or manifest'
+            );
+            return {
+              ok: false,
+              status: failStatus,
+              code: failCode,
+              message: `Audit chain integrity verification failed (${failCode}): ${chainCheck.failureReason || 'Invalid hash chain'}`,
+            };
+          }
+          if (data.auditIntegrityManifest === undefined) {
+            this.recordStorageError(
+              'importFullBackup',
+              'AUDIT_MANIFEST_MISSING',
+              'Full backup or disk snapshot is missing required auditIntegrityManifest'
+            );
+            return {
+              ok: false,
+              status: 400,
+              code: 'AUDIT_MANIFEST_MISSING',
+              message: 'Audit chain integrity verification failed: auditIntegrityManifest is required.',
+            };
+          }
+        }
+        stagedAuditEvents = data.auditEvents;
+      }
+
+      // 4. Pass 2: Tenant-Scope Authorization (HTTP 403 if authenticated tenant attempts to restore another tenant's data)
       if (scopeOrgId) {
         for (const orgId of orgMap.keys()) {
           if (orgId !== scopeOrgId) {
@@ -1531,61 +1694,13 @@ class DatabaseStore implements IDataStore {
         }
       }
 
-      // 4. Validate auditEvents hash chain integrity prior to committing any changes
-      let stagedAuditEvents: AuditEvent[] | null = null;
-      if (data.auditEvents !== undefined) {
-        if (!Array.isArray(data.auditEvents)) {
-          this.recordStorageError('importFullBackup', 'CORRUPTED_BACKUP_PAYLOAD', 'auditEvents is not an array');
-          return {
-            ok: false,
-            status: 400,
-            code: 'CORRUPTED_BACKUP_PAYLOAD',
-            message: 'Backup validation failed: auditEvents must be an array.',
-          };
-        }
-        if (scopeOrgId) {
-          for (const evt of data.auditEvents) {
-            if (!evt || evt.organizationId !== scopeOrgId) {
-              this.recordStorageError(
-                'importFullBackup',
-                'CROSS_TENANT_RESTORE_FORBIDDEN',
-                `Tenant ${scopeOrgId} attempted to restore auditEvents for another organization`
-              );
-              return {
-                ok: false,
-                status: 403,
-                code: 'CROSS_TENANT_RESTORE_FORBIDDEN',
-                message: 'Cross-tenant restore forbidden in auditEvents.',
-              };
-            }
-          }
-        }
-        if (data.auditEvents.length > 0 && !scopeOrgId) {
-          const chainCheck = AuditLogger.verifyChainIntegrity(data.auditEvents);
-          if (!chainCheck.valid) {
-            this.recordStorageError(
-              'importFullBackup',
-              'TAMPERED_AUDIT_CHAIN',
-              chainCheck.failureReason || 'Invalid audit hash chain'
-            );
-            return {
-              ok: false,
-              status: 400,
-              code: 'TAMPERED_AUDIT_CHAIN',
-              message: `Audit chain integrity verification failed: ${chainCheck.failureReason || 'Invalid hash chain'}`,
-            };
-          }
-        }
-        stagedAuditEvents = data.auditEvents;
-      }
-
       // 5. Snapshot current live maps in case persistToDisk fails and requires atomic rollback
       const preCommitSnapshots: Record<string, Map<UUID, any>> = {};
       for (const spec of collectionSpecs) {
         const liveMap: Map<UUID, any> = (this as any)[spec.key];
         preCommitSnapshots[spec.key] = new Map(liveMap.entries());
       }
-      const preCommitAuditEvents = AuditLogger.exportAllEvents();
+      const preCommitAuditSnapshot = AuditLogger.captureSnapshot();
 
       // 6. Atomic commit: swap staged maps into live DatabaseStore
       for (const spec of collectionSpecs) {
@@ -1622,7 +1737,10 @@ class DatabaseStore implements IDataStore {
       }
 
       if (stagedAuditEvents !== null && !scopeOrgId) {
-        AuditLogger.importEvents(stagedAuditEvents);
+        AuditLogger.importEvents(stagedAuditEvents, data.auditCheckpoint);
+      }
+      if (data.auditIntegrityManifest && typeof data.auditIntegrityManifest === 'object') {
+        AuditLogger.recordVerifiedRestoreMetadata(data.auditIntegrityManifest);
       }
 
       if (options?.persistToDisk) {
@@ -1647,7 +1765,7 @@ class DatabaseStore implements IDataStore {
               targetMap.set(k, v);
             }
           }
-          AuditLogger.importEvents(preCommitAuditEvents);
+          AuditLogger.restoreSnapshot(preCommitAuditSnapshot);
           const diskErr = this.getLastStorageError();
           return {
             ok: false,
