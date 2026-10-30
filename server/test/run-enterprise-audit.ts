@@ -1985,6 +1985,7 @@ async function runComprehensiveEnterpriseAudit() {
         'src/components/GitHubSyncAndQASuiteView.tsx',
         'docs/PHASE_4_2_INDEPENDENT_SECURITY_VERIFICATION.md',
         'docs/PHASE_4_RELEASE_READINESS_AUDIT.md',
+        'docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256',
         'scripts/test_all_operations.ts',
       ];
       const missingRequiredFiles = requiredTrackedFiles.filter((reqFile) => !discoveredPaths.includes(reqFile));
@@ -2008,6 +2009,7 @@ async function runComprehensiveEnterpriseAudit() {
         missingRequiredFiles.length > 0 ||
         leakedForbiddenFiles.length > 0 ||
         auditFullyScannedDuringFixtures !== false ||
+        adminExcludedMap.has('docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256') ||
         adminExcludedMap.get('docs/temp_encrypted_pem_test.md') !== 'excluded_secret_content_pattern' ||
         adminExcludedMap.get('docs/temp_pgp_private_test.md') !== 'excluded_secret_content_pattern' ||
         adminExcludedMap.get('docs/temp_inline_secret_test.md') !== 'excluded_secret_content_pattern' ||
@@ -2020,17 +2022,23 @@ async function runComprehensiveEnterpriseAudit() {
         );
       }
 
-      // Verify clean workspace reports 0 exclusions after fixture cleanup
+      // Verify clean workspace reports 0 exclusions after fixture cleanup and includes evidence manifest
       const cleanFilesAuditRes = await fetch(`${baseUrl}/github/project-files`, {
         headers: authHeaders(adminSession.token),
       });
       const cleanFilesAuditJson = await cleanFilesAuditRes.json();
+      const cleanDiscoveredPaths = (cleanFilesAuditJson.data?.files || []).map((f: any) => String(f.path));
+      const cleanExcludedPaths = (cleanFilesAuditJson.data?.workspaceCleanlinessAudit?.excludedFiles || []).map(
+        (f: any) => String(f.path)
+      );
       if (
         cleanFilesAuditJson.data?.workspaceCleanlinessAudit?.excludedFilesCount !== 0 ||
-        cleanFilesAuditJson.data?.workspaceCleanlinessAudit?.fullyScannedWithoutExclusions !== true
+        cleanFilesAuditJson.data?.workspaceCleanlinessAudit?.fullyScannedWithoutExclusions !== true ||
+        !cleanDiscoveredPaths.includes('docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256') ||
+        cleanExcludedPaths.includes('docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256')
       ) {
         throw new Error(
-          `[GITHUB-SYNC-05] Post-cleanup workspace should have 0 excluded files, got: ${JSON.stringify(cleanFilesAuditJson.data?.workspaceCleanlinessAudit?.excludedFiles)}`
+          `[GITHUB-SYNC-05] Post-cleanup workspace should have 0 excluded files and include evidence manifest, got: ${JSON.stringify(cleanFilesAuditJson.data?.workspaceCleanlinessAudit?.excludedFiles)}`
         );
       }
 

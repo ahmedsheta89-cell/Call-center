@@ -3125,6 +3125,9 @@ const ALLOWED_WORKSPACE_ROOT_FILES = [
 
 const ALLOWED_WORKSPACE_DIRS = ['src', 'server', 'docs', 'scripts', '.github/workflows'];
 const ALLOWED_WORKSPACE_EXTENSIONS = /\.(ts|tsx|js|jsx|json|css|html|md|rules|yml|yaml|sql)$/;
+const ALLOWED_EXACT_WORKSPACE_FILE_PATHS = new Set([
+  'docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256',
+]);
 const EXCLUDED_DIR_NAMES = new Set([
   'node_modules',
   'dist',
@@ -3428,7 +3431,10 @@ function scanRealWorkspaceFiles(includeContent = false): {
         if (childLstat.isDirectory()) {
           walkDir(childRel);
         } else if (childLstat.isFile()) {
-          if (isForbiddenWorkspaceFilePath(childRel) || !ALLOWED_WORKSPACE_EXTENSIONS.test(entry.name)) {
+          const isAllowedFileExtensionOrExactPath =
+            ALLOWED_WORKSPACE_EXTENSIONS.test(entry.name) ||
+            ALLOWED_EXACT_WORKSPACE_FILE_PATHS.has(childRel);
+          if (isForbiddenWorkspaceFilePath(childRel) || !isAllowedFileExtensionOrExactPath) {
             recordExclusion(childRel, 'excluded_forbidden_filename');
             continue;
           }
