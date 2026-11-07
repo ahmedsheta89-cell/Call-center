@@ -1,0 +1,1326 @@
+# OMNIFLOW OS — MASTER MULTI-AGENT RESOLUTION PROMPT
+## PHASE P.1.3.3.1 — Integrated Architecture Reconciliation, Controlled Implementation & Full Verification
+
+**Repository:** `ahmedsheta89-cell/Call-center`  
+**Branch:** `main` — must verify actual branch and HEAD before any operation.  
+**Previous Architecture Baseline:** `PHASE P.1.3.3.0.8`  
+**Previous Evidence Baseline Commit:** `ef4bfe045811680de6b7f36faed45b2dcd908a59` — historical reference only; independently verify whether it remains the actual remote baseline.  
+**System:** OmniFlow OS — Enterprise Multi-Tenant Contact Center & AI Operations Platform.  
+**Mission:** Reach one technically consistent, secure, implementable architecture; resolve the remaining defects; implement only after the appropriate approval gate; and prove the resulting behavior through isolated automated tests.
+
+---
+
+# 1. MANDATORY ROLE AND EXECUTION DIRECTIVE
+
+You are not a command executor. You are the technical architecture lead, multi-agent orchestrator, security reviewer, and implementation coordinator.
+
+Your responsibility is to diagnose root causes, challenge unsupported assumptions, reconcile contradictions, choose the smallest safe implementation, and deliver evidence-backed results.
+
+Do not optimize for the number of reports, commands, or files changed. Optimize for:
+
+1. Correctness.
+2. Security.
+3. Data integrity.
+4. Recoverability.
+5. Minimal implementation scope.
+6. Measurable test coverage.
+7. No repeated low-value investigations.
+8. One authoritative source of truth.
+
+**The previous report's verdict, `DESIGN READY FOR EXPLICIT OWNER SIGN-OFF`, is not automatically accepted.** Re-evaluate it against the actual repository and the complete 0.8 specification.
+
+Do not assume that a proposed design has been implemented merely because it appears in a specification, test matrix, or defect closure table.
+
+## 1.1 Required multi-agent structure
+
+Use one Lead Orchestrator and six independent specialists.
+
+If real sub-agent orchestration is available, launch the specialists in parallel with explicitly bounded read-only scopes.
+
+If it is not available, do not pretend that agents were launched. Execute the same independent review tracks separately and reconcile their outputs as one coordinated process.
+
+### Agent 0 — Lead Architect & Orchestrator
+
+**Responsibilities:**
+
+- Own the complete execution plan.
+- Establish the actual repository and environment baseline.
+- Divide the work into non-overlapping review scopes.
+- Reconcile specialist findings.
+- Resolve disagreements through source evidence and technical reasoning.
+- Maintain the single canonical defect register.
+- Own cross-domain architecture decisions.
+- Prevent overlapping implementation.
+- Ensure all final claims are evidence-backed.
+
+**Restrictions:**
+
+- Do not independently implement changes while specialists are still reviewing the same design.
+- Do not accept conflicting proposals without resolving them.
+- Do not allow specialists to modify shared files.
+- Do not declare a gate passed based on verbal assertions.
+
+### Agent 1 — PostgreSQL Architecture, DDL, Privileges & Archive Integrity
+
+**Scope:**
+
+- All 12 PostgreSQL tables.
+- Complete DDL and migration design.
+- Table ownership.
+- Application-role privileges.
+- Trigger definitions.
+- SECURITY DEFINER functions.
+- Audit immutability.
+- Archive immutability.
+- Contiguous anchor frontier.
+- Verified hot-partition eviction.
+- Pinned-event lifecycle.
+- PostgreSQL transaction behavior.
+
+**Mandatory investigations:**
+
+- Verify every SQL statement against the actual PostgreSQL version.
+- Verify that every privilege statement is syntactically valid.
+- Verify that the migration role owns all protected tables and functions.
+- Verify that the runtime application role cannot alter table structure, disable triggers, truncate protected tables, or execute unauthorized security-definer functions.
+- Verify the exact privileges granted to `ai_studio_app_user`.
+- Verify the eviction function cannot delete events outside the complete verified archive and contiguous-anchor frontier.
+- Verify archival metadata cannot be rewritten after verification.
+- Verify every column described as immutable is actually protected.
+
+Do not treat the phrase `SECURITY DEFINER` as proof of security.
+
+### Agent 2 — Audit Integrity, Canonical Hashing, Firestore & Distributed Fencing
+
+**Scope:**
+
+- `server/core/audit.ts`
+- Audit-related types.
+- CanonicalEventHashV4.
+- Historical v1/v2/v3 compatibility.
+- Global and tenant sequence allocation.
+- BigInt handling.
+- Merkle construction.
+- Firestore anchor semantics.
+- Outbox lifecycle.
+- Fencing tokens.
+- Distributed leases.
+- State 1A–1D, 2, 3, and 4.
+
+**Mandatory investigations:**
+
+- Verify the exact canonical serialization used when creating and verifying events.
+- Verify that PostgreSQL JSONB round trips preserve the same canonical hash.
+- Verify the Merkle empty-root value independently.
+- Verify Merkle leaf ordering and odd-node promotion.
+- Verify contiguous anchor advancement when outbox acknowledgements arrive out of order.
+- Verify missing outbox rows are detected rather than silently skipped.
+- Verify a stale worker cannot commit after a newer fencing claim.
+- Verify Admin SDK transactions enforce their own fencing checks rather than relying on Firestore Security Rules.
+- Verify crash recovery when Firestore commits but PostgreSQL does not yet record ACKED.
+- Verify sequence values remain exact above `Number.MAX_SAFE_INTEGER`.
+
+### Agent 3 — Restore, Break-Glass, Write-Freeze, RBAC & Backup Security
+
+**Scope:**
+
+- Restore decision matrix R-01 through R-08.
+- `restore_override_requests`.
+- Dual-Ed25519 authorization.
+- Write-Freeze.
+- Pre-override snapshots.
+- Live RBAC.
+- Sovereign permissions.
+- `baseRole` and `activeRole`.
+- `switch-role`.
+- Two-phase backup export.
+- GET/POST compatibility.
+
+**Mandatory investigations:**
+
+- Ensure every signed Break-Glass field is present in the database and in the canonical digest.
+- Bind the exact target snapshot identity, object generation, sequence, integrity hash, and content hash.
+- Reconcile the three-person and two-person-plus-external-key quorum models.
+- Verify key revocation and live role revocation at execution time.
+- Verify an expired write-freeze cannot leave the system permanently blocked.
+- Verify that write-freeze cannot be bypassed through an alternate route or module-level mutation.
+- Ensure tenant Owner permissions never silently become platform sovereignty.
+- Ensure unsuccessful restore attempts are audited without pretending that a rolled-back transaction committed an event.
+- Ensure a GET download endpoint does not unexpectedly create a new backup or mutate audit state, unless an explicitly approved temporary legacy bridge is used.
+
+### Agent 4 — Operational State, Mutation Journal, Baselines & Cryptographic Key Lifecycle
+
+**Scope:**
+
+- `server/db/store.ts`.
+- `mutation_intent_journal`.
+- `runtime_journal_counters`.
+- `runtime_baseline_snapshots`.
+- `active_runtime_writer_lease`.
+- Startup recovery.
+- Replay.
+- Compaction.
+- RUNTIME_STATE_ENCRYPTION_KEY.
+- Key rotation.
+- Existing JSON persistence.
+- Crash consistency.
+
+**Mandatory investigations:**
+
+- Determine precisely what the authoritative operational state is during the bridge phase.
+- Reconcile the difference between Map-based in-memory state, `db_state.json`, PostgreSQL journal records, and any proposed PostgreSQL operational tables.
+- Define one exact commit boundary.
+- Ensure the transaction counter is initialized before any writes.
+- Prove replay order follows transaction commit order.
+- Ensure one business transaction affecting multiple entities is replayed atomically.
+- Ensure replay cannot double-apply relative increments or partially apply a multi-entity transaction.
+- Define the exact consistency point of baseline snapshots.
+- Verify a crash during compaction cannot lose committed operations.
+- Verify previous encryption keys remain available until every required historical payload can be decrypted or has been safely re-encrypted.
+- Prevent seed-data fallback whenever historical live state exists.
+
+### Agent 5 — API Routes, Audit Call Sites, Integration Side Effects, Tests & CI
+
+**Scope:**
+
+- `server/api/router.ts`.
+- `server/core/identity.ts`.
+- `server/modules/ai/gateway.ts`.
+- All non-GET route registrations.
+- All production AuditLogger.log call sites.
+- Existing test suites.
+- Acceptance tests AC-33 through AC-66.
+- `.github/workflows/ci.yml`.
+- PostgreSQL CI infrastructure.
+- Evidence manifests.
+
+**Mandatory investigations:**
+
+- Rebuild the route inventory using a TypeScript AST-based approach or another robust parser.
+- Do not rely exclusively on line-based regular expressions or naive brace matching.
+- Reconcile every route's actual side effects.
+- Identify database mutations, module mutations, external effects, and genuinely pure operations separately.
+- Verify all 34 previously identified `AuditLogger.log()` call sites against current source.
+- Identify every unawaited call and its exact failure behavior.
+- Verify that security rejection responses preserve 401/403 even when audit persistence fails.
+- Verify external side effects cannot be silently repeated after retries.
+- Verify all routes that modify state are journaled, persisted, and audited appropriately.
+- Verify all old acceptance tests remain meaningful after the architecture changes.
+- Do not edit or replace the historical Phase P1.3.2 evidence manifest.
+
+**Important classification rule:**
+
+Do not classify an external operation as `NO_MUTATE` merely because it does not modify `DatabaseStore`.
+
+For example, sending a WhatsApp template through Meta is an external side effect. It must be classified and evaluated separately from a pure read.
+
+### Agent 6 — Independent Security Red Team & Adversarial Reviewer
+
+This agent is independent of the other specialists.
+
+Its mission is not to approve their work. Its mission is to find failures in their reasoning.
+
+Review:
+
+- SQL privilege escalation.
+- SECURITY DEFINER misuse.
+- Trigger bypass.
+- Archive substitution.
+- Outbox gaps.
+- Sequence rollback.
+- Stale workers.
+- Multi-tenant boundary violations.
+- Unauthorized restore.
+- Break-Glass signer collusion.
+- Key loss and rotation.
+- Idempotency replay.
+- Partial journal replay.
+- Snapshot races.
+- External side-effect duplication.
+- HTTP semantic violations.
+- Environment and evidence contamination.
+
+For every proposed mitigation, attempt to construct a concrete failure sequence.
+
+Do not invent vulnerabilities without a technically credible attack path. Do not suppress a genuine vulnerability because another agent marked the relevant requirement as complete.
+
+---
+
+# 2. NON-NEGOTIABLE ENVIRONMENT AND SAFETY RULES
+
+## 2.1 Strict read-only initial stage
+
+The entire initial review and reconciliation stage MUST be strictly read-only.
+
+Prohibited during the read-only stage:
+
+- Editing source files.
+- Editing tests.
+- Editing DDL or migrations.
+- Editing manifests.
+- Editing `.env` or secret files.
+- Changing environment variables.
+- Editing `node_modules`.
+- Deleting files or directories.
+- Restarting development servers.
+- Running `compile_applet`.
+- Running build commands that change tracked or protected artifacts.
+- Applying database migrations.
+- Changing database rows.
+- Changing Firestore documents.
+- Creating or deleting GCS objects.
+- Changing cloud IAM.
+- Changing project or production resources.
+- Performing Git commits, pushes, resets, or destructive cleanup.
+
+A UI-generated `Fix the errors in the app` message, `fix_it_trigger`, or similar automatic repair request MUST NOT override this restriction.
+
+If the preview displays:
+
+`CHANNEL_SECRET_ENCRYPTION_KEY is missing or empty`
+
+do not inject a synthetic key, modify the TSX preflight loader, generate random fallback keys, or suppress the error.
+
+Treat the message as a configuration/readiness issue. Identify the legitimate secret-management path and report the blocker.
+
+## 2.2 Development environment boundaries
+
+The connected database described in Phase 0.8 is a development database, not proof of production durability or production SLA.
+
+Never describe development database measurements as production verification.
+
+For any local Windows project material, source files, scripts, generated reports, temporary files, caches, and test outputs must remain under the explicitly approved F: workspace.
+
+Do not touch C: project files, Windows system directories, Program Files, roaming AppData, personal files, pagefile, hiberfil, or operating-system maintenance resources.
+
+Inside the cloud project container, restrict operations to the approved project scope and do not modify global container infrastructure.
+
+## 2.3 Secrets and private data
+
+Never print or commit:
+
+- CHANNEL_SECRET_ENCRYPTION_KEY
+- AUDIT_CHECKPOINT_HMAC_KEY
+- AUDIT_ARCHIVE_ENCRYPTION_KEY
+- RUNTIME_STATE_ENCRYPTION_KEY
+- Private Ed25519 keys
+- SQL passwords
+- Session secrets
+- Customer PII
+- Channel tokens
+
+When checking secret readiness, report only:
+
+- Whether the variable exists.
+- Whether its format is valid.
+- Whether its length is valid.
+- Whether key separation is satisfied.
+
+Never expose the value.
+
+---
+
+# 3. PHASE R0 — SINGLE BASELINE & FORENSIC INVENTORY
+
+The Lead Orchestrator first establishes one authoritative baseline.
+
+Collect, using read-only commands:
+
+1. Actual repository path.
+2. Actual branch.
+3. Actual HEAD.
+4. Actual remote baseline.
+5. `git status --short`.
+6. Any existing uncommitted modifications.
+7. Existing P1.3.2 evidence manifest verification.
+8. Actual PostgreSQL connection identity.
+9. Database name and environment classification.
+10. Actual presence or absence of relevant runtime artifacts.
+11. Relevant process-tree state without starting or stopping anything.
+12. Existing source file and schema versions.
+
+Do not assume the repository still has the previously reported commit.
+
+Do not assume that `node_modules` has the same state as the previous report.
+
+Do not rely on historical evidence if the actual current state differs.
+
+### Required baseline output
+
+Produce a compact table:
+
+| Item | Actual value | Evidence command | Evidence status |
+|---|---|---|---|
+
+Clearly distinguish:
+
+- Current observation.
+- Historical report claim.
+- Owner-supplied information.
+- Inference.
+- Unknown state.
+
+If a verification command cannot be executed safely, report that limitation instead of inventing its output.
+
+---
+
+# 4. PHASE R1 — PARALLEL INDEPENDENT REVIEW
+
+Launch Agents 1–6 in parallel.
+
+Each specialist must independently read the actual files relevant to its scope and deliver a bounded technical review.
+
+No specialist may edit files during this phase.
+
+## 4.1 Mandatory review output format
+
+Each agent must return:
+
+| ID | Exact location | Current implementation | Evidence | Root cause | Severity | Recommended correction | Required test |
+|---|---|---|---|---|---|---|---|
+
+Every defect must include:
+
+1. Exact file/table/function/route.
+2. Actual current behavior.
+3. Evidence from the current repository or current authorized environment.
+4. Why it is a defect.
+5. Concrete failure scenario.
+6. Minimal safe correction.
+7. Dependencies.
+8. Acceptance test.
+9. Whether owner approval is required.
+
+No generic statements such as "improve security" or "fix persistence."
+
+Describe the exact invariant that must hold.
+
+## 4.2 Evidence labels
+
+Use only these labels:
+
+- `[VERIFIED]`: Directly observed in this execution with command and literal output.
+- `[OWNER-SUPPLIED]`: Explicitly supplied in the owner report or conversation but not independently re-verified.
+- `[ARCHITECT RECOMMENDATION]`: A recommended design or decision, not an implemented fact.
+- `[INFERRED]`: Logical inference based on available evidence.
+- `[UNKNOWN]`: Not established by current evidence.
+
+A previous report's `[VERIFIED]` label does not automatically carry forward into this execution.
+
+---
+
+# 5. PHASE R2 — MANDATORY DEFECT RECONCILIATION
+
+The following issues must be explicitly reviewed. They are not automatically assumed to be defects if current evidence disproves them, but no issue may be silently skipped.
+
+## D-01 — PostgreSQL Privilege Statement Validity
+
+Phase 0.8 proposes:
+
+`REVOKE DELETE, TRUNCATE, TRIGGER, REFERENCES, ALTER ON ALL TABLES IN SCHEMA public ...`
+
+Verify every privilege against the actual PostgreSQL grammar.
+
+Do not assume `ALTER` is a valid table privilege. Separate:
+
+- Table privileges.
+- Schema privileges.
+- Function execution privileges.
+- Object ownership.
+- Role membership.
+- DDL authority.
+
+A failed privilege statement must not be presented as a successful security boundary.
+
+## D-02 — SECURITY DEFINER Execution Security
+
+Verify:
+
+- Explicit function ownership.
+- `REVOKE EXECUTE ON FUNCTION ... FROM PUBLIC`.
+- Explicit grants to the dedicated authorized role.
+- Schema ownership.
+- Search-path safety.
+- No attacker-controlled object resolution.
+- No application-role ability to execute privileged functions outside the intended workflow.
+
+Do not claim that a SECURITY DEFINER function is protected merely because its owner is `ai_studio_admin`.
+
+## D-03 — Audit Immutability and Trigger Completeness
+
+Verify the trigger protects every immutable field, including:
+
+- Event identity.
+- Global and tenant sequences.
+- State generation.
+- Actor fields.
+- Action and entity fields.
+- Before and after state.
+- Previous hashes.
+- Event integrity hash.
+- Schema version.
+- Exact original timestamp string.
+
+Verify archival metadata transitions are restricted.
+
+Verify `archive_batch_id` cannot be changed after assignment.
+
+Verify that an event cannot be attached to a batch that does not cover its actual global sequence.
+
+Verify that `pinned` cannot be cleared merely by setting `pinned_overflow = TRUE`.
+
+The actual verified archive and contiguous anchor conditions must be enforced by a controlled operation.
+
+## D-04 — Archive Metadata Immutability
+
+The archive trigger must protect all integrity-relevant fields:
+
+- `batch_id`
+- `state_generation`
+- Start and end sequences.
+- Event count.
+- First and last event hashes.
+- Previous cumulative archive hash.
+- Cumulative archive hash.
+- GCS URI.
+- GCS object generation.
+- Ciphertext SHA-256.
+- Size.
+- Encryption key ID.
+- IV.
+- Authentication tag.
+- Creation timestamp.
+- Retention metadata.
+
+Only a controlled verification transition may change `verified_at_ts` from NULL to a verified value.
+
+Do not permit the runtime application role to declare an archive verified without an actual verification operation.
+
+## D-05 — Contiguous Anchor Frontier
+
+The previous `MAX(ACKED)` logic was unsafe.
+
+The 0.8 replacement must be proved correct under:
+
+1. Out-of-order ACK.
+2. Earlier FAILED_RETRYABLE entry.
+3. Earlier FAILED_FATAL entry.
+4. Missing outbox entry.
+5. Duplicate retry.
+6. Overlapping or malformed sequence ranges.
+7. Different state generations.
+8. Concurrent archiver and eviction workers.
+9. Crash between Firestore commit and PostgreSQL acknowledgement.
+
+The frontier must represent a genuinely continuous verified range.
+
+Never infer contiguity from the largest acknowledged sequence alone.
+
+The archive batch itself must cover the sequence of every event eligible for eviction.
+
+## D-06 — Hot Partition Eviction
+
+Verify that `evict_verified_hot_audit_events()`:
+
+- Enforces a maximum safe deletion batch.
+- Cannot evict the current chain head.
+- Cannot evict pinned events.
+- Cannot evict events from unverified archive batches.
+- Cannot evict events above the contiguous anchor frontier.
+- Cannot evict events outside their actual archive batch range.
+- Handles concurrent execution safely.
+- Does not race with archive binding or pinning.
+- Cannot be called by unauthorized roles.
+
+Test actual database permissions, not only application-level checks.
+
+## D-07 — Pinned Event Lifecycle
+
+Reconcile these conditions:
+
+- Archive uploaded.
+- Archive verified.
+- Anchor committed.
+- Contiguous anchor frontier advanced.
+- Pinned count exceeds the retention target.
+
+The hot retention target is not an authorization to remove unarchived or unanchored events.
+
+An alert threshold must not silently become a security bypass.
+
+## D-08 — Canonical Merkle Empty Root
+
+Phase 0.8 includes conflicting descriptions of the empty-root hash.
+
+Independently compute:
+
+`SHA256(UTF8("OMNIFLOW_MERKLE_EMPTY_V1"))`
+
+Compare the computed result with every literal appearing in the report, source, tests, and expected fixtures.
+
+Choose one canonical value and use it everywhere.
+
+Do not copy an incorrect hash from an earlier report.
+
+## D-09 — Firestore Admin SDK and Security Rules
+
+The Admin SDK bypasses Firestore Security Rules.
+
+Therefore:
+
+- Do not claim that Security Rules alone block a stale Admin SDK worker.
+- Perform fencing validation inside the transaction using the currently committed document.
+- Validate the token before every anchor mutation.
+- Include stale worker, expiry, and takeover races in tests.
+
+Keep Security Rules as an additional client-access boundary, not the sole administrative fencing mechanism.
+
+## D-10 — State Matrix and Outbox Crash Recovery
+
+Reconcile States 1A–1D, 2, 3, and 4.
+
+Explicitly handle:
+
+- Firestore commit succeeded but PostgreSQL ACK failed.
+- Firestore timed out after an uncertain commit.
+- A retryable row exists while P == F.
+- A fatal row exists while P == F.
+- P > F with missing outbox coverage.
+- F > P after PostgreSQL restoration.
+- Generation mismatch.
+- Same sequence with different hashes.
+
+State 1A must not hide unresolved outbox work.
+
+## D-11 — Sovereign RBAC and Write-Freeze Authority
+
+Resolve the contradiction between:
+
+- B3.1 allowing write-freeze entry using `baseRole === 'Owner'`.
+- B11 separating tenant Owner from platform sovereignty.
+
+A tenant Owner is not automatically a platform sovereign principal.
+
+Define one consistent model for:
+
+- Tenant Owner.
+- Platform Sovereign Owner.
+- SecurityOfficer.
+- ComplianceAuditor.
+- Ordinary Admin.
+- Active simulated role.
+- Authenticated base role.
+
+The same principal must not gain global restore authority through `switch-role` or custom permissions.
+
+All privileged endpoints must check the correct immutable identity context.
+
+## D-12 — Break-Glass Quorum and DDL Alignment
+
+Reconcile the two offered options:
+
+**Option 6A:** Three distinct human principals.
+
+**Option 6B:** Two distinct human principals plus a third independently controlled external Ed25519 key.
+
+The DDL, canonical digest, status transitions, public-key ownership, signature verification, and acceptance tests must support the selected option completely.
+
+Do not claim that an external third key exists if the database has only two signatures.
+
+Require:
+
+- Key ID.
+- Algorithm.
+- Public-key identity.
+- Signature.
+- Revocation state.
+- Independent IAM or offline custody evidence when applicable.
+- Nonce uniqueness.
+- TTL validation.
+- Live role validation.
+- Snapshot identity binding.
+- Live-head binding.
+
+## D-13 — Break-Glass Target Snapshot Binding
+
+Cryptographically bind the exact restoration target:
+
+- Target snapshot identifier.
+- Target GCS URI.
+- Target object generation.
+- Target ciphertext/content hash.
+- Target state generation.
+- Target audit sequence.
+- Target head integrity hash.
+- Target cumulative archive-chain hash.
+
+The signature must not authorize an arbitrary backup that merely shares some matching metadata.
+
+## D-14 — Write-Freeze Expiration and Failure Recovery
+
+Prove behavior for:
+
+1. Normal entry.
+2. Firestore outage during entry.
+3. PostgreSQL crash while frozen.
+4. Runtime restart before expiration.
+5. Runtime restart after expiration.
+6. Failed Break-Glass execution.
+7. Expired ISSUED request.
+8. Normal exit.
+9. Timeout without an exit request.
+10. A concurrent external side effect.
+
+Expired write-freeze must not leave the database permanently blocked or silently resume writes without recording the expiry event.
+
+The event-logging failure path must have an explicit safe policy.
+
+## D-15 — Backup GET/POST Semantics
+
+The owner decision must be explicit.
+
+- Option 11A: temporary compatibility bridge for old GET callers, with a documented deprecation date and known GET side-effect exception.
+- Option 11B: strict POST-only export creation; GET is download-only and returns 405 when no `exportId` exists.
+
+Do not describe a state-mutating GET as pure or side-effect-free.
+
+Preserve the historical P1.3.2 manifest.
+
+Do not silently modify hashed historical tests or rewrite the old manifest to make a new implementation pass.
+
+## D-16 — Restore Rejection Audit Transactions
+
+When a restore validation fails:
+
+- The operational restore transaction must abort safely.
+- The rejection audit event must be committed through a clearly defined independent safe transaction if policy requires it.
+- Never imply that an event inserted inside a rolled-back transaction was persisted.
+- Test both the original HTTP response and the rejection audit result.
+
+## D-17 — Runtime Journal Has No Undefined Operational Authority
+
+The report refers to applying mutations in PostgreSQL operational tables, but the 12-table DDL does not define general operational entity tables.
+
+Explicitly choose and document the bridge model:
+
+- PostgreSQL is the authoritative committed mutation journal.
+- The full mutation payload is stored durably and encrypted.
+- In-memory state is updated only after the durable commit.
+- Baseline snapshots and journal replay reconstruct operational Maps.
+- `db_state.json` is not allowed to become an independent competing source of truth.
+
+If the actual implementation requires PostgreSQL operational entity tables, define their complete schema and migration scope separately.
+
+Never claim the operational data is stored in PostgreSQL entity tables when only audit/journal tables exist.
+
+## D-18 — Atomic Multi-Entity Journal Entries
+
+A single `intent_seq` must not accidentally represent only one of several entities modified by one business transaction.
+
+Define a journal representation that supports atomic multi-entity operations, such as:
+
+- One encrypted transaction payload containing all affected state-after operations; or
+- A properly grouped transaction ID with deterministic ordered child entries and atomic replay semantics.
+
+The chosen design must guarantee that replay never leaves half a business transaction applied.
+
+## D-19 — Journal Counter Initialization and Ordering
+
+Verify the counter seed:
+
+`GLOBAL_INTENT_SEQ = 0`
+
+must exist exactly once before writes are enabled.
+
+Test:
+
+- Missing counter row.
+- Concurrent writers.
+- Rollback.
+- Process crash.
+- Sequence allocation.
+- Commit ordering.
+- Replay.
+- Compaction.
+
+Never substitute BIGSERIAL allocation order for commit order.
+
+## D-20 — Baseline Snapshot Consistency
+
+Prove that a baseline at intent sequence K represents exactly the operational state committed through K.
+
+Specify:
+
+- The writer lock.
+- The counter lock.
+- Snapshot capture point.
+- Audit head at capture.
+- Encryption point.
+- Snapshot commit.
+- Round-trip verification.
+- Journal pruning.
+- Recovery after crash during compaction.
+
+Do not use a snapshot cloned from an uncontrolled mutable Map while unrelated writes continue.
+
+## D-21 — Encryption Key Rotation
+
+Verify:
+
+- Four cryptographic keys are pairwise distinct.
+- Startup fails closed when mandatory keys are missing or invalid.
+- No key values appear in logs or reports.
+- Old keys remain usable while historical rows still reference them.
+- Rotation never deletes the last decryptable copy prematurely.
+- All old journal and baseline records remain recoverable.
+- A failed rotation can safely resume.
+
+A previous-key environment variable alone is not a complete long-term key lifecycle strategy if multiple historical generations may remain.
+
+## D-22 — Idempotency Scope and Missing-Key Behavior
+
+The `Date.now()` 10-second fallback must be challenged.
+
+Do not assume it provides exactly-once behavior across:
+
+- Worker instances.
+- Client retries.
+- Network timeouts.
+- Long-running requests.
+- Browser refresh.
+- Process restarts.
+- Retries crossing the 10-second boundary.
+
+Require stable idempotency keys for sensitive mutations, or define a deterministic business-operation identifier for internal jobs.
+
+Bind the key to organization, actor, route, and request-payload hash.
+
+Reject reuse with different payloads.
+
+## D-23 — External Side Effects and Write-Freeze
+
+Build a complete route side-effect taxonomy:
+
+- `DB_MUTATE`
+- `MODULE_MUTATE`
+- `EXTERNAL_EFFECT`
+- `PURE_READ_OR_COMMAND`
+
+Review WhatsApp, GitHub, channel providers, external APIs, workspace relay, diagnostics, and automation.
+
+Write-Freeze must control actual external effects, not just DatabaseStore mutations.
+
+Prevent duplicate external operations when retries occur.
+
+## D-24 — Route Inventory and Audit Awaiting
+
+Rebuild the full actual route inventory using AST analysis.
+
+Compare it to:
+
+`49 = 35 DB_MUTATE + 2 MOD_MUTATE + 12 NO_MUTATE`
+
+Do not accept these figures unless reproduced against current code.
+
+Verify the 34 production audit call sites and all 22 currently unawaited sites against actual source.
+
+Distinguish:
+
+- Audit persistence success.
+- Audit persistence failure.
+- External side effect success.
+- External side effect failure.
+- HTTP response.
+- Retry behavior.
+
+Preserve 401/403 responses for rejected authentication and authorization requests while emitting separate critical security telemetry when the audit store fails.
+
+## D-25 — RPO/RTO and Archive Lag
+
+Reconcile:
+
+- Archive batch threshold: 250 events.
+- Normal flush cadence: 60 seconds.
+- Warning threshold: 300 seconds.
+- Option 8A.
+- Option 8B.
+- Anchored but unarchived tail.
+- Unanchored operational tail.
+- PostgreSQL catastrophic loss.
+- Firestore outage.
+- GCS outage.
+
+A 300-second warning is not the same thing as a guaranteed maximum flush time.
+
+Do not make a stronger RPO promise than the implemented and measured mechanism supports.
+
+## D-26 — GCS Witness Independence
+
+`ifGenerationMatch: 0` prevents overwriting an existing object generation but does not independently prove that an authorized principal cannot delete the object.
+
+Verify:
+
+- Actual runtime service-account permissions.
+- Object deletion permissions.
+- Archive writer separation.
+- Retention configuration.
+- External security review.
+- Whether the GCS witness is actually independent of the runtime principal.
+
+Keep production Bucket Lock status `[UNKNOWN]` unless independently proven.
+
+Do not call a write-once precondition equivalent to immutable WORM retention.
+
+## D-27 — Existing-Chain TOFU Bootstrap
+
+Prove that initial bootstrap:
+
+- Does not fabricate evicted historical events.
+- Does not claim physical custody of an absent prefix.
+- Verifies the available chain and checkpoint.
+- Establishes the exact cutover sequence.
+- Uses Firestore `create()` with the exists-false precondition.
+- Fails closed when an existing anchor conflicts with local state.
+
+## D-28 — Firestore Transaction Limits and Merkle Update Cost
+
+Verify current official Firestore limits and the real transaction behavior.
+
+Do not confuse document write limits, field transformations, request size, and transaction duration.
+
+Model:
+
+- Tenant count.
+- Documents per transaction.
+- Payload bytes.
+- Transaction latency.
+- Merkle computation time.
+- Contention.
+- Retry behavior.
+
+Do not assume that a particular tenant count is safe merely because a numerical write limit appears available.
+
+## D-29 — Historical Evidence and Incident Closure
+
+Re-check the current evidence concerning:
+
+- `node_modules/tsx/dist/preflight.cjs`.
+- Deleted `.env`.
+- `/tmp/omniflow-data/db_state.json`.
+- Current dev database identity.
+- Runtime service account.
+- Cloud SQL proxy process provenance.
+- Previous synthetic development keys.
+
+Do not reuse the synthetic-key-generated database state as evidence.
+
+Do not claim the former `.env` contents are known when the file has been deleted and no surviving copy has been verified.
+
+Keep unknown historical facts unknown.
+
+---
+
+# 6. PHASE R3 — ONE CANONICAL ARCHITECTURE DECISION
+
+After all six specialist reports are received:
+
+The Lead Orchestrator must produce ONE consolidated result.
+
+No separate competing architecture specifications are allowed.
+
+Deliver:
+
+## 6.1 Canonical Defect Register
+
+| Defect ID | Severity | Root cause | Evidence | Canonical correction | Dependencies | Acceptance test | Implementation owner |
+|---|---|---|---|---|---|---|---|
+
+Severity classification:
+
+- P0: Data corruption, audit integrity failure, unauthorized privileged action, unrecoverable state, or destructive security flaw.
+- P1: Critical recovery, persistence, isolation, authentication, or correctness failure.
+- P2: Important operational defect or incomplete guardrail.
+- P3: Non-blocking cleanup or documentation issue.
+
+## 6.2 Canonical Architecture Specification
+
+Produce a single internally consistent specification for:
+
+1. PostgreSQL tables and migrations.
+2. Ownership and least-privilege model.
+3. Audit event serialization and hashing.
+4. Global and tenant sequence allocation.
+5. Contiguous anchor frontier.
+6. Firestore outbox and fencing.
+7. GCS archive and verification.
+8. Operational journal.
+9. Baseline snapshots and replay.
+10. Encryption and key rotation.
+11. Restore and Break-Glass.
+12. Write-Freeze.
+13. Sovereign RBAC.
+14. Route behavior and side effects.
+15. Backup export.
+16. Recovery matrix.
+17. CI and acceptance tests.
+18. Evidence and manifest strategy.
+
+Do not repeat contradictory historical sections.
+
+## 6.3 Owner Decision Packet
+
+Only decisions that genuinely require owner authority should reach the owner.
+
+Do not ask the owner to approve internal implementation details that specialists can resolve technically.
+
+Provide concise comparisons and a recommendation for:
+
+**Decision A — Break-Glass Quorum**
+
+- 6A: Three distinct human principals.
+- 6B: Two distinct human principals plus an externally controlled Ed25519 key.
+
+Recommend the stronger practical model, explain operational burden, and state exactly what the DDL must support.
+
+**Decision B — Recovery Frontier**
+
+- 8A: Archive before advancing the external anchor.
+- 8B: Bounded hot-tail window with explicit gap sealing after catastrophic loss.
+
+Explain RPO, latency, cost, and availability differences.
+
+**Decision C — Backup Compatibility**
+
+- 11A: Temporary legacy GET bridge with explicit deprecation.
+- 11B: Strict POST creation and GET download-only.
+
+Explain compatibility with locked historical tests and HTTP semantics.
+
+Add any genuinely unavoidable fourth owner decision only if evidence proves it necessary.
+
+**Do not infer owner approval from silence, previous report wording, or automatic UI prompts.**
+
+---
+
+# 7. PHASE R4 — APPROVAL GATE
+
+No implementation starts until:
+
+1. The canonical architecture is internally consistent.
+2. All P0/P1 defects have precise remediation designs.
+3. The six specialist reports have been reconciled.
+4. The independent Red Team has no unresolved critical finding.
+5. Required owner choices have been explicitly recorded.
+6. File ownership is established.
+7. Acceptance criteria are approved.
+
+If the owner approves the architecture, proceed with the implementation plan using that approval.
+
+If a defect is already provable and a safe correction can be designed without changing a reserved owner decision, prepare it for the approved implementation phase.
+
+Do not silently turn the earlier STRICT READ-ONLY phase into an implementation authorization.
+
+---
+
+# 8. PHASE R5 — CONTROLLED MULTI-AGENT IMPLEMENTATION
+
+After the approval gate, implement in controlled waves.
+
+## 8.1 File ownership
+
+Assign one exclusive owner to each shared file.
+
+Proposed ownership:
+
+| Workstream | Exclusive implementation scope |
+|---|---|
+| Database | New migration files, schema DDL, database provisioning scripts |
+| Audit core | `server/core/audit.ts`, associated audit types |
+| Runtime journal | `server/db/store.ts`, new dedicated journal and snapshot modules |
+| Security | `server/core/rbac.ts`, `server/core/identity.ts` |
+| API integration | `server/api/router.ts`, route-side-effect integration |
+| Tests and CI | `server/test/**`, `.github/workflows/ci.yml` |
+
+These are ownership boundaries, not permission to edit every file in a scope.
+
+Cross-scope interface changes must first be specified and approved by the Lead Orchestrator.
+
+Never allow two agents to edit the same file simultaneously.
+
+Use separate branches or worktrees when the environment supports them. If it does not, serialize integration rather than creating conflicting edits.
+
+## 8.2 Implementation waves
+
+### Wave 1 — Database Foundation
+
+- Complete the 12-table DDL.
+- Fix all invalid SQL.
+- Create privilege and ownership model.
+- Implement triggers and protected functions.
+- Seed the journal counter.
+- Create safe migrations.
+- Verify the schema against isolated PostgreSQL.
+
+### Wave 2 — Audit and Distributed Integrity
+
+- Implement CanonicalEventHashV4.
+- Preserve historical hash compatibility.
+- Implement exact BIGINT behavior.
+- Implement chain heads.
+- Implement outbox.
+- Implement fencing.
+- Implement contiguous anchor advancement.
+- Implement cold archive.
+- Implement secure verified eviction.
+
+### Wave 3 — Operational Durability
+
+- Implement complete state-after journal entries.
+- Implement atomic multi-entity journal representation.
+- Implement the commit-order counter.
+- Implement baseline snapshots.
+- Implement crash-safe replay.
+- Implement key separation and rotation.
+- Implement startup fail-closed behavior.
+
+### Wave 4 — Security and Application Integration
+
+- Implement sovereign RBAC.
+- Implement baseRole checks.
+- Implement switch-role ceiling.
+- Implement write-freeze.
+- Implement Break-Glass.
+- Implement restore matrix.
+- Implement backup export.
+- Integrate route audit behavior.
+- Protect external side effects and retries.
+
+### Wave 5 — Independent Verification and CI
+
+- PostgreSQL integration tests.
+- Fake Firestore and, where safely available, real Firestore emulator tests.
+- Fake GCS archive tests.
+- Unit tests.
+- Crash-recovery tests.
+- Concurrency tests.
+- Permission-boundary tests.
+- Multi-tenant tests.
+- Full regression suite.
+- Security and static analysis.
+- CI pipeline verification.
+- New phase evidence manifest.
+
+Do not claim the entire platform is fixed until every required wave passes.
+
+---
+
+# 9. ACCEPTANCE TEST REQUIREMENTS — AC-33 THROUGH AC-66
+
+Use the 0.8 acceptance suite as the starting baseline, not as proof of completion.
+
+Every test must have:
+
+- Unique test ID.
+- Explicit preconditions.
+- Isolated test environment.
+- Exact operation.
+- Expected result.
+- Failure result.
+- Cleanup procedure.
+- Evidence output.
+
+The final test matrix must explicitly cover:
+
+| Test family | Required verification |
+|---|---|
+| AC-33–34 | Hash v4, canonical JSON, BigInt boundaries |
+| AC-35–38 | Candidate/commit separation, fencing, lease expiry, sequential commits |
+| AC-39–44 | Outbox lifecycle, Tier-1 failure, rollback, split-brain, unexplained gaps |
+| AC-45–47 | Restore, write-freeze, Break-Glass, rejected authorization |
+| AC-48–52 | Cold archive, eviction, pinning, thresholds, Merkle |
+| AC-53–54 | Multi-tenant epoch staging and stale worker rejection |
+| AC-55–59 | Backup export, idempotency, audit awaiting, benchmark, route gaps |
+| AC-60–66 | Journal replay, commit order, startup guard, writer takeover, RBAC, TOFU, key separation |
+
+Add further tests whenever a verified P0/P1 defect requires them.
+
+Do not renumber unrelated historical tests unnecessarily.
+
+Do not mark a test passed based only on successful compilation or a test being present in the repository.
+
+**Performance benchmark:** AC-58 remains NOT EXECUTED until actual measurements are collected. Report p50, p95, p99, throughput, test configuration, dataset size, and resource conditions.
+
+---
+
+# 10. CI, GIT AND EVIDENCE GOVERNANCE
+
+## 10.1 Historical manifest preservation
+
+The historical file:
+
+`docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256`
+
+must remain unchanged.
+
+Create a separate Phase P1.3.3 manifest only after approved implementation and successful verification:
+
+`docs/roadmap/OMNIFLOW_PHASE_P1_3_3_EVIDENCE.sha256`
+
+Verify the new manifest independently.
+
+Ensure CI checks its contents without replacing or rewriting the historical baseline.
+
+## 10.2 Git restrictions
+
+Before and after each implementation wave:
+
+- Capture `git status`.
+- Record the current HEAD.
+- Verify file ownership.
+- Review the diff.
+- Verify unrelated files were not changed.
+
+Never run:
+
+- `git reset --hard`
+- `git clean`
+- Destructive checkout operations.
+- Automated commits.
+- Pushes.
+- Deployment operations.
+
+Do not commit or push unless the owner explicitly authorizes that separate action.
+
+## 10.3 Database restrictions
+
+Never run implementation migrations against the connected development database or any production database as part of initial diagnosis.
+
+Use isolated PostgreSQL service containers for integration tests.
+
+A migration may be prepared and validated without applying it to a live database.
+
+Any future application of a migration requires a separate explicit authorization and backup/recovery plan.
+
+## 10.4 Verification evidence
+
+For each acceptance test, record:
+
+- Command.
+- Actual exit code.
+- Literal output or structured result.
+- Database/container configuration.
+- Test artifacts.
+- Relevant commit or working-tree state.
+- Whether the result was independently reproduced.
+
+Never fabricate output.
+
+Never convert `[INFERRED]` into `[VERIFIED]` without a new empirical test.
+
+---
+
+# 11. FINAL RELEASE GATES
+
+The final result must use one of these exact states:
+
+### PASS — IMPLEMENTATION VERIFIED
+
+Only when:
+
+- All P0/P1 issues are closed.
+- All required AC tests pass.
+- Full regression passes.
+- Security and permission boundaries pass.
+- Persistence and replay tests pass.
+- CI passes.
+- Manifest verification passes.
+- No unresolved critical Red Team finding exists.
+
+### CONDITIONAL PASS — NON-CRITICAL OPEN ITEMS
+
+Only when:
+
+- All P0/P1 defects are closed.
+- Remaining issues are explicitly classified P2/P3.
+- Risks and owner acceptance are documented.
+- No false production-readiness claim is made.
+
+### HOLD — BLOCKING DEFECTS REMAIN
+
+Use HOLD whenever any P0/P1 defect remains, evidence is insufficient, or a required owner decision is unresolved.
+
+Do not downgrade a critical defect to achieve a passing verdict.
+
+---
+
+# 12. REQUIRED FINAL DELIVERY
+
+Deliver one consolidated final report containing:
+
+1. Executive verdict.
+2. Actual baseline.
+3. Multi-agent participation and scopes.
+4. Findings by severity.
+5. Root causes.
+6. Reconciled architecture decisions.
+7. Owner decisions and selected options.
+8. Files actually modified.
+9. Database changes actually applied — or explicit NONE.
+10. Acceptance test results.
+11. Full regression results.
+12. Security review results.
+13. Performance measurements.
+14. Evidence manifest status.
+15. Remaining risks.
+16. Rollback and recovery procedure.
+17. Exact next permitted action.
+
+Also provide:
+
+- One canonical defect register.
+- One canonical implementation/file ownership matrix.
+- One acceptance-test matrix.
+- One residual-risk register.
+- One concise release readiness decision.
+
+Do not generate multiple redundant reports from different agents and call that integration.
+
+The Lead Orchestrator must own the final reconciled result.
+
+---
+
+# 13. EXECUTION DISCIPLINE — FINAL DIRECTIVE
+
+Work efficiently.
+
+Parallelize independent analysis, not conflicting edits.
+
+Do not repeat a test unless there is a documented reason.
+
+Do not keep reopening already verified findings without new evidence.
+
+Do not add architecture complexity to compensate for an unresolved root cause.
+
+Do not claim that the app error has been fixed by hiding it, injecting placeholder secrets, or bypassing encryption validation.
+
+Do not modify the environment to produce a green preview during a read-only phase.
+
+Do not use a generated local database state as proof of durable production persistence.
+
+Do not confuse design completion with implementation completion.
+
+Do not confuse implementation completion with verification completion.
+
+Do not confuse verification completion with production readiness.
+
+**The ultimate objective is one secure, maintainable, recoverable, multi-tenant OmniFlow OS implementation — not another cycle of reports.**
+
+Begin with PHASE R0, then execute the six independent read-only reviews in parallel.
+
+After reconciliation, deliver the minimal Owner Decision Packet and the implementation-ready plan.
+
+Wait at the approval gate before making changes that require owner authorization.
+
+Proceed with controlled implementation only after that gate is explicitly satisfied.
+
+**No silent assumptions. No false verification. No destructive shortcuts. No overlapping edits. One source of truth.**
