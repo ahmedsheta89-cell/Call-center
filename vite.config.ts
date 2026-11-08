@@ -134,19 +134,8 @@ export default defineConfig(({ command, mode }) => {
               },
             },
             {
-              urlPattern: /\/api\/v1\/(operations\/live|tickets|conversations|customers|agents|calls)/i,
-              handler: 'NetworkFirst',
-              options: {
-                cacheName: 'omniflow-api-live-cache',
-                networkTimeoutSeconds: 4,
-                expiration: {
-                  maxEntries: 50,
-                  maxAgeSeconds: 60 * 60 * 24,
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
+              urlPattern: /\/api\/.*/i,
+              handler: 'NetworkOnly',
             },
           ],
         },

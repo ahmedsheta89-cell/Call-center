@@ -168,6 +168,61 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
 };
 
 /**
+ * Authoritative privilege rank per role.
+ * Role switching is strictly a downscoping mechanism: activeRole rank must never exceed baseRole rank.
+ */
+export const ROLE_HIERARCHY_RANK: Readonly<Record<string, number>> = Object.freeze({
+  Owner: 100,
+  Admin: 80,
+  Supervisor: 60,
+  'Team Leader': 50,
+  QA: 40,
+  Analyst: 30,
+  Agent: 20,
+  'AI Agent': 15,
+  'Read Only': 10,
+});
+
+/**
+ * Returns true if and only if a user with `baseRole` is permitted to switch their active session role to `targetRole`.
+ * - Only `Owner` and `Admin` baseRoles may use role switching.
+ * - `targetRole` rank must be `<= baseRole` rank (e.g., `Admin` cannot escalate to `Owner`).
+ */
+export function canSwitchToRole(baseRole: string, targetRole: string): boolean {
+  if (baseRole !== 'Owner' && baseRole !== 'Admin') {
+    return false;
+  }
+  const baseRank = ROLE_HIERARCHY_RANK[baseRole];
+  const targetRank = ROLE_HIERARCHY_RANK[targetRole];
+  if (typeof baseRank !== 'number' || typeof targetRank !== 'number') {
+    return false;
+  }
+  return targetRank <= baseRank;
+}
+
+/**
+ * Enforces that paid-tier activation (`zeroCostMode: false`) and billing/budget mutations
+ * can only be performed by an authenticated `Owner` acting with `baseRole === 'Owner'` and `role === 'Owner'`.
+ */
+export function assertOwnerBillingAuthority(actor: {
+  role: string;
+  baseRole?: string;
+}): void {
+  const effectiveBaseRole = actor.baseRole || actor.role;
+  if (
+    effectiveBaseRole !== 'Owner' ||
+    actor.role !== 'Owner' ||
+    !hasPermission(actor.role, [], 'billing.manage')
+  ) {
+    const err = new AuthorizationError(
+      'Access Denied: Paid-tier activation and billing/budget mutations require explicit Owner authority (baseRole=Owner, role=Owner, billing.manage).'
+    );
+    err.code = 'OWNER_BILLING_AUTHORIZATION_REQUIRED';
+    throw err;
+  }
+}
+
+/**
  * Validates whether a user with given roles and custom permissions possesses the requested permission.
  */
 export function hasPermission(

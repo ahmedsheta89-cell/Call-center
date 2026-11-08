@@ -44,7 +44,7 @@ export function initializeSeedData() {
       timezone: 'Asia/Riyadh',
       defaultLanguage: 'ar',
       workingHours: { start: '08:00', end: '20:00', days: [0, 1, 2, 3, 4] },
-      zeroCostMode: false,
+      zeroCostMode: true,
       aiMonthlyBudgetUsd: 250.0,
       aiCurrentMonthSpendUsd: 18.45,
     },

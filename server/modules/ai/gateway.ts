@@ -61,13 +61,20 @@ export class AIGateway {
       };
     }
 
-    // 2. Determine Route: Local vs Cloud
-    const isZeroCost = org?.settings.zeroCostMode ?? false;
+    // 2. Determine Route: Local vs Cloud (Free-First by default; Paid Cloud requires explicit zeroCostMode === false)
+    const isZeroCost = org?.settings.zeroCostMode ?? true;
     const isRestrictedPii = safeReq.privacy === 'restricted_pii';
     const isSimpleTask = safeReq.task === 'sentiment_intent_analysis';
     const isBudgetExceeded = (org?.settings.aiCurrentMonthSpendUsd ?? 0) >= (org?.settings.aiMonthlyBudgetUsd ?? 100);
 
-    const useLocal = safeReq.forceLocal || isZeroCost || isRestrictedPii || isSimpleTask || isBudgetExceeded || !process.env.GEMINI_API_KEY;
+    const useLocal =
+      safeReq.forceLocal ||
+      isZeroCost ||
+      org?.settings.zeroCostMode !== false ||
+      isRestrictedPii ||
+      isSimpleTask ||
+      isBudgetExceeded ||
+      !process.env.GEMINI_API_KEY;
 
     let response: AIRouteResponse;
 
@@ -269,21 +276,33 @@ ${JSON.stringify(req.contextData || {})}`;
       config: {
         systemInstruction,
         temperature: req.temperature ?? 0.2,
+        thinkingConfig: { thinkingBudget: 0 },
       },
     });
 
     const outputText = res.text || '';
-    const inputTokenEstimate = Math.ceil((prompt.length + systemInstruction.length) / 4);
-    const outputTokenEstimate = Math.ceil(outputText.length / 4);
-    // Standard Gemini 2.5 Flash pricing: ~$0.075 / 1M input, $0.30 / 1M output
-    const cost = (inputTokenEstimate * 0.000000075) + (outputTokenEstimate * 0.00000030);
+    const usage = (res as any)?.usageMetadata;
+    const inputTokenCount =
+      typeof usage?.promptTokenCount === 'number' && usage.promptTokenCount > 0
+        ? usage.promptTokenCount
+        : Math.ceil((prompt.length + systemInstruction.length) / 4);
+    const outputTokenCount =
+      typeof usage?.candidatesTokenCount === 'number' && usage.candidatesTokenCount >= 0
+        ? usage.candidatesTokenCount + (typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0)
+        : Math.ceil(outputText.length / 4);
+    // Official Gemini 2.5 Flash pricing: $0.30 / 1M input tokens, $2.50 / 1M output tokens
+    const cost = inputTokenCount * 0.0000003 + outputTokenCount * 0.0000025;
 
     return {
       runId: crypto.randomUUID(),
       provider: 'cloud_gemini',
       model: 'gemini-2.5-flash',
       content: outputText,
-      tokensUsed: { input: inputTokenEstimate, output: outputTokenEstimate, total: inputTokenEstimate + outputTokenEstimate },
+      tokensUsed: {
+        input: inputTokenCount,
+        output: outputTokenCount,
+        total: inputTokenCount + outputTokenCount,
+      },
       costUsd: Number(cost.toFixed(6)),
       latencyMs: Date.now() - startTime,
       isHallucinationSafe: true,

@@ -20,7 +20,13 @@ import {
 } from '../db/store.ts';
 import { DEMO_ORG_ID, initializeSeedData } from '../db/seed.ts';
 import { AuditLogger, redactSensitiveValue } from '../core/audit.ts';
-import { assertPermission, hasPermission, ROLE_PERMISSIONS } from '../core/rbac.ts';
+import {
+  assertPermission,
+  hasPermission,
+  ROLE_PERMISSIONS,
+  canSwitchToRole,
+  assertOwnerBillingAuthority,
+} from '../core/rbac.ts';
 import type { Permission } from '../core/rbac.ts';
 import {
   authenticateApiRequest,
@@ -255,25 +261,37 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   }
 
   const { idToken, userId, email, ttlMs } = req.body || {};
-  const isProduction =
+  const remoteIp = String(req.ip || req.socket?.remoteAddress || '').trim();
+  const isLoopbackRequest =
+    remoteIp === '127.0.0.1' ||
+    remoteIp === '::1' ||
+    remoteIp === '::ffff:127.0.0.1' ||
+    req.hostname === '127.0.0.1' ||
+    req.hostname === 'localhost';
+  const isProductionOrLocked =
     process.env.NODE_ENV === 'production' ||
     process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === 'true';
+  const allowLocalTestLogin =
+    !isProductionOrLocked &&
+    process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' &&
+    isLoopbackRequest;
+  const requireCryptographicIdToken = !allowLocalTestLogin;
 
   let resolvedUserId: string | undefined;
 
-  if (isProduction && (!idToken || typeof idToken !== 'string' || idToken.trim().length === 0)) {
+  if (requireCryptographicIdToken && (!idToken || typeof idToken !== 'string' || idToken.trim().length === 0)) {
     res.status(401).json({
       success: false,
       error: {
         code: 'FIREBASE_ID_TOKEN_REQUIRED_IN_PRODUCTION',
-        message: 'Production login requires a valid Firebase ID token; demo userId/email login is disabled.',
+        message: 'Login requires a valid Firebase ID token; unverified userId/email login is disabled by default.',
       },
     });
     return;
   }
 
-  // If idToken is provided OR running in production, strictly verify Firebase ID Token via adminAuth.verifyIdToken
-  if (idToken !== undefined || isProduction) {
+  // If idToken is provided OR cryptographic token is required, strictly verify Firebase ID Token via adminAuth.verifyIdToken
+  if (idToken !== undefined || requireCryptographicIdToken) {
     try {
       const verifiedFb = await verifyFirebaseIdToken(idToken);
       resolvedUserId = verifiedFb.userId;
@@ -288,15 +306,12 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
       return;
     }
   } else {
-    // Development / Sandbox mode only (NODE_ENV !== 'production')
+    // Explicit loopback automated test mode ONLY (OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' on 127.0.0.1)
     let resolvedUser = userId ? db.users.get(String(userId).trim()) : undefined;
     if (!resolvedUser && email && typeof email === 'string') {
       resolvedUser = Array.from(db.users.values()).find(
         (u) => u.email.toLowerCase() === email.trim().toLowerCase()
       );
-    }
-    if (!resolvedUser && !userId && !email) {
-      resolvedUser = db.users.get('usr-admin-01');
     }
     resolvedUserId = resolvedUser?.id;
   }
@@ -359,33 +374,59 @@ apiRouter.post('/auth/logout', (req: Request, res: Response) => {
 });
 
 apiRouter.post('/auth/switch-role', (req: Request, res: Response) => {
-  // CRITICAL SECURITY GATE: Only users whose authoritative baseRole is Owner/Admin with 'settings.manage'
-  // may switch active roles or simulate RBAC personas. Unprivileged users cannot self-escalate!
-  const isAuthorizedRoleManager =
-    (currentActor.baseRole === 'Owner' || currentActor.baseRole === 'Admin') &&
-    hasPermission(currentActor.baseRole, [], 'settings.manage');
-  if (!isAuthorizedRoleManager) {
+  const authenticatedUserId = currentActor.userId;
+  const previousRole = currentActor.role;
+  const authoritativeBaseRole = currentActor.baseRole;
+
+  // 1. CDR-01: Unconditionally forbid userId in /auth/switch-role body (prevent cross-user impersonation & audit spoofing)
+  if (req.body && typeof req.body === 'object' && 'userId' in req.body && req.body.userId !== undefined) {
     AuditLogger.log({
       organizationId: currentActor.organizationId,
-      actorId: currentActor.userId,
+      actorId: authenticatedUserId,
       actorType: 'user',
       action: 'security.unauthorized_role_switch',
       entityType: 'session',
       entityId: currentActor.sessionId,
-      beforeState: { baseRole: currentActor.baseRole, activeRole: currentActor.role },
+      beforeState: { userId: authenticatedUserId, baseRole: authoritativeBaseRole, activeRole: previousRole },
+      afterState: { attemptedUserId: req.body?.userId, attemptedRole: req.body?.role },
+      reason: 'Blocked userId parameter in /auth/switch-role (USER_IMPERSONATION_FORBIDDEN)',
+    });
+    res.status(400).json({
+      success: false,
+      error: {
+        code: 'USER_IMPERSONATION_FORBIDDEN',
+        message: 'Supplying userId in /auth/switch-role is forbidden; role switching applies strictly to the authenticated session user.',
+      },
+    });
+    return;
+  }
+
+  // 2. Only users whose authoritative baseRole is Owner/Admin with 'settings.manage' may switch active roles
+  const isAuthorizedRoleManager =
+    (authoritativeBaseRole === 'Owner' || authoritativeBaseRole === 'Admin') &&
+    hasPermission(authoritativeBaseRole, [], 'settings.manage');
+  if (!isAuthorizedRoleManager) {
+    AuditLogger.log({
+      organizationId: currentActor.organizationId,
+      actorId: authenticatedUserId,
+      actorType: 'user',
+      action: 'security.unauthorized_role_switch',
+      entityType: 'session',
+      entityId: currentActor.sessionId,
+      beforeState: { userId: authenticatedUserId, baseRole: authoritativeBaseRole, activeRole: previousRole },
       afterState: { attemptedRole: req.body?.role },
     });
     res.status(403).json({
       success: false,
       error: {
         code: 'ROLE_SWITCH_FORBIDDEN',
-        message: `Role switch denied: base identity role [${currentActor.baseRole}] lacks Owner/Admin authority.`,
+        message: `Role switch denied: base identity role [${authoritativeBaseRole}] lacks Owner/Admin authority.`,
       },
     });
     return;
   }
 
-  const { role, userId } = req.body || {};
+  const { role } = req.body || {};
   let resolvedRole = currentActor.role;
   if (role !== undefined) {
     if (typeof role !== 'string' || role.trim().length === 0) {
@@ -413,39 +454,47 @@ apiRouter.post('/auth/switch-role', (req: Request, res: Response) => {
     }
   }
 
-  let targetUserId = currentActor.userId;
-  if (userId) {
-    const targetUser = db.users.get(String(userId).trim());
-    if (!targetUser || targetUser.organizationId !== currentActor.organizationId) {
-      res.status(404).json({
-        success: false,
-        error: { code: 'NOT_FOUND', message: 'Target user not found in current organization' },
-      });
-      return;
-    }
-    targetUserId = targetUser.id;
+  // 3. CDR-01: Enforce strict baseRole hierarchy ceiling (e.g. Admin cannot escalate to Owner)
+  if (!canSwitchToRole(authoritativeBaseRole, resolvedRole)) {
+    AuditLogger.log({
+      organizationId: currentActor.organizationId,
+      actorId: authenticatedUserId,
+      actorType: 'user',
+      action: 'security.unauthorized_role_switch',
+      entityType: 'session',
+      entityId: currentActor.sessionId,
+      beforeState: { userId: authenticatedUserId, baseRole: authoritativeBaseRole, activeRole: previousRole },
+      afterState: { attemptedRole: resolvedRole },
+      reason: `Blocked privilege escalation from baseRole [${authoritativeBaseRole}] to [${resolvedRole}]`,
+    });
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'ROLE_ESCALATION_FORBIDDEN',
+        message: `Role escalation denied: base identity role [${authoritativeBaseRole}] cannot switch to higher privilege role [${resolvedRole}].`,
+      },
+    });
+    return;
   }
 
-  const previousRole = currentActor.role;
   const { token, csrfToken, actor } = issueSessionToken({
-    userId: targetUserId,
+    userId: authenticatedUserId,
     activeRoleOverride: resolvedRole,
     existingJti: currentActor.sessionId,
   });
 
+  // Preserve authenticated userId and name in AsyncLocalStorage; mutate active role only
   currentActor.role = actor.role;
-  currentActor.userId = actor.userId;
-  currentActor.name = actor.name;
 
   AuditLogger.log({
     organizationId: currentActor.organizationId,
-    actorId: currentActor.userId,
+    actorId: authenticatedUserId,
     actorType: 'user',
     action: 'auth.switch_role',
     entityType: 'session',
     entityId: currentActor.sessionId,
-    beforeState: { role: previousRole, baseRole: currentActor.baseRole },
-    afterState: { role: actor.role, baseRole: actor.baseRole },
+    beforeState: { userId: authenticatedUserId, role: previousRole, baseRole: authoritativeBaseRole },
+    afterState: { userId: authenticatedUserId, role: actor.role, baseRole: actor.baseRole },
   });
 
   res.setHeader('Set-Cookie', formatSessionCookie(req, token));
@@ -1085,7 +1134,7 @@ apiRouter.get('/operations/live', (req: Request, res: Response) => {
       aiBudget: {
         monthlyLimitUsd: org?.settings.aiMonthlyBudgetUsd || 250,
         currentSpendUsd: org?.settings.aiCurrentMonthSpendUsd || 18.45,
-        zeroCostMode: org?.settings.zeroCostMode || false,
+        zeroCostMode: org?.settings.zeroCostMode ?? true,
       },
     },
   });
@@ -1126,6 +1175,10 @@ apiRouter.get('/settings', (req: Request, res: Response) => {
 
 apiRouter.post('/settings', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'settings.manage');
+  // CDR-07 & Product Policy Section 3: Disabling zeroCostMode or changing AI budget requires explicit Owner authority
+  if (req.body?.zeroCostMode === false || req.body?.aiMonthlyBudgetUsd !== undefined) {
+    assertOwnerBillingAuthority(currentActor);
+  }
   const org = db.organizations.get(currentActor.organizationId);
   if (org) {
     org.settings = { ...org.settings, ...req.body };
@@ -3131,6 +3184,7 @@ const ALLOWED_EXACT_WORKSPACE_FILE_PATHS = new Set([
 const EXCLUDED_DIR_NAMES = new Set([
   'node_modules',
   'dist',
+  'dist-server',
   'build',
   'dev-dist',
   'coverage',

@@ -13,6 +13,11 @@ import {
   signOut,
 } from 'firebase/auth';
 import { auth } from './firebase';
+import {
+  refreshGlobalApiSession,
+  logoutGlobalApiSession,
+  purgeSensitiveBrowserCaches,
+} from './apiClient';
 
 export const WORKSPACE_SCOPES = [
   'https://mail.google.com/',
@@ -70,7 +75,13 @@ export const initWorkspaceAuth = (callback?: AuthCallback): (() => void) => {
 
   const unsubscribe = onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
-      // User is signed into Firebase Auth
+      // User is signed into Firebase Auth: synchronize backend session with verified Firebase ID token
+      try {
+        const idToken = await user.getIdToken();
+        await refreshGlobalApiSession(idToken);
+      } catch {
+        // Ignore session sync error during background auth state check
+      }
       currentState = {
         user,
         accessToken: cachedAccessToken,
@@ -139,6 +150,14 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
     // OAuth access tokens typically expire in 3600 seconds (1 hour)
     tokenExpiresAt = Date.now() + 3500 * 1000;
 
+    // Exchange verified Firebase ID Token with backend /api/v1/auth/login to synchronize OmniFlow session
+    try {
+      const idToken = await result.user.getIdToken();
+      await refreshGlobalApiSession(idToken);
+    } catch {
+      // Non-fatal if backend session exchange is handled separately
+    }
+
     currentState = {
       user: result.user,
       accessToken: cachedAccessToken,
@@ -164,10 +183,12 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 };
 
 /**
- * Sign out and clear in-memory token
+ * Sign out, revoke backend /api/v1/auth/logout session, purge sensitive caches, and clear in-memory token
  */
 export const googleSignOut = async (): Promise<void> => {
   try {
+    await logoutGlobalApiSession();
+    await purgeSensitiveBrowserCaches();
     await signOut(auth);
     cachedAccessToken = null;
     tokenExpiresAt = null;

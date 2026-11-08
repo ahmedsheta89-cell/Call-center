@@ -20,7 +20,7 @@ import crypto from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
 import type { Request, Response, NextFunction } from 'express';
 import { db } from '../db/store.ts';
-import { ROLE_PERMISSIONS } from './rbac.ts';
+import { ROLE_PERMISSIONS, canSwitchToRole } from './rbac.ts';
 import { AuditLogger } from './audit.ts';
 import { adminAuth } from '../../src/lib/firebase-admin.ts';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -347,6 +347,32 @@ export function issueSessionToken(options: {
       status: 400,
       code: 'INVALID_ROLE',
     });
+  }
+
+  if (options.activeRoleOverride && activeRole !== baseRole && !canSwitchToRole(baseRole, activeRole)) {
+    throw Object.assign(
+      new Error(`Role escalation forbidden: baseRole [${baseRole}] cannot switch to [${activeRole}]`),
+      {
+        status: 403,
+        code: 'ROLE_ESCALATION_FORBIDDEN',
+      }
+    );
+  }
+
+  if (options.existingJti) {
+    const existingSession = activeSessions.get(options.existingJti);
+    if (
+      existingSession &&
+      (existingSession.userId !== user.id || existingSession.organizationId !== user.organizationId)
+    ) {
+      throw Object.assign(
+        new Error('Session identity is immutable: cannot reassign an existing session JTI to another user or organization'),
+        {
+          status: 403,
+          code: 'SESSION_USER_IMMUTABLE',
+        }
+      );
+    }
   }
 
   const now = Date.now();

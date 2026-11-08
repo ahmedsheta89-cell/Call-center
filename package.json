@@ -5,15 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --outfile=dist/server.cjs",
-    "start": "node dist/server.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --outfile=dist-server/server.cjs",
+    "start": "node dist-server/server.cjs",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist dist-server server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx server/test/run-enterprise-audit.ts",
-    "test:audit": "tsx server/test/run-enterprise-audit.ts",
+    "test": "OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true tsx server/test/run-enterprise-audit.ts",
+    "test:audit": "OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true tsx server/test/run-enterprise-audit.ts",
     "test:firestore": "tsx server/test/firestore-rules-audit.ts",
-    "test:e2e": "tsx scripts/test_all_operations.ts"
+    "test:e2e": "OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true tsx scripts/test_all_operations.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

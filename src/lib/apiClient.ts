@@ -24,6 +24,7 @@ export interface ApiClientOptions {
   globalThisTarget?: any;
   loginTimeoutMs?: number;
   getFirebaseIdToken?: () => Promise<string | null>;
+  allowLocalTestBootstrap?: boolean;
 }
 
 export type FetchDescriptorMode =
@@ -52,6 +53,70 @@ let registeredGlobalClient: ApiClientController | null = null;
 
 export function registerGlobalApiClient(client: ApiClientController): void {
   registeredGlobalClient = client;
+}
+
+/**
+ * Purges any cached API responses from Browser CacheStorage (`caches`) upon logout or role switch.
+ */
+export async function purgeSensitiveBrowserCaches(): Promise<void> {
+  try {
+    if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys
+          .filter(
+            (key) =>
+              key.includes('omniflow-api') ||
+              key.includes('api-live-cache') ||
+              key.includes('workbox-runtime')
+          )
+          .map((key) => caches.delete(key))
+      );
+    }
+  } catch {
+    // Ignore CacheStorage errors in non-browser or restricted environments
+  }
+}
+
+/**
+ * Exchanges a verified Firebase ID Token with `/api/v1/auth/login` via the registered global API client.
+ */
+export async function refreshGlobalApiSession(idToken?: string | null): Promise<SessionCredentials | null> {
+  if (!registeredGlobalClient) return null;
+  if (idToken && typeof idToken === 'string' && idToken.trim().length > 0) {
+    const res = await registeredGlobalClient.apiFetch('/api/v1/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ idToken: idToken.trim() }),
+    });
+    if (!res.ok) {
+      return null;
+    }
+    return registeredGlobalClient.getActiveSession();
+  }
+  return registeredGlobalClient.ensureSession(true);
+}
+
+/**
+ * Revokes the backend session via `POST /api/v1/auth/logout`, clears client credentials,
+ * and purges browser caches.
+ */
+export async function logoutGlobalApiSession(): Promise<void> {
+  try {
+    if (registeredGlobalClient && registeredGlobalClient.getActiveSession()) {
+      await registeredGlobalClient.apiFetch('/api/v1/auth/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+      });
+    }
+  } catch {
+    // Even if network logout fails, unconditionally clear local session state
+  } finally {
+    registeredGlobalClient?.clearSession();
+    await purgeSensitiveBrowserCaches();
+  }
 }
 
 /**
@@ -115,7 +180,21 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
           }
         }
 
-        const bodyPayload = idToken ? { idToken } : { userId: 'usr-admin-01' };
+        const isNodeLocalTestAllowed =
+          typeof process !== 'undefined' &&
+          process.env?.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' &&
+          process.env?.NODE_ENV !== 'production' &&
+          process.env?.OMNIFLOW_REQUIRE_FIREBASE_AUTH !== 'true';
+        const allowFallbackUserId =
+          options.allowLocalTestBootstrap !== undefined
+            ? options.allowLocalTestBootstrap
+            : isNodeLocalTestAllowed;
+
+        const bodyPayload = idToken
+          ? { idToken }
+          : allowFallbackUserId
+          ? { userId: 'usr-admin-01' }
+          : {};
         const res = await invokeRawFetch('/api/v1/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -288,6 +367,7 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
             token: data.data.token,
             csrfToken: data.data.csrfToken || session.csrfToken,
           };
+          void purgeSensitiveBrowserCaches();
         }
       } catch {
         // ignore clone parse failure
@@ -295,6 +375,7 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
     } else if (urlStr.includes('/api/v1/auth/logout') && response.ok) {
       activeSession = null;
       explicitlyLoggedOut = true;
+      void purgeSensitiveBrowserCaches();
     }
 
     return response;
@@ -307,6 +388,7 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
     clearSession: () => {
       activeSession = null;
       explicitlyLoggedOut = true;
+      void purgeSensitiveBrowserCaches();
     },
     getLoginCallCount: () => loginCallCount,
     getProtectionStatus: () => protectionStatus,

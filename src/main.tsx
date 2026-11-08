@@ -11,13 +11,14 @@ export const sessionApiClient = createSessionAwareClient({
   rawFetch: nativeFetch,
   globalThisTarget: window,
   loginTimeoutMs: 6000,
+  allowLocalTestBootstrap: false,
   getFirebaseIdToken: async () => {
     try {
       if (auth?.currentUser) {
         return await auth.currentUser.getIdToken();
       }
     } catch {
-      // fallback to session login if no Firebase client user is signed in
+      // Return null when no Firebase client user is signed in
     }
     return null;
   },
