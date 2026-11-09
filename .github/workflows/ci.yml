@@ -62,7 +62,7 @@ jobs:
 
       - name: Run End-to-End Operations Suite
         run: |
-          PORT=3000 NODE_ENV=development npx tsx server.ts > /tmp/ci-omniflow-server.log 2>&1 &
+          OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true PORT=3000 NODE_ENV=development npx tsx server.ts > /tmp/ci-omniflow-server.log 2>&1 &
           SERVER_PID=$!
           trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
           READY=0
