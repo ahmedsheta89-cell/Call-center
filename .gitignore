@@ -11,4 +11,4 @@ bun.lock
 .env*
 !.env.example
 .aistudio/
-
+dist-server/
