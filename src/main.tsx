@@ -2,7 +2,13 @@ import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
-import { createSessionAwareClient, installDescriptorSafeFetch, registerGlobalApiClient } from './lib/apiClient.ts';
+import {
+  createSessionAwareClient,
+  installDescriptorSafeFetch,
+  purgeSensitiveBrowserCaches,
+  registerGlobalApiClient,
+  resolveRestoredFirebaseIdToken,
+} from './lib/apiClient.ts';
 import { auth } from './lib/firebase.ts';
 
 const nativeFetch = window.fetch.bind(window);
@@ -12,22 +18,16 @@ export const sessionApiClient = createSessionAwareClient({
   globalThisTarget: window,
   loginTimeoutMs: 6000,
   allowLocalTestBootstrap: false,
-  getFirebaseIdToken: async () => {
-    try {
-      if (auth?.currentUser) {
-        return await auth.currentUser.getIdToken();
-      }
-    } catch {
-      // Return null when no Firebase client user is signed in
-    }
-    return null;
-  },
+  getFirebaseIdToken: () => resolveRestoredFirebaseIdToken(auth),
 });
 
 registerGlobalApiClient(sessionApiClient);
 installDescriptorSafeFetch(window, sessionApiClient);
 
-sessionApiClient.ensureSession().finally(() => {
+void (async () => {
+  await purgeSensitiveBrowserCaches();
+  await sessionApiClient.ensureSession();
+})().finally(() => {
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <App />

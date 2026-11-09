@@ -17,6 +17,18 @@
 export interface SessionCredentials {
   token: string;
   csrfToken: string;
+  sessionId?: string;
+  userId?: string;
+  organizationId?: string;
+  role?: string;
+  baseRole?: string;
+}
+
+export interface LogoutResult {
+  localCleaned: boolean;
+  remoteRevoked: boolean;
+  status?: number;
+  error?: string;
 }
 
 export interface ApiClientOptions {
@@ -42,6 +54,7 @@ export interface FetchProtectionStatus {
 export interface ApiClientController {
   apiFetch: typeof fetch;
   ensureSession: (forceRelogin?: boolean) => Promise<SessionCredentials | null>;
+  loginWithIdToken: (idToken: string) => Promise<SessionCredentials | null>;
   getActiveSession: () => SessionCredentials | null;
   clearSession: () => void;
   getLoginCallCount: () => number;
@@ -55,68 +68,215 @@ export function registerGlobalApiClient(client: ApiClientController): void {
   registeredGlobalClient = client;
 }
 
+const SENSITIVE_STORAGE_KEYS = [
+  'omniflow_workspace_token',
+  'omniflow_session_cache',
+  'omniflow_tenant_cache',
+  'omniflow_api_cache',
+];
+
+function isSensitiveCacheName(key: string): boolean {
+  const lower = key.toLowerCase();
+  return (
+    lower === 'omniflow-api-live-cache' ||
+    lower.includes('omniflow-api') ||
+    lower.includes('api-live-cache') ||
+    lower.includes('workbox-runtime') ||
+    lower.includes('omniflow-session') ||
+    lower.includes('omniflow-tenant') ||
+    lower.includes('omniflow-auth')
+  );
+}
+
 /**
- * Purges any cached API responses from Browser CacheStorage (`caches`) upon logout or role switch.
+ * Purges legacy and runtime cached API responses from Browser CacheStorage (`caches`) and
+ * sensitive session/tenant keys from web storage upon startup, account/tenant switch, role switch, or logout.
+ * Preserves unrelated browser caches (such as font or static icon caches).
  */
 export async function purgeSensitiveBrowserCaches(): Promise<void> {
   try {
     if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
       const keys = await caches.keys();
       await Promise.all(
-        keys
-          .filter(
-            (key) =>
-              key.includes('omniflow-api') ||
-              key.includes('api-live-cache') ||
-              key.includes('workbox-runtime')
-          )
-          .map((key) => caches.delete(key))
+        keys.map(async (key) => {
+          if (isSensitiveCacheName(key)) {
+            await caches.delete(key);
+            return;
+          }
+          // For any other cache that supports inspection, evict only individual `/api/` entries
+          if (typeof caches.open === 'function') {
+            try {
+              const cache = await caches.open(key);
+              if (cache && typeof cache.keys === 'function') {
+                const reqs = await cache.keys();
+                await Promise.all(
+                  reqs
+                    .filter((req) => {
+                      const u = typeof req === 'string' ? req : req?.url || '';
+                      return u.includes('/api/');
+                    })
+                    .map((req) => cache.delete(req))
+                );
+              }
+            } catch {
+              // ignore individual cache inspection errors
+            }
+          }
+        })
       );
     }
   } catch {
     // Ignore CacheStorage errors in non-browser or restricted environments
   }
+
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      for (const k of SENSITIVE_STORAGE_KEYS) {
+        sessionStorage.removeItem(k);
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+
+  try {
+    if (typeof localStorage !== 'undefined') {
+      for (const k of SENSITIVE_STORAGE_KEYS) {
+        localStorage.removeItem(k);
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+/**
+ * Waits for Firebase Authentication persistence restoration (`authStateReady()`) before
+ * reading `auth.currentUser` and requesting a fresh ID token.
+ * Never treats `auth.currentUser` as authoritative prior to persistence restoration.
+ */
+export async function resolveRestoredFirebaseIdToken(authInstance: any): Promise<string | null> {
+  if (!authInstance) return null;
+  try {
+    if (typeof authInstance.authStateReady === 'function') {
+      await authInstance.authStateReady();
+    }
+    const currentUser = authInstance.currentUser;
+    if (currentUser && typeof currentUser.getIdToken === 'function') {
+      const token = await currentUser.getIdToken();
+      return typeof token === 'string' && token.trim().length > 0 ? token.trim() : null;
+    }
+  } catch {
+    // Return null if Firebase Auth restoration or ID token retrieval fails
+  }
+  return null;
+}
+
+/**
+ * Computes an in-memory, non-reversible principal key from a Firebase ID Token without
+ * storing or logging the raw token. Extracts the JWT `uid`/`sub` claim when present so
+ * `googleSignIn()` and `onAuthStateChanged()` for the same Firebase user coalesce deterministically.
+ */
+function derivePrincipalKeyFromToken(rawIdToken?: string | null): string {
+  if (!rawIdToken || typeof rawIdToken !== 'string' || rawIdToken.trim().length === 0) {
+    return 'bootstrap:default';
+  }
+  const trimmed = rawIdToken.trim();
+  const parts = trimmed.split('.');
+  if (parts.length === 3) {
+    try {
+      const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const jsonStr =
+        typeof Buffer !== 'undefined'
+          ? Buffer.from(b64, 'base64').toString('utf-8')
+          : typeof atob === 'function'
+          ? atob(b64)
+          : '';
+      if (jsonStr) {
+        const claims = JSON.parse(jsonStr);
+        const principalId = claims?.uid || claims?.user_id || claims?.sub || claims?.email;
+        if (typeof principalId === 'string' && principalId.trim().length > 0) {
+          return `principal:${principalId.trim()}`;
+        }
+      }
+    } catch {
+      // Fall through to non-reversible token fingerprint
+    }
+  }
+  // Fast FNV-1a 32-bit fingerprint (never stores the raw token)
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < trimmed.length; i++) {
+    hash ^= trimmed.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `token_fp:${(hash >>> 0).toString(16)}:${trimmed.length}`;
 }
 
 /**
  * Exchanges a verified Firebase ID Token with `/api/v1/auth/login` via the registered global API client.
+ * Coalesces concurrent calls for the same principal/token so `googleSignIn()` and `onAuthStateChanged()`
+ * cannot mint competing sessions.
  */
 export async function refreshGlobalApiSession(idToken?: string | null): Promise<SessionCredentials | null> {
   if (!registeredGlobalClient) return null;
   if (idToken && typeof idToken === 'string' && idToken.trim().length > 0) {
-    const res = await registeredGlobalClient.apiFetch('/api/v1/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ idToken: idToken.trim() }),
-    });
-    if (!res.ok) {
-      return null;
-    }
-    return registeredGlobalClient.getActiveSession();
+    return registeredGlobalClient.loginWithIdToken(idToken.trim());
   }
   return registeredGlobalClient.ensureSession(true);
 }
 
 /**
- * Revokes the backend session via `POST /api/v1/auth/logout`, clears client credentials,
- * and purges browser caches.
+ * Revokes the backend session via `POST /api/v1/auth/logout` (always called with `credentials: 'include'`,
+ * even when no in-memory session token exists after page reload), clears client credentials,
+ * and purges sensitive browser caches in a guaranteed `finally` path.
+ * Never claims `remoteRevoked: true` unless the server confirms revocation with HTTP 200.
  */
-export async function logoutGlobalApiSession(): Promise<void> {
+export async function logoutGlobalApiSession(): Promise<LogoutResult> {
+  let remoteRevoked = false;
+  let status: number | undefined;
+  let errorMsg: string | undefined;
+
   try {
-    if (registeredGlobalClient && registeredGlobalClient.getActiveSession()) {
-      await registeredGlobalClient.apiFetch('/api/v1/auth/logout', {
+    const fetchFn = registeredGlobalClient
+      ? registeredGlobalClient.apiFetch
+      : typeof fetch === 'function'
+      ? fetch
+      : null;
+
+    if (fetchFn) {
+      const res = await fetchFn('/api/v1/auth/logout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
       });
+      status = res.status;
+      const body = await res.json().catch(() => null);
+      if (res.ok && body?.success === true && body?.remoteRevoked !== false) {
+        remoteRevoked = true;
+      } else {
+        remoteRevoked = false;
+        errorMsg =
+          body?.error?.message ||
+          body?.message ||
+          `Server logout failed with HTTP ${res.status}`;
+      }
+    } else {
+      errorMsg = 'No fetch implementation available for remote session revocation';
     }
-  } catch {
-    // Even if network logout fails, unconditionally clear local session state
+  } catch (err: any) {
+    remoteRevoked = false;
+    errorMsg = err?.message || 'Network error during remote session logout';
   } finally {
     registeredGlobalClient?.clearSession();
     await purgeSensitiveBrowserCaches();
   }
+
+  return {
+    localCleaned: true,
+    remoteRevoked,
+    status,
+    ...(errorMsg ? { error: errorMsg } : {}),
+  };
 }
 
 /**
@@ -139,7 +299,14 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
   } = options;
 
   let activeSession: SessionCredentials | null = null;
-  let loginInFlight: Promise<SessionCredentials | null> | null = null;
+  let activePrincipalKey: string | null = null;
+  let lastCommittedUserId: string | null = null;
+  let lastCommittedOrgId: string | null = null;
+  let transitionEpoch = 0;
+
+  const inFlightByPrincipal = new Map<string, Promise<SessionCredentials | null>>();
+  let defaultBootstrapInFlight: Promise<SessionCredentials | null> | null = null;
+
   let loginCallCount = 0;
   let explicitlyLoggedOut = false;
   let protectionStatus: FetchProtectionStatus = {
@@ -152,32 +319,87 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
     return rawFetch.call(globalThisTarget, input, init);
   };
 
-  const ensureSession = (forceRelogin = false): Promise<SessionCredentials | null> => {
-    if (forceRelogin) {
-      explicitlyLoggedOut = false;
-    }
-    if (explicitlyLoggedOut) {
-      return Promise.resolve(null);
-    }
-    if (activeSession) {
-      return Promise.resolve(activeSession);
-    }
-    if (loginInFlight) {
-      return loginInFlight;
+  const applyAuthenticatedSession = async (
+    nextSession: SessionCredentials,
+    principalKey: string
+  ): Promise<SessionCredentials> => {
+    const isPrincipalChanged =
+      (activePrincipalKey !== null && activePrincipalKey !== principalKey) ||
+      (lastCommittedUserId !== null &&
+        nextSession.userId !== undefined &&
+        lastCommittedUserId !== nextSession.userId) ||
+      (lastCommittedOrgId !== null &&
+        nextSession.organizationId !== undefined &&
+        lastCommittedOrgId !== nextSession.organizationId);
+
+    if (isPrincipalChanged) {
+      await purgeSensitiveBrowserCaches();
     }
 
+    activeSession = nextSession;
+    activePrincipalKey = principalKey;
+    if (nextSession.userId) {
+      lastCommittedUserId = nextSession.userId;
+    }
+    if (nextSession.organizationId) {
+      lastCommittedOrgId = nextSession.organizationId;
+    }
+    explicitlyLoggedOut = false;
+    return nextSession;
+  };
+
+  const executeLoginRequest = (
+    explicitIdToken: string | null | undefined,
+    principalKey: string,
+    epochAtStart: number
+  ): Promise<SessionCredentials | null> => {
     loginCallCount += 1;
-    loginInFlight = (async () => {
+    let promise!: Promise<SessionCredentials | null>;
+    promise = (async (): Promise<SessionCredentials | null> => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(new Error('Login bootstrap timed out')), loginTimeoutMs);
       try {
-        let idToken: string | null = null;
-        if (getFirebaseIdToken) {
+        let idToken: string | null =
+          typeof explicitIdToken === 'string' && explicitIdToken.trim().length > 0
+            ? explicitIdToken.trim()
+            : null;
+
+        if (!idToken && explicitIdToken === undefined && getFirebaseIdToken) {
           try {
             idToken = await getFirebaseIdToken();
           } catch {
             idToken = null;
           }
+        }
+
+        const effectivePrincipalKey =
+          principalKey === 'bootstrap:default' && idToken
+            ? derivePrincipalKeyFromToken(idToken)
+            : principalKey;
+
+        // If another login already established a session for this exact principal while getFirebaseIdToken resolved, reuse it
+        if (
+          activeSession &&
+          activePrincipalKey === effectivePrincipalKey &&
+          !explicitlyLoggedOut &&
+          explicitIdToken === undefined
+        ) {
+          return activeSession;
+        }
+
+        // If an in-flight request already exists for the resolved principal key, coalesce onto it
+        const existingResolvedInFlight = inFlightByPrincipal.get(effectivePrincipalKey);
+        if (existingResolvedInFlight && existingResolvedInFlight !== promise) {
+          loginCallCount -= 1;
+          return await existingResolvedInFlight;
+        }
+        inFlightByPrincipal.set(effectivePrincipalKey, promise);
+
+        // If switching away from an existing principal, clear prior active session and caches immediately
+        if (activePrincipalKey !== null && activePrincipalKey !== effectivePrincipalKey) {
+          activeSession = null;
+          activePrincipalKey = null;
+          await purgeSensitiveBrowserCaches();
         }
 
         const isNodeLocalTestAllowed =
@@ -195,6 +417,7 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
           : allowFallbackUserId
           ? { userId: 'usr-admin-01' }
           : {};
+
         const res = await invokeRawFetch('/api/v1/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -204,30 +427,118 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
         });
 
         if (!res.ok) {
-          activeSession = null;
+          if (epochAtStart === transitionEpoch) {
+            activeSession = null;
+            activePrincipalKey = null;
+          }
           return null;
         }
 
         const json = await res.json().catch(() => null);
         const token = json?.data?.token;
         const csrfToken = json?.data?.csrfToken || res.headers?.get?.('X-CSRF-Token') || '';
+        const actor = json?.data?.actor;
+
         if (typeof token === 'string' && token.length > 0) {
-          activeSession = { token, csrfToken };
-          explicitlyLoggedOut = false;
-          return activeSession;
+          const nextCredentials: SessionCredentials = {
+            token,
+            csrfToken,
+            sessionId: json?.data?.sessionId || actor?.sessionId,
+            userId: actor?.userId,
+            organizationId: actor?.organizationId,
+            role: actor?.role,
+            baseRole: actor?.baseRole,
+          };
+
+          // Only commit to activeSession if a newer principal transition did not supersede this request
+          if (epochAtStart === transitionEpoch) {
+            await applyAuthenticatedSession(nextCredentials, effectivePrincipalKey);
+          }
+          return nextCredentials;
         }
-        activeSession = null;
+
+        if (epochAtStart === transitionEpoch) {
+          activeSession = null;
+          activePrincipalKey = null;
+        }
         return null;
       } catch {
-        activeSession = null;
+        if (epochAtStart === transitionEpoch) {
+          activeSession = null;
+          activePrincipalKey = null;
+        }
         return null;
       } finally {
         clearTimeout(timer);
-        loginInFlight = null;
+        inFlightByPrincipal.forEach((val, key) => {
+          if (val === promise) {
+            inFlightByPrincipal.delete(key);
+          }
+        });
+        if (defaultBootstrapInFlight === promise) {
+          defaultBootstrapInFlight = null;
+        }
       }
     })();
 
-    return loginInFlight;
+    inFlightByPrincipal.set(principalKey, promise);
+    return promise;
+  };
+
+  const loginWithIdToken = (idToken: string): Promise<SessionCredentials | null> => {
+    const trimmed = typeof idToken === 'string' ? idToken.trim() : '';
+    if (!trimmed) {
+      return Promise.resolve(null);
+    }
+    const principalKey = derivePrincipalKeyFromToken(trimmed);
+    explicitlyLoggedOut = false;
+
+    // 1. If a request for the exact same principal/token is currently in flight, coalesce onto it
+    const existingInFlight = inFlightByPrincipal.get(principalKey);
+    if (existingInFlight) {
+      return existingInFlight;
+    }
+
+    // 2. If an active session is already established for the exact same principal, return it without duplicate login
+    if (activeSession && activePrincipalKey === principalKey) {
+      return Promise.resolve(activeSession);
+    }
+
+    // 3. Different principal or fresh login: invalidate prior principal state immediately so prior account data is never exposed
+    transitionEpoch += 1;
+    const currentEpoch = transitionEpoch;
+    if (activePrincipalKey !== null && activePrincipalKey !== principalKey) {
+      activeSession = null;
+      activePrincipalKey = null;
+      void purgeSensitiveBrowserCaches();
+    }
+
+    return executeLoginRequest(trimmed, principalKey, currentEpoch);
+  };
+
+  const ensureSession = (forceRelogin = false): Promise<SessionCredentials | null> => {
+    if (forceRelogin) {
+      explicitlyLoggedOut = false;
+    }
+    if (explicitlyLoggedOut) {
+      return Promise.resolve(null);
+    }
+    if (activeSession && !forceRelogin) {
+      return Promise.resolve(activeSession);
+    }
+    if (defaultBootstrapInFlight) {
+      return defaultBootstrapInFlight;
+    }
+    if (inFlightByPrincipal.size === 1) {
+      const firstInFlight = inFlightByPrincipal.values().next().value;
+      if (firstInFlight) {
+        return firstInFlight;
+      }
+    }
+
+    const currentEpoch = transitionEpoch;
+    defaultBootstrapInFlight = executeLoginRequest(undefined, 'bootstrap:default', currentEpoch);
+    return defaultBootstrapInFlight;
   };
 
   const extractUrlString = (input: RequestInfo | URL): string => {
@@ -240,13 +551,14 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
   const isProtectedApiRoute = (urlStr: string): boolean => {
     try {
       if (urlStr.startsWith('/api/v1/')) {
-        return !urlStr.startsWith('/api/v1/auth/login');
+        return !urlStr.startsWith('/api/v1/auth/login') && !urlStr.startsWith('/api/v1/auth/logout');
       }
       if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
         const parsed = new URL(urlStr);
         return (
           parsed.pathname.startsWith('/api/v1/') &&
-          !parsed.pathname.startsWith('/api/v1/auth/login')
+          !parsed.pathname.startsWith('/api/v1/auth/login') &&
+          !parsed.pathname.startsWith('/api/v1/auth/logout')
         );
       }
     } catch {
@@ -264,24 +576,92 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
 
     const urlStr = extractUrlString(input);
 
-    // If caller explicitly calls /api/v1/auth/login, clear logged-out lock and capture the new session
+    // Handle explicit /api/v1/auth/login calls (including account/tenant transitions)
     if (urlStr.includes('/api/v1/auth/login')) {
-      const loginRes = await invokeRawFetch(input, init);
+      let parsedBody: any = null;
+      if (typeof init?.body === 'string') {
+        try {
+          parsedBody = JSON.parse(init.body);
+        } catch {
+          parsedBody = null;
+        }
+      }
+      const suppliedPrincipalKey = parsedBody?.idToken
+        ? derivePrincipalKeyFromToken(parsedBody.idToken)
+        : parsedBody?.userId
+        ? `principal:${String(parsedBody.userId).trim()}`
+        : parsedBody?.email
+        ? `principal:${String(parsedBody.email).trim().toLowerCase()}`
+        : 'bootstrap:explicit';
+
+      if (activePrincipalKey !== null && activePrincipalKey !== suppliedPrincipalKey) {
+        activeSession = null;
+        activePrincipalKey = null;
+        await purgeSensitiveBrowserCaches();
+      }
+
+      const loginRes = await invokeRawFetch(input, {
+        ...init,
+        credentials: init?.credentials || (isRequestInstance ? input.credentials : undefined) || 'include',
+      });
       if (loginRes.ok) {
         try {
           const cloned = loginRes.clone();
           const json = await cloned.json();
           const token = json?.data?.token;
           const csrfToken = json?.data?.csrfToken || loginRes.headers?.get?.('X-CSRF-Token') || '';
+          const actor = json?.data?.actor;
           if (typeof token === 'string' && token.length > 0) {
-            activeSession = { token, csrfToken };
-            explicitlyLoggedOut = false;
+            await applyAuthenticatedSession(
+              {
+                token,
+                csrfToken,
+                sessionId: json?.data?.sessionId || actor?.sessionId,
+                userId: actor?.userId,
+                organizationId: actor?.organizationId,
+                role: actor?.role,
+                baseRole: actor?.baseRole,
+              },
+              suppliedPrincipalKey
+            );
           }
         } catch {
           // ignore parse error
         }
+      } else {
+        activeSession = null;
+        activePrincipalKey = null;
       }
       return loginRes;
+    }
+
+    // Handle /api/v1/auth/logout directly without calling ensureSession(), supporting both in-memory and cookie-only sessions
+    if (urlStr.includes('/api/v1/auth/logout')) {
+      const logoutHeaders = new Headers(isRequestInstance ? input.headers : undefined);
+      if (init?.headers) {
+        new Headers(init.headers).forEach((value, key) => logoutHeaders.set(key, value));
+      }
+      if (activeSession?.token && !logoutHeaders.has('Authorization')) {
+        logoutHeaders.set('Authorization', `Bearer ${activeSession.token}`);
+      }
+      if (activeSession?.csrfToken && !logoutHeaders.has('X-CSRF-Token')) {
+        logoutHeaders.set('X-CSRF-Token', activeSession.csrfToken);
+      }
+      try {
+        const logoutRes = await invokeRawFetch(input, {
+          ...init,
+          method: init?.method || (isRequestInstance ? input.method : 'POST') || 'POST',
+          headers: logoutHeaders,
+          credentials: init?.credentials || (isRequestInstance ? input.credentials : undefined) || 'include',
+        });
+        return logoutRes;
+      } finally {
+        transitionEpoch += 1;
+        activeSession = null;
+        activePrincipalKey = null;
+        explicitlyLoggedOut = true;
+        await purgeSensitiveBrowserCaches();
+      }
     }
 
     if (!isProtectedApiRoute(urlStr)) {
@@ -363,19 +743,19 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
         const cloned = response.clone();
         const data = await cloned.json();
         if (data?.success && data?.data?.token) {
+          const updatedActor = data.data.currentActor;
           activeSession = {
+            ...session,
             token: data.data.token,
             csrfToken: data.data.csrfToken || session.csrfToken,
+            role: updatedActor?.role || session.role,
+            baseRole: updatedActor?.baseRole || session.baseRole,
           };
-          void purgeSensitiveBrowserCaches();
+          await purgeSensitiveBrowserCaches();
         }
       } catch {
         // ignore clone parse failure
       }
-    } else if (urlStr.includes('/api/v1/auth/logout') && response.ok) {
-      activeSession = null;
-      explicitlyLoggedOut = true;
-      void purgeSensitiveBrowserCaches();
     }
 
     return response;
@@ -384,9 +764,12 @@ export function createSessionAwareClient(options: ApiClientOptions): ApiClientCo
   return {
     apiFetch,
     ensureSession,
+    loginWithIdToken,
     getActiveSession: () => activeSession,
     clearSession: () => {
+      transitionEpoch += 1;
       activeSession = null;
+      activePrincipalKey = null;
       explicitlyLoggedOut = true;
       void purgeSensitiveBrowserCaches();
     },

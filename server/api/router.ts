@@ -68,6 +68,54 @@ for (const method of ['get', 'post', 'put', 'delete'] as const) {
   };
 }
 
+const STRICT_API_CACHE_CONTROL = 'no-store, no-cache, must-revalidate, private';
+
+// Middleware: Enforce strict non-caching policy on all /api/v1/* responses (Workstream D.4)
+apiRouter.use((_req: Request, res: Response, next) => {
+  res.setHeader('Cache-Control', STRICT_API_CACHE_CONTROL);
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const origSetHeader = res.setHeader.bind(res);
+  res.setHeader = function (name: string, value: number | string | readonly string[]) {
+    const lower = String(name).toLowerCase();
+    if (lower === 'cache-control') {
+      return origSetHeader('Cache-Control', STRICT_API_CACHE_CONTROL);
+    }
+    if (lower === 'pragma') {
+      return origSetHeader('Pragma', 'no-cache');
+    }
+    if (lower === 'expires') {
+      return origSetHeader('Expires', '0');
+    }
+    return origSetHeader(name, value);
+  };
+
+  const origWriteHead = res.writeHead.bind(res);
+  (res as any).writeHead = function (statusCode: number, ...args: any[]) {
+    origSetHeader('Cache-Control', STRICT_API_CACHE_CONTROL);
+    origSetHeader('Pragma', 'no-cache');
+    origSetHeader('Expires', '0');
+    for (const arg of args) {
+      if (arg && typeof arg === 'object' && !Array.isArray(arg)) {
+        for (const k of Object.keys(arg)) {
+          const lower = k.toLowerCase();
+          if (lower === 'cache-control') {
+            arg[k] = STRICT_API_CACHE_CONTROL;
+          } else if (lower === 'pragma') {
+            arg[k] = 'no-cache';
+          } else if (lower === 'expires') {
+            arg[k] = '0';
+          }
+        }
+      }
+    }
+    return origWriteHead(statusCode, ...args);
+  };
+
+  next();
+});
+
 // Middleware: Cryptographic Session Authentication & Request-Scoped Isolation (AsyncLocalStorage)
 // Rejects unauthenticated requests (401) and blocks untrusted header spoofing (403).
 apiRouter.use(authenticateApiRequest);
@@ -117,7 +165,9 @@ apiRouter.use((req: Request, res: Response, next) => {
 apiRouter.get('/stream', (req: Request, res: Response) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': STRICT_API_CACHE_CONTROL,
+    Pragma: 'no-cache',
+    Expires: '0',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
     'Access-Control-Allow-Origin': '*',
@@ -261,13 +311,11 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   }
 
   const { idToken, userId, email, ttlMs } = req.body || {};
-  const remoteIp = String(req.ip || req.socket?.remoteAddress || '').trim();
+  const socketRemoteAddress = String(req.socket?.remoteAddress || '').trim();
   const isLoopbackRequest =
-    remoteIp === '127.0.0.1' ||
-    remoteIp === '::1' ||
-    remoteIp === '::ffff:127.0.0.1' ||
-    req.hostname === '127.0.0.1' ||
-    req.hostname === 'localhost';
+    socketRemoteAddress === '127.0.0.1' ||
+    socketRemoteAddress === '::1' ||
+    socketRemoteAddress === '::ffff:127.0.0.1';
   const isProductionOrLocked =
     process.env.NODE_ENV === 'production' ||
     process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === 'true';
@@ -360,17 +408,28 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
 });
 
 apiRouter.post('/auth/logout', (req: Request, res: Response) => {
-  revokeSessionToken(currentActor.sessionId);
-  AuditLogger.log({
-    organizationId: currentActor.organizationId,
-    actorId: currentActor.userId,
-    actorType: 'user',
-    action: 'auth.session_revoked',
-    entityType: 'session',
-    entityId: currentActor.sessionId,
-  });
+  const hasActiveSession =
+    Boolean(currentActor.authenticated) &&
+    typeof currentActor.sessionId === 'string' &&
+    currentActor.sessionId !== 'unauthenticated';
+  const revoked = hasActiveSession ? revokeSessionToken(currentActor.sessionId) : false;
+  if (hasActiveSession && revoked) {
+    AuditLogger.log({
+      organizationId: currentActor.organizationId,
+      actorId: currentActor.userId,
+      actorType: 'user',
+      action: 'auth.session_revoked',
+      entityType: 'session',
+      entityId: currentActor.sessionId,
+    });
+  }
   res.setHeader('Set-Cookie', formatClearSessionCookie(req));
-  res.json({ success: true, message: 'Session revoked successfully' });
+  res.json({
+    success: true,
+    remoteRevoked: true,
+    alreadyInactive: !revoked,
+    message: revoked ? 'Session revoked successfully' : 'Session already inactive; cookie cleared',
+  });
 });
 
 apiRouter.post('/auth/switch-role', (req: Request, res: Response) => {
@@ -1132,9 +1191,10 @@ apiRouter.get('/operations/live', (req: Request, res: Response) => {
         openTicketsCount: tickets.filter((t) => t.status !== 'resolved' && t.status !== 'closed').length,
       },
       aiBudget: {
-        monthlyLimitUsd: org?.settings.aiMonthlyBudgetUsd || 250,
-        currentSpendUsd: org?.settings.aiCurrentMonthSpendUsd || 18.45,
-        zeroCostMode: org?.settings.zeroCostMode ?? true,
+        monthlyLimitUsd: org?.settings?.aiMonthlyBudgetUsd ?? 250,
+        currentSpendUsd: org?.settings?.aiCurrentMonthSpendUsd ?? 18.45,
+        zeroCostMode: org?.settings?.zeroCostMode ?? true,
+        aiExecutionMode: AIGateway.resolveExecutionMode(org?.settings),
       },
     },
   });
@@ -1167,21 +1227,133 @@ apiRouter.get('/audit/logs', (req: Request, res: Response) => {
 // ----------------------------------------------------
 // 10. System Settings & Zero-Cost Mode
 // ----------------------------------------------------
+const ALLOWED_ORGANIZATION_SETTINGS_FIELDS = new Set<string>([
+  'timezone',
+  'defaultLanguage',
+  'workingHours',
+  'zeroCostMode',
+  'aiMonthlyBudgetUsd',
+  'aiExecutionMode',
+]);
+
 apiRouter.get('/settings', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
   const org = db.organizations.get(currentActor.organizationId);
-  res.json({ success: true, data: org?.settings });
+  res.json({
+    success: true,
+    data: org?.settings
+      ? {
+          ...org.settings,
+          zeroCostMode: org.settings.zeroCostMode ?? true,
+          aiExecutionMode: AIGateway.resolveExecutionMode(org.settings),
+        }
+      : {
+          timezone: 'Asia/Riyadh',
+          defaultLanguage: 'ar',
+          workingHours: { start: '08:00', end: '20:00', days: [0, 1, 2, 3, 4] },
+          zeroCostMode: true,
+          aiExecutionMode: 'LOCAL_ONLY',
+          aiMonthlyBudgetUsd: 250,
+          aiCurrentMonthSpendUsd: 0,
+        },
+  });
 });
 
 apiRouter.post('/settings', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'settings.manage');
-  // CDR-07 & Product Policy Section 3: Disabling zeroCostMode or changing AI budget requires explicit Owner authority
-  if (req.body?.zeroCostMode === false || req.body?.aiMonthlyBudgetUsd !== undefined) {
+
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_SETTINGS_PAYLOAD', message: 'Settings payload must be a JSON object.' },
+    });
+    return;
+  }
+
+  const suppliedKeys = Object.keys(body);
+  const disallowedKeys = suppliedKeys.filter((k) => !ALLOWED_ORGANIZATION_SETTINGS_FIELDS.has(k));
+  if (disallowedKeys.length > 0) {
+    res.status(400).json({
+      success: false,
+      error: {
+        code: 'INVALID_SETTINGS_FIELD',
+        message: `Unrecognized or read-only settings field(s) rejected: ${disallowedKeys.join(', ')}`,
+      },
+    });
+    return;
+  }
+
+  if (body.zeroCostMode !== undefined && typeof body.zeroCostMode !== 'boolean') {
+    res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_SETTINGS_VALUE', message: 'zeroCostMode must be a boolean.' },
+    });
+    return;
+  }
+
+  if (
+    body.aiMonthlyBudgetUsd !== undefined &&
+    (typeof body.aiMonthlyBudgetUsd !== 'number' || !Number.isFinite(body.aiMonthlyBudgetUsd) || body.aiMonthlyBudgetUsd < 0)
+  ) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_SETTINGS_VALUE', message: 'aiMonthlyBudgetUsd must be a non-negative finite number.' },
+    });
+    return;
+  }
+
+  if (
+    body.aiExecutionMode !== undefined &&
+    body.aiExecutionMode !== 'LOCAL_ONLY' &&
+    body.aiExecutionMode !== 'CLOUD_FREE' &&
+    body.aiExecutionMode !== 'CLOUD_PAID'
+  ) {
+    res.status(400).json({
+      success: false,
+      error: {
+        code: 'INVALID_SETTINGS_VALUE',
+        message: 'aiExecutionMode must be one of LOCAL_ONLY, CLOUD_FREE, or CLOUD_PAID.',
+      },
+    });
+    return;
+  }
+
+  // CDR-07 & Product Policy Section 3: Disabling zeroCostMode, activating CLOUD_PAID, or changing AI budget requires explicit Owner authority
+  if (
+    body.zeroCostMode === false ||
+    body.aiExecutionMode === 'CLOUD_PAID' ||
+    body.aiMonthlyBudgetUsd !== undefined
+  ) {
     assertOwnerBillingAuthority(currentActor);
   }
+
   const org = db.organizations.get(currentActor.organizationId);
   if (org) {
-    org.settings = { ...org.settings, ...req.body };
+    const nextSettings: Record<string, any> = { ...(org.settings || {}) };
+    for (const key of suppliedKeys) {
+      nextSettings[key] = body[key];
+    }
+
+    // Keep zeroCostMode and aiExecutionMode consistent
+    if (body.aiExecutionMode === 'CLOUD_PAID') {
+      nextSettings.zeroCostMode = false;
+      nextSettings.aiExecutionMode = 'CLOUD_PAID';
+    } else if (body.aiExecutionMode === 'CLOUD_FREE') {
+      nextSettings.zeroCostMode = true;
+      nextSettings.aiExecutionMode = 'CLOUD_FREE';
+    } else if (body.aiExecutionMode === 'LOCAL_ONLY') {
+      nextSettings.zeroCostMode = true;
+      nextSettings.aiExecutionMode = 'LOCAL_ONLY';
+    } else if (body.zeroCostMode === false) {
+      nextSettings.zeroCostMode = false;
+      nextSettings.aiExecutionMode = 'CLOUD_PAID';
+    } else if (body.zeroCostMode === true && nextSettings.aiExecutionMode === 'CLOUD_PAID') {
+      nextSettings.zeroCostMode = true;
+      nextSettings.aiExecutionMode = 'LOCAL_ONLY';
+    }
+
+    org.settings = nextSettings as typeof org.settings;
     AuditLogger.log({
       organizationId: currentActor.organizationId,
       actorId: currentActor.userId,
@@ -1189,7 +1361,7 @@ apiRouter.post('/settings', (req: Request, res: Response) => {
       action: 'settings.update',
       entityType: 'organization',
       entityId: org.id,
-      afterState: req.body,
+      afterState: nextSettings,
     });
   }
   res.json({ success: true, data: org?.settings });

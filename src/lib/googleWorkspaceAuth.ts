@@ -75,20 +75,44 @@ export const initWorkspaceAuth = (callback?: AuthCallback): (() => void) => {
 
   const unsubscribe = onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
-      // User is signed into Firebase Auth: synchronize backend session with verified Firebase ID token
+      let backendSession = null;
+      let syncError: string | null = null;
       try {
         const idToken = await user.getIdToken();
-        await refreshGlobalApiSession(idToken);
-      } catch {
-        // Ignore session sync error during background auth state check
+        backendSession = await refreshGlobalApiSession(idToken);
+        if (!backendSession || !backendSession.token) {
+          syncError = 'تعذر التحقق من جلسة الخادم الخلفي (/api/v1/auth/login)';
+        }
+      } catch (err: any) {
+        backendSession = null;
+        syncError = err?.message || 'فشل التحقق من جلسة الخادم الخلفي';
       }
-      currentState = {
-        user,
-        accessToken: cachedAccessToken,
-        isAuthenticated: !!cachedAccessToken,
-        isLoading: false,
-        error: null,
-      };
+
+      // If an interactive googleSignIn() flow is actively running, refreshGlobalApiSession above coalesced
+      // onto the single in-flight request; let googleSignIn() emit the authoritative state transition.
+      if (isSigningIn) {
+        return;
+      }
+
+      if (!backendSession || !backendSession.token) {
+        cachedAccessToken = null;
+        tokenExpiresAt = null;
+        currentState = {
+          user: null,
+          accessToken: null,
+          isAuthenticated: false,
+          isLoading: false,
+          error: syncError,
+        };
+      } else {
+        currentState = {
+          user,
+          accessToken: cachedAccessToken,
+          isAuthenticated: Boolean(cachedAccessToken && backendSession.token),
+          isLoading: false,
+          error: null,
+        };
+      }
     } else {
       cachedAccessToken = null;
       tokenExpiresAt = null;
@@ -127,7 +151,8 @@ export const getAccessToken = async (): Promise<string | null> => {
 };
 
 /**
- * Sign in with Google Popup and obtain access token with requested Gmail & Sheets scopes
+ * Sign in with Google Popup and obtain access token with requested Gmail & Sheets scopes.
+ * Requires a verified backend session from `/api/v1/auth/login`; fails closed if backend authentication fails.
  */
 export const googleSignIn = async (): Promise<{ user: User; accessToken: string }> => {
   if (isSigningIn) {
@@ -146,17 +171,15 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
       throw new Error('لم يتم استلام تصريح الوصول (OAuth Access Token) من Google.');
     }
 
+    const idToken = await result.user.getIdToken();
+    const backendSession = await refreshGlobalApiSession(idToken);
+    if (!backendSession || !backendSession.token) {
+      throw new Error('فشل التحقق من الجلسة في الخادم الخلفي (/api/v1/auth/login): تم رفض الهوية أو تعذر إنشاء الجلسة.');
+    }
+
     cachedAccessToken = credential.accessToken;
     // OAuth access tokens typically expire in 3600 seconds (1 hour)
     tokenExpiresAt = Date.now() + 3500 * 1000;
-
-    // Exchange verified Firebase ID Token with backend /api/v1/auth/login to synchronize OmniFlow session
-    try {
-      const idToken = await result.user.getIdToken();
-      await refreshGlobalApiSession(idToken);
-    } catch {
-      // Non-fatal if backend session exchange is handled separately
-    }
 
     currentState = {
       user: result.user,
@@ -169,9 +192,13 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 
     return { user: result.user, accessToken: cachedAccessToken };
   } catch (error: any) {
+    cachedAccessToken = null;
+    tokenExpiresAt = null;
     const errorMessage = error?.message || 'فشل تسجيل الدخول باستخدام حساب Google';
     currentState = {
-      ...currentState,
+      user: null,
+      accessToken: null,
+      isAuthenticated: false,
       isLoading: false,
       error: errorMessage,
     };
@@ -183,24 +210,63 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 };
 
 /**
- * Sign out, revoke backend /api/v1/auth/logout session, purge sensitive caches, and clear in-memory token
+ * Sign out, revoke backend /api/v1/auth/logout session, purge sensitive caches, and clear in-memory token.
+ * Guarantees local state and cache cleanup in `finally` even if remote revocation or Firebase signOut throws,
+ * while surfacing remote revocation failures accurately.
  */
 export const googleSignOut = async (): Promise<void> => {
+  let remoteRevocationError: Error | null = null;
+  let firebaseSignOutError: Error | null = null;
+
   try {
-    await logoutGlobalApiSession();
-    await purgeSensitiveBrowserCaches();
-    await signOut(auth);
+    try {
+      const logoutResult = await logoutGlobalApiSession();
+      if (!logoutResult.remoteRevoked) {
+        remoteRevocationError = new Error(
+          logoutResult.error ||
+            'Remote backend session revocation (/api/v1/auth/logout) could not be confirmed; local credentials and caches were cleared.'
+        );
+      }
+    } catch (err: any) {
+      remoteRevocationError =
+        err instanceof Error
+          ? err
+          : new Error('Remote backend session revocation failed; local credentials and caches were cleared.');
+    }
+
+    try {
+      if (auth && typeof signOut === 'function') {
+        await signOut(auth);
+      }
+    } catch (err: any) {
+      firebaseSignOutError =
+        err instanceof Error
+          ? err
+          : new Error('Firebase signOut failed; local credentials and caches were cleared.');
+    }
+  } finally {
     cachedAccessToken = null;
     tokenExpiresAt = null;
+    try {
+      await purgeSensitiveBrowserCaches();
+    } catch {
+      // Ignore cache cleanup errors in finally
+    }
+    const surfacedError = remoteRevocationError || firebaseSignOutError;
     currentState = {
       user: null,
       accessToken: null,
       isAuthenticated: false,
       isLoading: false,
-      error: null,
+      error: surfacedError ? surfacedError.message : null,
     };
     notifySubscribers(currentState);
-  } catch (error) {
-    throw error;
+  }
+
+  if (remoteRevocationError) {
+    throw remoteRevocationError;
+  }
+  if (firebaseSignOutError) {
+    throw firebaseSignOutError;
   }
 };

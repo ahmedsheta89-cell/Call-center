@@ -3149,6 +3149,7 @@ function initializeSeedData() {
       defaultLanguage: "ar",
       workingHours: { start: "08:00", end: "20:00", days: [0, 1, 2, 3, 4] },
       zeroCostMode: true,
+      aiExecutionMode: "LOCAL_ONLY",
       aiMonthlyBudgetUsd: 250,
       aiCurrentMonthSpendUsd: 18.45
     },
@@ -4208,16 +4209,28 @@ var init_pwaAssets = __esm({
 });
 
 // server/core/rbac.ts
-function canSwitchToRole(baseRole, targetRole) {
+function canSwitchToRole(baseRole, targetRole, rolePermissionsMap = ROLE_PERMISSIONS) {
+  if (typeof baseRole !== "string" || typeof targetRole !== "string") {
+    return false;
+  }
   if (baseRole !== "Owner" && baseRole !== "Admin") {
+    return false;
+  }
+  if (!Object.prototype.hasOwnProperty.call(ROLE_HIERARCHY_RANK, baseRole) || !Object.prototype.hasOwnProperty.call(ROLE_HIERARCHY_RANK, targetRole) || !Object.prototype.hasOwnProperty.call(rolePermissionsMap, baseRole) || !Object.prototype.hasOwnProperty.call(rolePermissionsMap, targetRole)) {
     return false;
   }
   const baseRank = ROLE_HIERARCHY_RANK[baseRole];
   const targetRank = ROLE_HIERARCHY_RANK[targetRole];
-  if (typeof baseRank !== "number" || typeof targetRank !== "number") {
+  if (typeof baseRank !== "number" || typeof targetRank !== "number" || targetRank > baseRank) {
     return false;
   }
-  return targetRank <= baseRank;
+  const basePermissions = rolePermissionsMap[baseRole];
+  const targetPermissions = rolePermissionsMap[targetRole];
+  if (!Array.isArray(basePermissions) || !Array.isArray(targetPermissions)) {
+    return false;
+  }
+  const basePermissionSet = new Set(basePermissions);
+  return targetPermissions.every((perm) => typeof perm === "string" && basePermissionSet.has(perm));
 }
 function assertOwnerBillingAuthority(actor) {
   const effectiveBaseRole = actor.baseRole || actor.role;
@@ -4628,14 +4641,20 @@ function issueSessionToken(options) {
     });
   }
   const baseRole = user.role;
+  if (!Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, baseRole)) {
+    throw Object.assign(new Error(`Invalid authoritative base role [${baseRole}]`), {
+      status: 403,
+      code: "INVALID_BASE_ROLE"
+    });
+  }
   const activeRole = options.activeRoleOverride || baseRole;
-  if (!(activeRole in ROLE_PERMISSIONS)) {
+  if (!Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, activeRole)) {
     throw Object.assign(new Error(`Invalid role [${activeRole}]`), {
       status: 400,
       code: "INVALID_ROLE"
     });
   }
-  if (options.activeRoleOverride && activeRole !== baseRole && !canSwitchToRole(baseRole, activeRole)) {
+  if (activeRole !== baseRole && !canSwitchToRole(baseRole, activeRole)) {
     throw Object.assign(
       new Error(`Role escalation forbidden: baseRole [${baseRole}] cannot switch to [${activeRole}]`),
       {
@@ -4644,9 +4663,45 @@ function issueSessionToken(options) {
       }
     );
   }
-  if (options.existingJti) {
-    const existingSession = activeSessions.get(options.existingJti);
-    if (existingSession && (existingSession.userId !== user.id || existingSession.organizationId !== user.organizationId)) {
+  const now = Date.now();
+  let jti;
+  if (options.existingJti !== void 0) {
+    if (typeof options.existingJti !== "string" || options.existingJti.trim().length === 0) {
+      throw Object.assign(new Error("Provided existingJti must be a non-empty string"), {
+        status: 401,
+        code: "INVALID_SESSION_JTI"
+      });
+    }
+    const candidateJti = options.existingJti.trim();
+    const existingSession = activeSessions.get(candidateJti);
+    if (!existingSession) {
+      throw Object.assign(
+        new Error("Cannot reuse nonexistent session JTI; arbitrary JTI injection is forbidden"),
+        {
+          status: 401,
+          code: "SESSION_NOT_FOUND"
+        }
+      );
+    }
+    if (existingSession.revoked) {
+      throw Object.assign(
+        new Error("Cannot reuse or rotate a revoked session JTI"),
+        {
+          status: 401,
+          code: "SESSION_REVOKED_OR_UNKNOWN"
+        }
+      );
+    }
+    if (now > existingSession.expiresAt) {
+      throw Object.assign(
+        new Error("Cannot reuse or rotate an expired session JTI"),
+        {
+          status: 401,
+          code: "SESSION_EXPIRED"
+        }
+      );
+    }
+    if (existingSession.userId !== user.id || existingSession.organizationId !== user.organizationId) {
       throw Object.assign(
         new Error("Session identity is immutable: cannot reassign an existing session JTI to another user or organization"),
         {
@@ -4655,10 +4710,11 @@ function issueSessionToken(options) {
         }
       );
     }
+    jti = candidateJti;
+  } else {
+    jti = `sess-${import_crypto4.default.randomBytes(12).toString("hex")}`;
   }
-  const now = Date.now();
   const ttl = options.ttlMs !== void 0 ? options.ttlMs : DEFAULT_TTL_MS;
-  const jti = options.existingJti || `sess-${import_crypto4.default.randomBytes(12).toString("hex")}`;
   const csrfToken = deriveCsrfToken(jti);
   const payload = {
     jti,
@@ -4760,7 +4816,7 @@ function verifySessionToken(rawToken, authMethod = "session_token") {
       code: "USER_INACTIVE_OR_DELETED"
     });
   }
-  if (user.organizationId !== sessionRecord.organizationId) {
+  if (user.organizationId !== sessionRecord.organizationId || payload.sub !== user.id || payload.org !== user.organizationId) {
     throw Object.assign(new Error("User organization binding mismatch"), {
       status: 401,
       code: "ORG_BINDING_MISMATCH"
@@ -4773,12 +4829,40 @@ function verifySessionToken(rawToken, authMethod = "session_token") {
       code: "ORG_INACTIVE_OR_DELETED"
     });
   }
+  const currentBaseRole = user.role;
+  const sessionActiveRole = sessionRecord.activeRole;
+  if (!Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, currentBaseRole) || !Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, sessionActiveRole) || payload.activeRole !== sessionActiveRole) {
+    sessionRecord.revoked = true;
+    throw Object.assign(new Error("Session role is no longer valid in RBAC policy"), {
+      status: 403,
+      code: "SESSION_ROLE_INVALIDATED_BY_DEMOTION"
+    });
+  }
+  const currentBaseRank = ROLE_HIERARCHY_RANK[currentBaseRole];
+  const issuedBaseRank = ROLE_HIERARCHY_RANK[sessionRecord.baseRole];
+  const wasBaseRoleDemoted = typeof currentBaseRank !== "number" || typeof issuedBaseRank !== "number" || currentBaseRank < issuedBaseRank;
+  const currentBasePerms = new Set(ROLE_PERMISSIONS[currentBaseRole] || []);
+  const activeRolePerms = ROLE_PERMISSIONS[sessionActiveRole] || [];
+  const hasPermissionContainment = Array.isArray(activeRolePerms) && activeRolePerms.every((perm) => currentBasePerms.has(perm));
+  const isAuthorizedActiveRole = sessionActiveRole === currentBaseRole ? hasPermissionContainment : canSwitchToRole(currentBaseRole, sessionActiveRole) && hasPermissionContainment;
+  if (wasBaseRoleDemoted || !isAuthorizedActiveRole) {
+    sessionRecord.revoked = true;
+    throw Object.assign(
+      new Error(
+        `Session invalidated: current base role [${currentBaseRole}] no longer authorizes active role [${sessionActiveRole}]`
+      ),
+      {
+        status: 403,
+        code: "SESSION_ROLE_INVALIDATED_BY_DEMOTION"
+      }
+    );
+  }
   return {
     sessionId: sessionRecord.jti,
     userId: user.id,
     organizationId: user.organizationId,
-    role: sessionRecord.activeRole,
-    baseRole: user.role,
+    role: sessionActiveRole,
+    baseRole: currentBaseRole,
     name: user.fullName,
     email: user.email,
     phoneNumber: user.phoneNumber || "01018108979",
@@ -4867,6 +4951,9 @@ function verifyCsrfForCookieMutation(req, verifiedActor) {
   }
   const originHeader = req.headers.origin || req.headers.referer;
   if (!originHeader || typeof originHeader !== "string" || originHeader.trim().length === 0) {
+    if (req.path === "/auth/logout" && req.method.toUpperCase() === "POST") {
+      return { valid: true };
+    }
     return {
       valid: false,
       code: "CSRF_ORIGIN_REQUIRED",
@@ -4894,6 +4981,9 @@ function verifyCsrfForCookieMutation(req, verifiedActor) {
   }
   const providedCsrf = req.headers["x-csrf-token"]?.trim();
   if (!providedCsrf || !verifiedActor.csrfToken) {
+    if (req.path === "/auth/logout" && req.method.toUpperCase() === "POST") {
+      return { valid: true };
+    }
     return {
       valid: false,
       code: "CSRF_TOKEN_MISSING",
@@ -4916,8 +5006,13 @@ function authenticateApiRequest(req, res, next) {
     next();
     return;
   }
+  const isLogoutRoute = req.path === "/auth/logout" && req.method.toUpperCase() === "POST";
   const { token, method } = extractRawToken(req);
   if (!token) {
+    if (isLogoutRoute) {
+      actorContextStorage.run({ ...unauthenticatedFallbackContext }, () => next());
+      return;
+    }
     res.status(401).json({
       success: false,
       error: {
@@ -4931,6 +5026,13 @@ function authenticateApiRequest(req, res, next) {
   try {
     verifiedActor = verifySessionToken(token, method);
   } catch (err) {
+    if (isLogoutRoute && (err?.code === "SESSION_REVOKED_OR_UNKNOWN" || err?.code === "SESSION_EXPIRED" || err?.code === "TOKEN_EXPIRED" || err?.code === "SESSION_ROLE_INVALIDATED_BY_DEMOTION")) {
+      actorContextStorage.run({ ...unauthenticatedFallbackContext }, () => next());
+      return;
+    }
+    if (isLogoutRoute) {
+      res.setHeader("Set-Cookie", formatClearSessionCookie(req));
+    }
     res.status(err?.status || 401).json({
       success: false,
       error: {
@@ -5187,6 +5289,29 @@ var init_gateway = __esm({
     geminiClient = null;
     AIGateway = class {
       /**
+       * Resolves the authoritative AI execution mode for an organization.
+       * Guarantees:
+       * - Missing organization or missing settings defaults to `LOCAL_ONLY`.
+       * - New organizations default to `LOCAL_ONLY`.
+       * - Legacy organizations with `zeroCostMode: false` but without an explicit Owner-authorized
+       *   `aiExecutionMode` ('CLOUD_FREE' or 'CLOUD_PAID') safely default to `LOCAL_ONLY`.
+       * - `CLOUD_PAID` requires both `aiExecutionMode === 'CLOUD_PAID'` and `zeroCostMode === false`.
+       * - `CLOUD_FREE` never triggers paid billing (`costUsd = 0`) and never falls back to `CLOUD_PAID`.
+       */
+      static resolveExecutionMode(settings) {
+        if (!settings || typeof settings !== "object") {
+          return "LOCAL_ONLY";
+        }
+        const explicitMode = settings.aiExecutionMode;
+        if (explicitMode === "CLOUD_FREE") {
+          return "CLOUD_FREE";
+        }
+        if (explicitMode === "CLOUD_PAID" && settings.zeroCostMode === false) {
+          return "CLOUD_PAID";
+        }
+        return "LOCAL_ONLY";
+      }
+      /**
        * PII & PCI-DSS Redaction Filter: Scrubs credit cards, national IDs, and OTP secrets before AI processing
        */
       static redactPII(rawText) {
@@ -5199,6 +5324,7 @@ var init_gateway = __esm({
       static async execute(req) {
         const startTime = Date.now();
         const org = db.organizations.get(req.organizationId);
+        const settings = org?.settings && typeof org.settings === "object" ? org.settings : void 0;
         const sanitizedInput = this.redactPII(req.input);
         const safeReq = { ...req, input: sanitizedInput };
         const safetyViolation = this.checkSafetyGuardrails(safeReq.input);
@@ -5214,24 +5340,41 @@ var init_gateway = __esm({
             isHallucinationSafe: true
           };
         }
-        const isZeroCost = org?.settings.zeroCostMode ?? true;
+        const supportedTasks = /* @__PURE__ */ new Set([
+          "sentiment_intent_analysis",
+          "copilot_suggest",
+          "conversation_summary",
+          "supervisor_risk_eval",
+          "qa_rubric_audit"
+        ]);
+        const isUnsupportedTaskOrModality = !supportedTasks.has(safeReq.task) || Boolean(safeReq.modality && safeReq.modality !== "text");
+        const executionMode = this.resolveExecutionMode(settings);
         const isRestrictedPii = safeReq.privacy === "restricted_pii";
         const isSimpleTask = safeReq.task === "sentiment_intent_analysis";
-        const isBudgetExceeded = (org?.settings.aiCurrentMonthSpendUsd ?? 0) >= (org?.settings.aiMonthlyBudgetUsd ?? 100);
-        const useLocal = safeReq.forceLocal || isZeroCost || org?.settings.zeroCostMode !== false || isRestrictedPii || isSimpleTask || isBudgetExceeded || !process.env.GEMINI_API_KEY;
+        const monthlyBudget = typeof settings?.aiMonthlyBudgetUsd === "number" && Number.isFinite(settings.aiMonthlyBudgetUsd) ? settings.aiMonthlyBudgetUsd : 0;
+        const currentSpend = typeof settings?.aiCurrentMonthSpendUsd === "number" && Number.isFinite(settings.aiCurrentMonthSpendUsd) ? settings.aiCurrentMonthSpendUsd : 0;
+        const isBudgetExceeded = monthlyBudget <= 0 || currentSpend >= monthlyBudget;
+        const useLocal = Boolean(safeReq.forceLocal) || isUnsupportedTaskOrModality || executionMode === "LOCAL_ONLY" || isRestrictedPii || isSimpleTask || executionMode === "CLOUD_PAID" && isBudgetExceeded || !process.env.GEMINI_API_KEY;
         let response;
         if (useLocal) {
           response = await this.executeLocalEngine(safeReq, startTime);
+        } else if (executionMode === "CLOUD_FREE") {
+          try {
+            response = await this.executeCloudGemini(safeReq, startTime, "CLOUD_FREE");
+          } catch (cloudErr) {
+            console.warn("[AI Gateway] Cloud Free execution failed or quota exhausted. Falling back to Local Engine:", cloudErr);
+            response = await this.executeLocalEngine(safeReq, startTime, true);
+          }
         } else {
           try {
-            response = await this.executeCloudGemini(safeReq, startTime);
+            response = await this.executeCloudGemini(safeReq, startTime, "CLOUD_PAID");
           } catch (cloudErr) {
-            console.warn("[AI Gateway] Cloud execution failed or timed out. Gracefully falling back to Local Engine:", cloudErr);
+            console.warn("[AI Gateway] Cloud Paid execution failed or timed out. Gracefully falling back to Local Engine:", cloudErr);
             response = await this.executeLocalEngine(safeReq, startTime, true);
           }
         }
-        if (org && response.costUsd > 0) {
-          org.settings.aiCurrentMonthSpendUsd = Number((org.settings.aiCurrentMonthSpendUsd + response.costUsd).toFixed(5));
+        if (settings && executionMode === "CLOUD_PAID" && response.costUsd > 0) {
+          settings.aiCurrentMonthSpendUsd = Number((currentSpend + response.costUsd).toFixed(6));
         }
         if (safeReq.task === "supervisor_risk_eval" || safeReq.task === "qa_rubric_audit") {
           await AuditLogger.log({
@@ -5240,7 +5383,13 @@ var init_gateway = __esm({
             action: `ai.execute.${safeReq.task}`,
             entityType: "ai_run",
             entityId: response.runId,
-            afterState: { model: response.model, tokens: response.tokensUsed, latencyMs: response.latencyMs }
+            afterState: {
+              mode: executionMode,
+              model: response.model,
+              tokens: response.tokensUsed,
+              costUsd: response.costUsd,
+              latencyMs: response.latencyMs
+            }
           });
         }
         return response;
@@ -5367,7 +5516,7 @@ var init_gateway = __esm({
       /**
        * Cloud Engine: Invokes Google Gemini 2.5 Flash for High-order Reasoning
        */
-      static async executeCloudGemini(req, startTime) {
+      static async executeCloudGemini(req, startTime, executionMode = "CLOUD_FREE") {
         const ai = getGeminiClient();
         if (!ai) {
           throw new Error("Gemini client unavailable");
@@ -5394,7 +5543,8 @@ ${JSON.stringify(req.contextData || {})}`;
         const usage = res?.usageMetadata;
         const inputTokenCount = typeof usage?.promptTokenCount === "number" && usage.promptTokenCount > 0 ? usage.promptTokenCount : Math.ceil((prompt.length + systemInstruction.length) / 4);
         const outputTokenCount = typeof usage?.candidatesTokenCount === "number" && usage.candidatesTokenCount >= 0 ? usage.candidatesTokenCount + (typeof usage?.thoughtsTokenCount === "number" ? usage.thoughtsTokenCount : 0) : Math.ceil(outputText.length / 4);
-        const cost = inputTokenCount * 3e-7 + outputTokenCount * 25e-7;
+        const rawPaidCost = inputTokenCount * 3e-7 + outputTokenCount * 25e-7;
+        const cost = executionMode === "CLOUD_PAID" ? Number(rawPaidCost.toFixed(6)) : 0;
         return {
           runId: crypto.randomUUID(),
           provider: "cloud_gemini",
@@ -5405,7 +5555,7 @@ ${JSON.stringify(req.contextData || {})}`;
             output: outputTokenCount,
             total: inputTokenCount + outputTokenCount
           },
-          costUsd: Number(cost.toFixed(6)),
+          costUsd: cost,
           latencyMs: Date.now() - startTime,
           isHallucinationSafe: true
         };
@@ -5847,7 +5997,7 @@ function saveGitHubConfigToTmp() {
   } catch {
   }
 }
-var import_express, import_fs3, import_os3, import_path3, import_crypto5, import_child_process, apiRouter, handleConversationReply, handleTicketUpdate, handleIncomingWebhook, PUBLIC_SHARED_APP_URL, DEV_APP_URL, githubSyncState, syncCommitsLedger, ALLOWED_GITHUB_REPOS, FORBIDDEN_DIRECT_SYNC_BRANCHES, ALLOWED_BRANCH_PREFIXES, SAFE_BRANCH_COMPONENT_CHARS, FORBIDDEN_GIT_REF_CHARS, ALLOWED_WORKSPACE_ROOT_FILES, ALLOWED_WORKSPACE_DIRS, ALLOWED_WORKSPACE_EXTENSIONS, ALLOWED_EXACT_WORKSPACE_FILE_PATHS, EXCLUDED_DIR_NAMES, SECRET_OR_FORBIDDEN_FILE_PATTERNS, SECRET_CONTENT_PATTERN, GITHUB_TMP_CONFIG_PATH, lastAutoSyncedTreeHash;
+var import_express, import_fs3, import_os3, import_path3, import_crypto5, import_child_process, apiRouter, STRICT_API_CACHE_CONTROL, handleConversationReply, handleTicketUpdate, ALLOWED_ORGANIZATION_SETTINGS_FIELDS, handleIncomingWebhook, PUBLIC_SHARED_APP_URL, DEV_APP_URL, githubSyncState, syncCommitsLedger, ALLOWED_GITHUB_REPOS, FORBIDDEN_DIRECT_SYNC_BRANCHES, ALLOWED_BRANCH_PREFIXES, SAFE_BRANCH_COMPONENT_CHARS, FORBIDDEN_GIT_REF_CHARS, ALLOWED_WORKSPACE_ROOT_FILES, ALLOWED_WORKSPACE_DIRS, ALLOWED_WORKSPACE_EXTENSIONS, ALLOWED_EXACT_WORKSPACE_FILE_PATHS, EXCLUDED_DIR_NAMES, SECRET_OR_FORBIDDEN_FILE_PATTERNS, SECRET_CONTENT_PATTERN, GITHUB_TMP_CONFIG_PATH, lastAutoSyncedTreeHash;
 var init_router = __esm({
   "server/api/router.ts"() {
     import_express = require("express");
@@ -5883,6 +6033,48 @@ var init_router = __esm({
         return original(pathArg, ...wrappedHandlers);
       };
     }
+    STRICT_API_CACHE_CONTROL = "no-store, no-cache, must-revalidate, private";
+    apiRouter.use((_req, res, next) => {
+      res.setHeader("Cache-Control", STRICT_API_CACHE_CONTROL);
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      const origSetHeader = res.setHeader.bind(res);
+      res.setHeader = function(name, value) {
+        const lower = String(name).toLowerCase();
+        if (lower === "cache-control") {
+          return origSetHeader("Cache-Control", STRICT_API_CACHE_CONTROL);
+        }
+        if (lower === "pragma") {
+          return origSetHeader("Pragma", "no-cache");
+        }
+        if (lower === "expires") {
+          return origSetHeader("Expires", "0");
+        }
+        return origSetHeader(name, value);
+      };
+      const origWriteHead = res.writeHead.bind(res);
+      res.writeHead = function(statusCode, ...args) {
+        origSetHeader("Cache-Control", STRICT_API_CACHE_CONTROL);
+        origSetHeader("Pragma", "no-cache");
+        origSetHeader("Expires", "0");
+        for (const arg of args) {
+          if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+            for (const k of Object.keys(arg)) {
+              const lower = k.toLowerCase();
+              if (lower === "cache-control") {
+                arg[k] = STRICT_API_CACHE_CONTROL;
+              } else if (lower === "pragma") {
+                arg[k] = "no-cache";
+              } else if (lower === "expires") {
+                arg[k] = "0";
+              }
+            }
+          }
+        }
+        return origWriteHead(statusCode, ...args);
+      };
+      next();
+    });
     apiRouter.use(authenticateApiRequest);
     apiRouter.use((req, res, next) => {
       if (req.path === "/system/restore") {
@@ -5917,7 +6109,9 @@ var init_router = __esm({
     apiRouter.get("/stream", (req, res) => {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
+        "Cache-Control": STRICT_API_CACHE_CONTROL,
+        Pragma: "no-cache",
+        Expires: "0",
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
         "Access-Control-Allow-Origin": "*"
@@ -6043,8 +6237,8 @@ var init_router = __esm({
         return;
       }
       const { idToken, userId, email, ttlMs } = req.body || {};
-      const remoteIp = String(req.ip || req.socket?.remoteAddress || "").trim();
-      const isLoopbackRequest = remoteIp === "127.0.0.1" || remoteIp === "::1" || remoteIp === "::ffff:127.0.0.1" || req.hostname === "127.0.0.1" || req.hostname === "localhost";
+      const socketRemoteAddress = String(req.socket?.remoteAddress || "").trim();
+      const isLoopbackRequest = socketRemoteAddress === "127.0.0.1" || socketRemoteAddress === "::1" || socketRemoteAddress === "::ffff:127.0.0.1";
       const isProductionOrLocked = process.env.NODE_ENV === "production" || process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === "true";
       const allowLocalTestLogin = !isProductionOrLocked && process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === "true" && isLoopbackRequest;
       const requireCryptographicIdToken = !allowLocalTestLogin;
@@ -6122,17 +6316,25 @@ var init_router = __esm({
       });
     });
     apiRouter.post("/auth/logout", (req, res) => {
-      revokeSessionToken(currentActor.sessionId);
-      AuditLogger.log({
-        organizationId: currentActor.organizationId,
-        actorId: currentActor.userId,
-        actorType: "user",
-        action: "auth.session_revoked",
-        entityType: "session",
-        entityId: currentActor.sessionId
-      });
+      const hasActiveSession = Boolean(currentActor.authenticated) && typeof currentActor.sessionId === "string" && currentActor.sessionId !== "unauthenticated";
+      const revoked = hasActiveSession ? revokeSessionToken(currentActor.sessionId) : false;
+      if (hasActiveSession && revoked) {
+        AuditLogger.log({
+          organizationId: currentActor.organizationId,
+          actorId: currentActor.userId,
+          actorType: "user",
+          action: "auth.session_revoked",
+          entityType: "session",
+          entityId: currentActor.sessionId
+        });
+      }
       res.setHeader("Set-Cookie", formatClearSessionCookie(req));
-      res.json({ success: true, message: "Session revoked successfully" });
+      res.json({
+        success: true,
+        remoteRevoked: true,
+        alreadyInactive: !revoked,
+        message: revoked ? "Session revoked successfully" : "Session already inactive; cookie cleared"
+      });
     });
     apiRouter.post("/auth/switch-role", (req, res) => {
       const authenticatedUserId = currentActor.userId;
@@ -6780,9 +6982,10 @@ var init_router = __esm({
             openTicketsCount: tickets.filter((t) => t.status !== "resolved" && t.status !== "closed").length
           },
           aiBudget: {
-            monthlyLimitUsd: org?.settings.aiMonthlyBudgetUsd || 250,
-            currentSpendUsd: org?.settings.aiCurrentMonthSpendUsd || 18.45,
-            zeroCostMode: org?.settings.zeroCostMode ?? true
+            monthlyLimitUsd: org?.settings?.aiMonthlyBudgetUsd ?? 250,
+            currentSpendUsd: org?.settings?.aiCurrentMonthSpendUsd ?? 18.45,
+            zeroCostMode: org?.settings?.zeroCostMode ?? true,
+            aiExecutionMode: AIGateway.resolveExecutionMode(org?.settings)
           }
         }
       });
@@ -6802,19 +7005,106 @@ var init_router = __esm({
       const logs = AuditLogger.getEvents(currentActor.organizationId);
       res.json({ success: true, data: logs });
     });
+    ALLOWED_ORGANIZATION_SETTINGS_FIELDS = /* @__PURE__ */ new Set([
+      "timezone",
+      "defaultLanguage",
+      "workingHours",
+      "zeroCostMode",
+      "aiMonthlyBudgetUsd",
+      "aiExecutionMode"
+    ]);
     apiRouter.get("/settings", (req, res) => {
       assertPermission(currentActor.role, [], "conversation.read");
       const org = db.organizations.get(currentActor.organizationId);
-      res.json({ success: true, data: org?.settings });
+      res.json({
+        success: true,
+        data: org?.settings ? {
+          ...org.settings,
+          zeroCostMode: org.settings.zeroCostMode ?? true,
+          aiExecutionMode: AIGateway.resolveExecutionMode(org.settings)
+        } : {
+          timezone: "Asia/Riyadh",
+          defaultLanguage: "ar",
+          workingHours: { start: "08:00", end: "20:00", days: [0, 1, 2, 3, 4] },
+          zeroCostMode: true,
+          aiExecutionMode: "LOCAL_ONLY",
+          aiMonthlyBudgetUsd: 250,
+          aiCurrentMonthSpendUsd: 0
+        }
+      });
     });
     apiRouter.post("/settings", (req, res) => {
       assertPermission(currentActor.role, [], "settings.manage");
-      if (req.body?.zeroCostMode === false || req.body?.aiMonthlyBudgetUsd !== void 0) {
+      const body = req.body;
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        res.status(400).json({
+          success: false,
+          error: { code: "INVALID_SETTINGS_PAYLOAD", message: "Settings payload must be a JSON object." }
+        });
+        return;
+      }
+      const suppliedKeys = Object.keys(body);
+      const disallowedKeys = suppliedKeys.filter((k) => !ALLOWED_ORGANIZATION_SETTINGS_FIELDS.has(k));
+      if (disallowedKeys.length > 0) {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: "INVALID_SETTINGS_FIELD",
+            message: `Unrecognized or read-only settings field(s) rejected: ${disallowedKeys.join(", ")}`
+          }
+        });
+        return;
+      }
+      if (body.zeroCostMode !== void 0 && typeof body.zeroCostMode !== "boolean") {
+        res.status(400).json({
+          success: false,
+          error: { code: "INVALID_SETTINGS_VALUE", message: "zeroCostMode must be a boolean." }
+        });
+        return;
+      }
+      if (body.aiMonthlyBudgetUsd !== void 0 && (typeof body.aiMonthlyBudgetUsd !== "number" || !Number.isFinite(body.aiMonthlyBudgetUsd) || body.aiMonthlyBudgetUsd < 0)) {
+        res.status(400).json({
+          success: false,
+          error: { code: "INVALID_SETTINGS_VALUE", message: "aiMonthlyBudgetUsd must be a non-negative finite number." }
+        });
+        return;
+      }
+      if (body.aiExecutionMode !== void 0 && body.aiExecutionMode !== "LOCAL_ONLY" && body.aiExecutionMode !== "CLOUD_FREE" && body.aiExecutionMode !== "CLOUD_PAID") {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: "INVALID_SETTINGS_VALUE",
+            message: "aiExecutionMode must be one of LOCAL_ONLY, CLOUD_FREE, or CLOUD_PAID."
+          }
+        });
+        return;
+      }
+      if (body.zeroCostMode === false || body.aiExecutionMode === "CLOUD_PAID" || body.aiMonthlyBudgetUsd !== void 0) {
         assertOwnerBillingAuthority(currentActor);
       }
       const org = db.organizations.get(currentActor.organizationId);
       if (org) {
-        org.settings = { ...org.settings, ...req.body };
+        const nextSettings = { ...org.settings || {} };
+        for (const key of suppliedKeys) {
+          nextSettings[key] = body[key];
+        }
+        if (body.aiExecutionMode === "CLOUD_PAID") {
+          nextSettings.zeroCostMode = false;
+          nextSettings.aiExecutionMode = "CLOUD_PAID";
+        } else if (body.aiExecutionMode === "CLOUD_FREE") {
+          nextSettings.zeroCostMode = true;
+          nextSettings.aiExecutionMode = "CLOUD_FREE";
+        } else if (body.aiExecutionMode === "LOCAL_ONLY") {
+          nextSettings.zeroCostMode = true;
+          nextSettings.aiExecutionMode = "LOCAL_ONLY";
+        } else if (body.zeroCostMode === false) {
+          nextSettings.zeroCostMode = false;
+          nextSettings.aiExecutionMode = "CLOUD_PAID";
+        } else if (body.zeroCostMode === true && nextSettings.aiExecutionMode === "CLOUD_PAID") {
+          nextSettings.zeroCostMode = true;
+          nextSettings.aiExecutionMode = "LOCAL_ONLY";
+        }
+        org.settings = nextSettings;
         AuditLogger.log({
           organizationId: currentActor.organizationId,
           actorId: currentActor.userId,
@@ -6822,7 +7112,7 @@ var init_router = __esm({
           action: "settings.update",
           entityType: "organization",
           entityId: org.id,
-          afterState: req.body
+          afterState: nextSettings
         });
       }
       res.json({ success: true, data: org?.settings });

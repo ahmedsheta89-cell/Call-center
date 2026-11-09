@@ -22,7 +22,33 @@ function getGeminiClient(): GoogleGenAI | null {
   return geminiClient;
 }
 
+export type AIExecutionMode = 'LOCAL_ONLY' | 'CLOUD_FREE' | 'CLOUD_PAID';
+
 export class AIGateway {
+  /**
+   * Resolves the authoritative AI execution mode for an organization.
+   * Guarantees:
+   * - Missing organization or missing settings defaults to `LOCAL_ONLY`.
+   * - New organizations default to `LOCAL_ONLY`.
+   * - Legacy organizations with `zeroCostMode: false` but without an explicit Owner-authorized
+   *   `aiExecutionMode` ('CLOUD_FREE' or 'CLOUD_PAID') safely default to `LOCAL_ONLY`.
+   * - `CLOUD_PAID` requires both `aiExecutionMode === 'CLOUD_PAID'` and `zeroCostMode === false`.
+   * - `CLOUD_FREE` never triggers paid billing (`costUsd = 0`) and never falls back to `CLOUD_PAID`.
+   */
+  public static resolveExecutionMode(settings?: Record<string, any> | null): AIExecutionMode {
+    if (!settings || typeof settings !== 'object') {
+      return 'LOCAL_ONLY';
+    }
+    const explicitMode = settings.aiExecutionMode;
+    if (explicitMode === 'CLOUD_FREE') {
+      return 'CLOUD_FREE';
+    }
+    if (explicitMode === 'CLOUD_PAID' && settings.zeroCostMode === false) {
+      return 'CLOUD_PAID';
+    }
+    return 'LOCAL_ONLY';
+  }
+
   /**
    * PII & PCI-DSS Redaction Filter: Scrubs credit cards, national IDs, and OTP secrets before AI processing
    */
@@ -43,6 +69,15 @@ export class AIGateway {
   public static async execute(req: AIRouteRequest): Promise<AIRouteResponse> {
     const startTime = Date.now();
     const org = db.organizations.get(req.organizationId);
+    const settings = (org?.settings && typeof org.settings === 'object' ? org.settings : undefined) as
+      | (Record<string, any> & {
+          zeroCostMode?: boolean;
+          aiMonthlyBudgetUsd?: number;
+          aiCurrentMonthSpendUsd?: number;
+          aiExecutionMode?: AIExecutionMode;
+        })
+      | undefined;
+
     const sanitizedInput = this.redactPII(req.input);
     const safeReq: AIRouteRequest = { ...req, input: sanitizedInput };
 
@@ -61,40 +96,69 @@ export class AIGateway {
       };
     }
 
-    // 2. Determine Route: Local vs Cloud (Free-First by default; Paid Cloud requires explicit zeroCostMode === false)
-    const isZeroCost = org?.settings.zeroCostMode ?? true;
+    // 2. Supported Modality & Task Validation (Text-only tasks; unsupported modalities fail closed to local)
+    const supportedTasks = new Set<string>([
+      'sentiment_intent_analysis',
+      'copilot_suggest',
+      'conversation_summary',
+      'supervisor_risk_eval',
+      'qa_rubric_audit',
+    ]);
+    const isUnsupportedTaskOrModality =
+      !supportedTasks.has(safeReq.task) ||
+      Boolean((safeReq as any).modality && (safeReq as any).modality !== 'text');
+
+    // 3. Determine Route: LOCAL_ONLY vs CLOUD_FREE vs CLOUD_PAID
+    const executionMode = this.resolveExecutionMode(settings);
     const isRestrictedPii = safeReq.privacy === 'restricted_pii';
     const isSimpleTask = safeReq.task === 'sentiment_intent_analysis';
-    const isBudgetExceeded = (org?.settings.aiCurrentMonthSpendUsd ?? 0) >= (org?.settings.aiMonthlyBudgetUsd ?? 100);
+    const monthlyBudget =
+      typeof settings?.aiMonthlyBudgetUsd === 'number' && Number.isFinite(settings.aiMonthlyBudgetUsd)
+        ? settings.aiMonthlyBudgetUsd
+        : 0;
+    const currentSpend =
+      typeof settings?.aiCurrentMonthSpendUsd === 'number' && Number.isFinite(settings.aiCurrentMonthSpendUsd)
+        ? settings.aiCurrentMonthSpendUsd
+        : 0;
+    const isBudgetExceeded = monthlyBudget <= 0 || currentSpend >= monthlyBudget;
 
     const useLocal =
-      safeReq.forceLocal ||
-      isZeroCost ||
-      org?.settings.zeroCostMode !== false ||
+      Boolean(safeReq.forceLocal) ||
+      isUnsupportedTaskOrModality ||
+      executionMode === 'LOCAL_ONLY' ||
       isRestrictedPii ||
       isSimpleTask ||
-      isBudgetExceeded ||
+      (executionMode === 'CLOUD_PAID' && isBudgetExceeded) ||
       !process.env.GEMINI_API_KEY;
 
     let response: AIRouteResponse;
 
     if (useLocal) {
       response = await this.executeLocalEngine(safeReq, startTime);
-    } else {
+    } else if (executionMode === 'CLOUD_FREE') {
+      // CLOUD_FREE: Never accrues paid spend and NEVER falls back to CLOUD_PAID; falls back strictly to Local Engine
       try {
-        response = await this.executeCloudGemini(safeReq, startTime);
+        response = await this.executeCloudGemini(safeReq, startTime, 'CLOUD_FREE');
       } catch (cloudErr) {
-        console.warn('[AI Gateway] Cloud execution failed or timed out. Gracefully falling back to Local Engine:', cloudErr);
+        console.warn('[AI Gateway] Cloud Free execution failed or quota exhausted. Falling back to Local Engine:', cloudErr);
+        response = await this.executeLocalEngine(safeReq, startTime, true);
+      }
+    } else {
+      // CLOUD_PAID: Explicitly Owner-authorized paid tier; falls back strictly to Local Engine on error
+      try {
+        response = await this.executeCloudGemini(safeReq, startTime, 'CLOUD_PAID');
+      } catch (cloudErr) {
+        console.warn('[AI Gateway] Cloud Paid execution failed or timed out. Gracefully falling back to Local Engine:', cloudErr);
         response = await this.executeLocalEngine(safeReq, startTime, true);
       }
     }
 
-    // 3. Telemetry & Cost Accounting
-    if (org && response.costUsd > 0) {
-      org.settings.aiCurrentMonthSpendUsd = Number((org.settings.aiCurrentMonthSpendUsd + response.costUsd).toFixed(5));
+    // 4. Telemetry & Cost Accounting (Only CLOUD_PAID accrues billable USD spend)
+    if (settings && executionMode === 'CLOUD_PAID' && response.costUsd > 0) {
+      settings.aiCurrentMonthSpendUsd = Number((currentSpend + response.costUsd).toFixed(6));
     }
 
-    // 4. Audit Log for Privileged AI operations
+    // 5. Audit Log for Privileged AI operations
     if (safeReq.task === 'supervisor_risk_eval' || safeReq.task === 'qa_rubric_audit') {
       await AuditLogger.log({
         organizationId: safeReq.organizationId,
@@ -102,7 +166,13 @@ export class AIGateway {
         action: `ai.execute.${safeReq.task}`,
         entityType: 'ai_run',
         entityId: response.runId,
-        afterState: { model: response.model, tokens: response.tokensUsed, latencyMs: response.latencyMs },
+        afterState: {
+          mode: executionMode,
+          model: response.model,
+          tokens: response.tokensUsed,
+          costUsd: response.costUsd,
+          latencyMs: response.latencyMs,
+        },
       });
     }
 
@@ -253,7 +323,11 @@ export class AIGateway {
   /**
    * Cloud Engine: Invokes Google Gemini 2.5 Flash for High-order Reasoning
    */
-  private static async executeCloudGemini(req: AIRouteRequest, startTime: number): Promise<AIRouteResponse> {
+  private static async executeCloudGemini(
+    req: AIRouteRequest,
+    startTime: number,
+    executionMode: 'CLOUD_FREE' | 'CLOUD_PAID' = 'CLOUD_FREE'
+  ): Promise<AIRouteResponse> {
     const ai = getGeminiClient();
     if (!ai) {
       throw new Error('Gemini client unavailable');
@@ -290,8 +364,9 @@ ${JSON.stringify(req.contextData || {})}`;
       typeof usage?.candidatesTokenCount === 'number' && usage.candidatesTokenCount >= 0
         ? usage.candidatesTokenCount + (typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0)
         : Math.ceil(outputText.length / 4);
-    // Official Gemini 2.5 Flash pricing: $0.30 / 1M input tokens, $2.50 / 1M output tokens
-    const cost = inputTokenCount * 0.0000003 + outputTokenCount * 0.0000025;
+    // Official Gemini 2.5 Flash pricing: $0.30 / 1M input tokens, $2.50 / 1M output tokens (charged only in CLOUD_PAID mode)
+    const rawPaidCost = inputTokenCount * 0.0000003 + outputTokenCount * 0.0000025;
+    const cost = executionMode === 'CLOUD_PAID' ? Number(rawPaidCost.toFixed(6)) : 0.0;
 
     return {
       runId: crypto.randomUUID(),
@@ -303,7 +378,7 @@ ${JSON.stringify(req.contextData || {})}`;
         output: outputTokenCount,
         total: inputTokenCount + outputTokenCount,
       },
-      costUsd: Number(cost.toFixed(6)),
+      costUsd: cost,
       latencyMs: Date.now() - startTime,
       isHallucinationSafe: true,
     };

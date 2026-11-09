@@ -185,19 +185,42 @@ export const ROLE_HIERARCHY_RANK: Readonly<Record<string, number>> = Object.free
 
 /**
  * Returns true if and only if a user with `baseRole` is permitted to switch their active session role to `targetRole`.
- * - Only `Owner` and `Admin` baseRoles may use role switching.
- * - `targetRole` rank must be `<= baseRole` rank (e.g., `Admin` cannot escalate to `Owner`).
+ * Enforces both:
+ * 1. Role hierarchy constraints: only `Owner` and `Admin` baseRoles may switch roles, and `targetRank <= baseRank`.
+ * 2. Explicit effective permission-set containment: every permission granted to `targetRole` must be present in
+ *    the authorized permission set of `baseRole` (never relying on numerical rank alone).
  */
-export function canSwitchToRole(baseRole: string, targetRole: string): boolean {
+export function canSwitchToRole(
+  baseRole: string,
+  targetRole: string,
+  rolePermissionsMap: Readonly<Record<string, readonly string[]>> = ROLE_PERMISSIONS
+): boolean {
+  if (typeof baseRole !== 'string' || typeof targetRole !== 'string') {
+    return false;
+  }
   if (baseRole !== 'Owner' && baseRole !== 'Admin') {
+    return false;
+  }
+  if (
+    !Object.prototype.hasOwnProperty.call(ROLE_HIERARCHY_RANK, baseRole) ||
+    !Object.prototype.hasOwnProperty.call(ROLE_HIERARCHY_RANK, targetRole) ||
+    !Object.prototype.hasOwnProperty.call(rolePermissionsMap, baseRole) ||
+    !Object.prototype.hasOwnProperty.call(rolePermissionsMap, targetRole)
+  ) {
     return false;
   }
   const baseRank = ROLE_HIERARCHY_RANK[baseRole];
   const targetRank = ROLE_HIERARCHY_RANK[targetRole];
-  if (typeof baseRank !== 'number' || typeof targetRank !== 'number') {
+  if (typeof baseRank !== 'number' || typeof targetRank !== 'number' || targetRank > baseRank) {
     return false;
   }
-  return targetRank <= baseRank;
+  const basePermissions = rolePermissionsMap[baseRole];
+  const targetPermissions = rolePermissionsMap[targetRole];
+  if (!Array.isArray(basePermissions) || !Array.isArray(targetPermissions)) {
+    return false;
+  }
+  const basePermissionSet = new Set<string>(basePermissions);
+  return targetPermissions.every((perm) => typeof perm === 'string' && basePermissionSet.has(perm));
 }
 
 /**

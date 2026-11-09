@@ -20,7 +20,7 @@ import crypto from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
 import type { Request, Response, NextFunction } from 'express';
 import { db } from '../db/store.ts';
-import { ROLE_PERMISSIONS, canSwitchToRole } from './rbac.ts';
+import { ROLE_PERMISSIONS, ROLE_HIERARCHY_RANK, canSwitchToRole } from './rbac.ts';
 import { AuditLogger } from './audit.ts';
 import { adminAuth } from '../../src/lib/firebase-admin.ts';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -341,15 +341,22 @@ export function issueSessionToken(options: {
   }
 
   const baseRole = user.role;
+  if (!Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, baseRole)) {
+    throw Object.assign(new Error(`Invalid authoritative base role [${baseRole}]`), {
+      status: 403,
+      code: 'INVALID_BASE_ROLE',
+    });
+  }
+
   const activeRole = options.activeRoleOverride || baseRole;
-  if (!(activeRole in ROLE_PERMISSIONS)) {
+  if (!Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, activeRole)) {
     throw Object.assign(new Error(`Invalid role [${activeRole}]`), {
       status: 400,
       code: 'INVALID_ROLE',
     });
   }
 
-  if (options.activeRoleOverride && activeRole !== baseRole && !canSwitchToRole(baseRole, activeRole)) {
+  if (activeRole !== baseRole && !canSwitchToRole(baseRole, activeRole)) {
     throw Object.assign(
       new Error(`Role escalation forbidden: baseRole [${baseRole}] cannot switch to [${activeRole}]`),
       {
@@ -359,11 +366,48 @@ export function issueSessionToken(options: {
     );
   }
 
-  if (options.existingJti) {
-    const existingSession = activeSessions.get(options.existingJti);
+  const now = Date.now();
+  let jti: string;
+
+  if (options.existingJti !== undefined) {
+    if (typeof options.existingJti !== 'string' || options.existingJti.trim().length === 0) {
+      throw Object.assign(new Error('Provided existingJti must be a non-empty string'), {
+        status: 401,
+        code: 'INVALID_SESSION_JTI',
+      });
+    }
+    const candidateJti = options.existingJti.trim();
+    const existingSession = activeSessions.get(candidateJti);
+    if (!existingSession) {
+      throw Object.assign(
+        new Error('Cannot reuse nonexistent session JTI; arbitrary JTI injection is forbidden'),
+        {
+          status: 401,
+          code: 'SESSION_NOT_FOUND',
+        }
+      );
+    }
+    if (existingSession.revoked) {
+      throw Object.assign(
+        new Error('Cannot reuse or rotate a revoked session JTI'),
+        {
+          status: 401,
+          code: 'SESSION_REVOKED_OR_UNKNOWN',
+        }
+      );
+    }
+    if (now > existingSession.expiresAt) {
+      throw Object.assign(
+        new Error('Cannot reuse or rotate an expired session JTI'),
+        {
+          status: 401,
+          code: 'SESSION_EXPIRED',
+        }
+      );
+    }
     if (
-      existingSession &&
-      (existingSession.userId !== user.id || existingSession.organizationId !== user.organizationId)
+      existingSession.userId !== user.id ||
+      existingSession.organizationId !== user.organizationId
     ) {
       throw Object.assign(
         new Error('Session identity is immutable: cannot reassign an existing session JTI to another user or organization'),
@@ -373,11 +417,12 @@ export function issueSessionToken(options: {
         }
       );
     }
+    jti = candidateJti;
+  } else {
+    jti = `sess-${crypto.randomBytes(12).toString('hex')}`;
   }
 
-  const now = Date.now();
   const ttl = options.ttlMs !== undefined ? options.ttlMs : DEFAULT_TTL_MS;
-  const jti = options.existingJti || `sess-${crypto.randomBytes(12).toString('hex')}`;
   const csrfToken = deriveCsrfToken(jti);
 
   const payload: SessionTokenPayload = {
@@ -501,7 +546,11 @@ export function verifySessionToken(
     });
   }
 
-  if (user.organizationId !== sessionRecord.organizationId) {
+  if (
+    user.organizationId !== sessionRecord.organizationId ||
+    payload.sub !== user.id ||
+    payload.org !== user.organizationId
+  ) {
     throw Object.assign(new Error('User organization binding mismatch'), {
       status: 401,
       code: 'ORG_BINDING_MISMATCH',
@@ -516,12 +565,57 @@ export function verifySessionToken(
     });
   }
 
+  // Revalidate authoritative current base role, active role, and permission containment on every request
+  const currentBaseRole = user.role;
+  const sessionActiveRole = sessionRecord.activeRole;
+  if (
+    !Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, currentBaseRole) ||
+    !Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, sessionActiveRole) ||
+    payload.activeRole !== sessionActiveRole
+  ) {
+    sessionRecord.revoked = true;
+    throw Object.assign(new Error('Session role is no longer valid in RBAC policy'), {
+      status: 403,
+      code: 'SESSION_ROLE_INVALIDATED_BY_DEMOTION',
+    });
+  }
+
+  const currentBaseRank = ROLE_HIERARCHY_RANK[currentBaseRole];
+  const issuedBaseRank = ROLE_HIERARCHY_RANK[sessionRecord.baseRole];
+  const wasBaseRoleDemoted =
+    typeof currentBaseRank !== 'number' ||
+    typeof issuedBaseRank !== 'number' ||
+    currentBaseRank < issuedBaseRank;
+
+  const currentBasePerms = new Set<string>(ROLE_PERMISSIONS[currentBaseRole] || []);
+  const activeRolePerms = ROLE_PERMISSIONS[sessionActiveRole] || [];
+  const hasPermissionContainment =
+    Array.isArray(activeRolePerms) && activeRolePerms.every((perm) => currentBasePerms.has(perm));
+
+  const isAuthorizedActiveRole =
+    sessionActiveRole === currentBaseRole
+      ? hasPermissionContainment
+      : canSwitchToRole(currentBaseRole, sessionActiveRole) && hasPermissionContainment;
+
+  if (wasBaseRoleDemoted || !isAuthorizedActiveRole) {
+    sessionRecord.revoked = true;
+    throw Object.assign(
+      new Error(
+        `Session invalidated: current base role [${currentBaseRole}] no longer authorizes active role [${sessionActiveRole}]`
+      ),
+      {
+        status: 403,
+        code: 'SESSION_ROLE_INVALIDATED_BY_DEMOTION',
+      }
+    );
+  }
+
   return {
     sessionId: sessionRecord.jti,
     userId: user.id,
     organizationId: user.organizationId,
-    role: sessionRecord.activeRole,
-    baseRole: user.role,
+    role: sessionActiveRole,
+    baseRole: currentBaseRole,
     name: user.fullName,
     email: user.email,
     phoneNumber: user.phoneNumber || '01018108979',
@@ -656,6 +750,10 @@ function verifyCsrfForCookieMutation(
 
   const originHeader = (req.headers.origin || req.headers.referer) as string | undefined;
   if (!originHeader || typeof originHeader !== 'string' || originHeader.trim().length === 0) {
+    // Allow cookie-only POST /auth/logout after page reload when no foreign Origin is present
+    if (req.path === '/auth/logout' && req.method.toUpperCase() === 'POST') {
+      return { valid: true };
+    }
     return {
       valid: false,
       code: 'CSRF_ORIGIN_REQUIRED',
@@ -686,6 +784,11 @@ function verifyCsrfForCookieMutation(
 
   const providedCsrf = (req.headers['x-csrf-token'] as string | undefined)?.trim();
   if (!providedCsrf || !verifiedActor.csrfToken) {
+    // Support cookie-backed POST /auth/logout after page reload when in-memory csrfToken was cleared,
+    // provided the Origin/Referer passed trusted origin validation above.
+    if (req.path === '/auth/logout' && req.method.toUpperCase() === 'POST') {
+      return { valid: true };
+    }
     return {
       valid: false,
       code: 'CSRF_TOKEN_MISSING',
@@ -722,8 +825,15 @@ export function authenticateApiRequest(req: Request, res: Response, next: NextFu
     return;
   }
 
+  const isLogoutRoute = req.path === '/auth/logout' && req.method.toUpperCase() === 'POST';
   const { token, method } = extractRawToken(req);
+
   if (!token) {
+    if (isLogoutRoute) {
+      // Idempotent logout when no active token or cookie is present
+      actorContextStorage.run({ ...unauthenticatedFallbackContext }, () => next());
+      return;
+    }
     res.status(401).json({
       success: false,
       error: {
@@ -738,6 +848,20 @@ export function authenticateApiRequest(req: Request, res: Response, next: NextFu
   try {
     verifiedActor = verifySessionToken(token, method);
   } catch (err: any) {
+    if (
+      isLogoutRoute &&
+      (err?.code === 'SESSION_REVOKED_OR_UNKNOWN' ||
+        err?.code === 'SESSION_EXPIRED' ||
+        err?.code === 'TOKEN_EXPIRED' ||
+        err?.code === 'SESSION_ROLE_INVALIDATED_BY_DEMOTION')
+    ) {
+      // Idempotent logout for an already-revoked or expired token with valid signature
+      actorContextStorage.run({ ...unauthenticatedFallbackContext }, () => next());
+      return;
+    }
+    if (isLogoutRoute) {
+      res.setHeader('Set-Cookie', formatClearSessionCookie(req));
+    }
     res.status(err?.status || 401).json({
       success: false,
       error: {
