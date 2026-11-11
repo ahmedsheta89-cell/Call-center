@@ -9,7 +9,7 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from './server/db/localPersistenceEngine.ts';
 
-dotenv.config();const durableDataPath = resolveDurableDataPath(); acquireDirectoryLock(durableDataPath); const gracefulShutdown = () => { releaseDirectoryLock(durableDataPath); process.exit(0); }; process.on('SIGTERM', gracefulShutdown); process.on('SIGINT', gracefulShutdown);
+dotenv.config(); const durableDataPath = resolveDurableDataPath(); if (durableDataPath.ok) { acquireDirectoryLock(durableDataPath.filePath); } const gracefulShutdown = () => { if (durableDataPath.ok) { releaseDirectoryLock(durableDataPath.filePath); } process.exit(0); }; process.on('SIGTERM', gracefulShutdown); process.on('SIGINT', gracefulShutdown);
 
 
 const app = express();
