@@ -7,6 +7,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { CURRENT_SCHEMA_VERSION, resolveDurableDataPath, preserveLastKnownGoodBackup, writeVerifiedAtomicFileSync, quarantineCorruptFile, validateAndMigrateSchemaPayload } from './localPersistenceEngine.ts';
 import {
   Organization,
   User,
@@ -236,7 +237,7 @@ export interface BackupImportResult {
   unconfiguredChannels?: string[];
 }
 
-export interface IDataStore {
+export interface schedulePersist {
   assertValidOrganizationId(orgId: unknown): UUID;
   getCustomers(orgId: UUID): Customer[];
   getConversations(orgId: UUID): Conversation[];
@@ -270,6 +271,7 @@ export interface IDataStore {
     options?: { scopeOrgId?: UUID; persistToDisk?: boolean; isDiskLoad?: boolean }
   ): BackupImportResult;
   saveToDisk(): boolean;
+  flushPendingPersist(): boolean;
   loadFromDisk(): boolean;
   isDiskOverwriteProtected(): boolean;
   getLastStorageError(): StorageDiagnosticError | null;
@@ -329,8 +331,8 @@ class DatabaseStore implements IDataStore {
     messages: new Map<UUID, Set<UUID>>(),
     calls: new Map<UUID, Set<UUID>>(),
   };
-
-  private defaultPersistFilePath = path.join(os.tmpdir(), 'omniflow-data', 'db_state.json');
+  private customPersistFilePath: string | null = null;
+  private defaultPersistFilePath = resolveDurableDataPath(null).filePath || path.resolve(process.cwd(), 'data', 'db_state.json');
   private persistFilePath = this.defaultPersistFilePath;
   private persistTimer: NodeJS.Timeout | null = null;
   private lastStorageError: StorageDiagnosticError | null = null;
@@ -359,9 +361,10 @@ class DatabaseStore implements IDataStore {
   }
 
   public getPersistFilePath(): string {
-    return this.persistFilePath;
+    if (this.customPersistFilePath) return this.customPersistFilePath;
+    const res = resolveDurableDataPath(null);
+    return res.ok ? res.filePath : '';
   }
-
   public setPersistFilePathForTesting(customPath: string | null): void {
     if (process.env.NODE_ENV === 'production') return;
     if (this.persistTimer) {
@@ -369,8 +372,9 @@ class DatabaseStore implements IDataStore {
       this.persistTimer = null;
     }
     this.existingFileProtected = false;
-    this.existingFileProtectionReason = 'NONE';
-    this.persistFilePath = customPath ? customPath : this.defaultPersistFilePath;
+    this.existingFileProtectionReason = 'NONE'; 
+    this.customPersistFilePath = customPath;
+    this.persistFilePath = customPath ? customPath : (resolveDurableDataPath(null).filePath || this.defaultPersistFilePath);'NONE';
   }
 
   /**
