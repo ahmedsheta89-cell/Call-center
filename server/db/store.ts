@@ -7,7 +7,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { CURRENT_SCHEMA_VERSION, resolveDurableDataPath, preserveLastKnownGoodBackup, writeVerifiedAtomicFileSync, quarantineCorruptFile, validateAndMigrateSchemaPayload } from './localPersistenceEngine.ts';
+import { CURRENT_SCHEMA_VERSION, resolveDurableDataPath, preserveLastKnownGoodBackup, writeVerifiedAtomicFileSync, quarantineCorruptFile, validateAndMigrateSchemaPayload, installDurableStoreLifecycle } from './localPersistenceEngine.ts';
 import {
   Organization,
   User,
@@ -359,7 +359,16 @@ class DatabaseStore implements IDataStore {
   public isDiskOverwriteProtected(): boolean {
     return this.existingFileProtected;
   }
-
+    private readonly _durableLifecycleBound = installDurableStoreLifecycle(this);
+  
+    public flushPendingPersist(): boolean {
+          if (this.persistTimer) {
+                  clearTimeout(this.persistTimer);
+                  this.persistTimer = null;
+                  return this.saveToDisk();
+          }
+          return true;
+    }
   public getPersistFilePath(): string {
     if (this.customPersistFilePath) return this.customPersistFilePath;
     const res = resolveDurableDataPath(null);
