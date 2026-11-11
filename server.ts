@@ -8,9 +8,27 @@ import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
 import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from './server/db/localPersistenceEngine.ts';
-
-dotenv.config(); const durableDataPath = resolveDurableDataPath(); if (durableDataPath.ok) { acquireDirectoryLock(durableDataPath.filePath); } const gracefulShutdown = () => { if (durableDataPath.ok) { releaseDirectoryLock(durableDataPath.filePath); } process.exit(0); }; process.on('SIGTERM', gracefulShutdown); process.on('SIGINT', gracefulShutdown);
-
+dotenv.config();
+const durableDataPath = resolveDurableDataPath();
+if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process.exit(1); }
+const bootLock = acquireDirectoryLock(durableDataPath.filePath);
+if (!bootLock.ok) { console.error(`[Fatal Storage Lock] ${bootLock.errorCode}: ${bootLock.errorMessage}`); process.exit(1); }
+let isShuttingDown = false;
+let activeDbRef: { flushPendingPersist: () => boolean; getPersistFilePath: () => string } | null = null;
+const gracefulShutdown = () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  const finalize = () => {
+    let ok = true;
+    try { if (activeDbRef) ok = activeDbRef.flushPendingPersist() !== false; } catch (_) { ok = false; }
+    const rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
+    process.exit(ok && rel ? 0 : 1);
+  };
+  const t = setTimeout(finalize, 1500); t.unref?.();
+  server.close(() => { clearTimeout(t); finalize(); });
+};
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 const app = express();
 app.set('trust proxy', 1);
@@ -95,22 +113,25 @@ async function bootstrapModules() {
     import('./server/db/store.ts'),
     import('./server/db/seed.ts'),
     import('./server/core/pwaAssets.ts'),
-    import('./server/api/router.ts'),
-    import('./server/core/identity.ts'),
+import('./server/core/identity.ts'),
   ]);
 
   // 1. Initialize Seed Data or Load from Persistent Storage
-  const restored = db.loadFromDisk();
+  activeDbRef = db;
+    const restored = db.loadFromDisk();
   if (!restored) {
     if (db.isDiskOverwriteProtected()) {
       console.error(
         `[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`
       );
+      releaseDirectoryLock(db.getPersistFilePath() || durableDataPath.filePath);
+      process.exit(1);
     } else {
       console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
       initializeSeedData();
       db.saveToDisk();
-      ensureEgyptSpecialCustomer();
+      ensureEgyptSpecialCustomer()
+        if (!restored) db.saveToDisk();;
       ensureAdminUser();
     }
   } else {
