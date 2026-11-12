@@ -113,6 +113,7 @@ async function bootstrapModules() {
     import('./server/db/store.ts'),
     import('./server/db/seed.ts'),
     import('./server/core/pwaAssets.ts'),
+    import('./server/api/router.ts'),
 import('./server/core/identity.ts'),
   ]);
 
@@ -130,7 +131,7 @@ import('./server/core/identity.ts'),
       console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
       initializeSeedData();
       db.saveToDisk();
-      ensureEgyptSpecialCustomer()
+      ensureEgyptSpecialCustomer();
         if (!restored) db.saveToDisk();;
       ensureAdminUser();
     }
