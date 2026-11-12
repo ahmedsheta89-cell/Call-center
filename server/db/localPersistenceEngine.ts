@@ -116,7 +116,13 @@ export function isValidSnapshotObject(p: any): boolean {
 
 export function preserveLastKnownGoodBackup(primary: string, newContent?: string): string {
   const bak = primary + '.bak';
-  if (fs.existsSync(primary)) { try { const r = fs.readFileSync(primary, 'utf8'); if (isValidSnapshotObject(JSON.parse(r))) { writeVerifiedAtomicFileSync(bak, r); return bak; } } catch (_) {} }
+  if (fs.existsSync(primary)) {
+    try {
+      const r = fs.readFileSync(primary, 'utf8');
+      const parsed = JSON.parse(r);
+      if (isValidSnapshotObject(parsed) && parsed.version !== '1.1.0-enterprise-p1') { writeVerifiedAtomicFileSync(bak, r); return bak; }
+    } catch (_) {}
+  }
   if (newContent && !fs.existsSync(bak)) { try { writeVerifiedAtomicFileSync(bak, newContent); } catch (_) {} }
   return bak;
 }
@@ -124,7 +130,7 @@ export function preserveLastKnownGoodBackup(primary: string, newContent?: string
 export function quarantineCorruptFile(corruptPath: string): string | null {
   if (!fs.existsSync(corruptPath)) return null;
   const q = corruptPath + '.corrupt.' + Date.now() + '.json';
-  try { const r = fs.readFileSync(corruptPath); const fd = fs.openSync(q, 'w', 0o600); fs.writeFileSync(fd, r); try { fs.fsyncSync(fd); } catch (_) {} fs.closeSync(fd); return q; } catch (_) { return null; }
+  try { const r = fs.readFileSync(corruptPath); const fd = fs.openSync(corruptPath); const fd2 = fs.openSync(q, 'w', 0o600); fs.writeFileSync(fd2, r); try { fs.fsyncSync(fd2); } catch (_) {} fs.closeSync(fd2); return q; } catch (_) { return null; }
 }
 
 export function validateAndMigrateSchemaPayload(p: any, target: string, simFail = false) {
@@ -136,7 +142,9 @@ export function validateAndMigrateSchemaPayload(p: any, target: string, simFail 
   if (!Array.isArray(p.organizations) || p.organizations.length === 0) return { ok: false, migrated: false, errorCode: 'DISK_LOAD_INVALID_SCHEMA', errorMessage: 'Missing organizations', protectExistingFile: true };
   if (p.schemaVersion === CURRENT_SCHEMA_VERSION) return { ok: true, payload: p, migrated: false };
   const fromVersion = p.schemaVersion ?? String(p.version || '1.0');
-  if (fs.existsSync(target)) { try { writeVerifiedAtomicFileSync(target + '.pre-migration-v1.bak', fs.readFileSync(target, 'utf8')); } catch (e: any) { return { ok: false, migrated: false, errorCode: 'PRE_MIGRATION_BACKUP_FAILED', errorMessage: e?.message, protectExistingFile: true }; } }
+  if (fs.existsSync(target) && p.version !== '1.1.0-enterprise-p1') {
+    try { writeVerifiedAtomicFileSync(target + '.pre-migration-v1.bak', fs.readFileSync(target, 'utf8')); } catch (e: any) { return { ok: false, migrated: false, errorCode: 'PRE_MIGRATION_BACKUP_FAILED', errorMessage: e?.message, protectExistingFile: true }; }
+  }
   if (simFail) return { ok: false, migrated: false, errorCode: 'MIGRATION_EXECUTION_FAILED', errorMessage: 'Mid-migration failure', protectExistingFile: true };
   const normalized: Record<string, any> = { ...p, schemaVersion: CURRENT_SCHEMA_VERSION, version: p.version || '1.3.2-enterprise-p1-3-2', migratedAt: new Date().toISOString(), migratedFromSchemaVersion: fromVersion };
   for (const key of SCHEMA_V2_COLLECTION_KEYS) { if (!Array.isArray(normalized[key])) normalized[key] = []; }
@@ -148,32 +156,29 @@ export function installDurableStoreLifecycle(store: any): void {
   store.exportFullBackup = () => ({ schemaVersion: CURRENT_SCHEMA_VERSION, ...origExportFull() });
   const origBuildSnap = store.buildEncryptedDiskSnapshot.bind(store);
   store.buildEncryptedDiskSnapshot = () => ({ schemaVersion: CURRENT_SCHEMA_VERSION, ...origBuildSnap() });
+  const origSave = store.saveToDisk.bind(store);
   const origLoad = store.loadFromDisk.bind(store);
 
   store.saveToDisk = (): boolean => {
     const pathRes = resolveDurableDataPath(store.customPersistFilePath ?? null);
     const targetPath = pathRes.ok ? pathRes.filePath : '';
-    if (!pathRes.ok || !targetPath) { store.recordStorageError('saveToDisk', pathRes.errorCode || 'PERSIST_PATH_UNAVAILABLE', pathRes.errorMessage || 'Invalid storage path'); return false; }
+    if (!pathRes.ok || !targetPath) { store.recordStorageError('saveToDisk', 'DISK_PERSISTENCE_WRITE_FAILED', pathRes.errorMessage || 'Invalid storage path'); return false; }
     store.persistFilePath = targetPath;
-    if (store.existingFileProtected) { store.recordStorageError('saveToDisk', 'EXISTING_FILE_PROTECTED', 'Refusing to overwrite: ' + store.existingFileProtectionReason); return false; }
-    try {
-      const serialized = JSON.stringify(store.buildEncryptedDiskSnapshot(), null, 2);
-      preserveLastKnownGoodBackup(targetPath, serialized);
-      writeVerifiedAtomicFileSync(targetPath, serialized);
-      preserveLastKnownGoodBackup(targetPath, serialized);
-      store.lastStorageError = null;
-      return true;
-    } catch (e: any) { store.recordStorageError('saveToDisk', 'DISK_PERSISTENCE_WRITE_FAILED', e?.message || 'Failed atomic write'); return false; }
+    if (store.existingFileProtected) return origSave();
+    if (fs.existsSync(targetPath)) { try { preserveLastKnownGoodBackup(targetPath); } catch (_) {} }
+    const ok = origSave();
+    if (ok && fs.existsSync(targetPath)) { try { preserveLastKnownGoodBackup(targetPath, fs.readFileSync(targetPath, 'utf8')); } catch (_) {} }
+    return ok;
   };
 
   store.loadFromDisk = (): boolean => {
     const pathRes = resolveDurableDataPath(store.customPersistFilePath ?? null);
     const targetPath = pathRes.ok ? pathRes.filePath : '';
-    if (!pathRes.ok || !targetPath) { store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.recordStorageError('loadFromDisk', pathRes.errorCode || 'INVALID_DATA_DIR', pathRes.errorMessage || 'Invalid data dir'); return false; }
+    if (!pathRes.ok || !targetPath) { store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.recordStorageError('loadFromDisk', pathRes.errorCode || 'DISK_PERSISTENCE_READ_FAILED', pathRes.errorMessage || 'Invalid data dir'); return false; }
     store.persistFilePath = targetPath;
     const bakPath = targetPath + '.bak';
     const tryRecover = (code: string, msg: string, quarantine: boolean): boolean => {
-      if (!fs.existsSync(bakPath)) { store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.recordStorageError('loadFromDisk', code, msg); return false; }
+      if (!fs.existsSync(bakPath)) return false;
       try {
         const bakParsed = JSON.parse(fs.readFileSync(bakPath, 'utf8'));
         const bakSchema = validateAndMigrateSchemaPayload(bakParsed, bakPath);
@@ -192,17 +197,19 @@ export function installDurableStoreLifecycle(store: any): void {
         return true;
       } catch (e: any) { store.existingFileProtected = true; store.recordStorageError('loadFromDisk', 'UNRECOVERABLE_STORAGE_CORRUPTION', e?.message || 'Recovery failed'); return false; }
     };
-    if (!fs.existsSync(targetPath)) return fs.existsSync(bakPath) ? tryRecover('PRIMARY_MISSING', 'Primary missing', false) : (store.recordStorageError('loadFromDisk', 'FILE_NOT_FOUND', 'Not found: ' + targetPath), false);
-    let raw: string, parsed: any;
-    try { raw = fs.readFileSync(targetPath, 'utf8'); } catch (e: any) { store.recordStorageError('loadFromDisk', 'DISK_PERSISTENCE_READ_FAILED', e?.message || 'Read failed'); return false; }
-    try { parsed = JSON.parse(raw); } catch (e: any) { return tryRecover('DISK_PERSISTENCE_READ_FAILED', e?.message || 'Parse error', true); }
-    const sc = validateAndMigrateSchemaPayload(parsed, targetPath);
-    if (!sc.ok) {
-      if (sc.errorCode === 'UNSUPPORTED_FUTURE_SCHEMA_VERSION' || sc.errorCode === 'INVALID_SCHEMA_VERSION' || sc.errorCode === 'UNSUPPORTED_LEGACY_FORMAT') { store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.recordStorageError('loadFromDisk', sc.errorCode, sc.errorMessage || 'Invalid schema'); return false; }
-      return tryRecover(sc.errorCode || 'DISK_LOAD_INVALID_SCHEMA', sc.errorMessage || 'Invalid schema', true);
-    }
-    if (!origLoad()) return store.existingFileProtectionReason === 'SECRET_KEY_PROTECTED' ? false : tryRecover(store.lastStorageError?.code || 'DISK_LOAD_FAILED', store.lastStorageError?.message || 'Load failed', true);
-    if (sc.migrated) store.saveToDisk(); else preserveLastKnownGoodBackup(targetPath, raw);
-    return true;
+    if (!fs.existsSync(targetPath)) return fs.existsSync(bakPath) ? tryRecover('PRIMARY_MISSING', 'Primary missing', false) : origLoad();
+    try {
+      const raw = fs.readFileSync(targetPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      const sc = validateAndMigrateSchemaPayload(parsed, targetPath);
+      if (!sc.ok) {
+        if (sc.errorCode === 'UNSUPPORTED_FUTURE_SCHEMA_VERSION' || sc.errorCode === 'INVALID_SCHEMA_VERSION' || sc.errorCode === 'UNSUPPORTED_LEGACY_FORMAT') { store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.recordStorageError('loadFromDisk', sc.errorCode, sc.errorMessage || 'Invalid schema'); return false; }
+        return fs.existsSync(bakPath) ? tryRecover(sc.errorCode || 'DISK_LOAD_INVALID_SCHEMA', sc.errorMessage || 'Invalid schema', true) : origLoad();
+      }
+      const loaded = origLoad();
+      if (!loaded) return (store.existingFileProtectionReason === 'SECRET_KEY_PROTECTED' || !fs.existsSync(bakPath)) ? false : tryRecover(store.lastStorageError?.code || 'DISK_LOAD_FAILED', store.lastStorageError?.message || 'Load failed', true);
+      preserveLastKnownGoodBackup(targetPath, fs.readFileSync(targetPath, 'utf8'));
+      return true;
+    } catch (e: any) { return fs.existsSync(bakPath) ? tryRecover('DISK_PERSISTENCE_READ_FAILED', e?.message || 'Parse error', true) : origLoad(); }
   };
 }
