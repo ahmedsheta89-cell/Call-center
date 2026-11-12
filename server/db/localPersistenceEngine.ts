@@ -100,7 +100,7 @@ export function writeVerifiedAtomicFileSync(target: string, content: string): vo
   const tmp = path.join(dir, '.callcenter-db.' + process.pid + '.' + Date.now() + '.' + Math.random().toString(36).slice(2, 8) + '.tmp');
   let fd: number | null = null;
   try {
-    ffd = fs.openSync(tmp, 'wx', 0o600); try { fs.writeFileSync(fd, content, 'utf8'); try { fs.fsyncSync(fd); } catch (_) {} } finally { try { fs.closeSync(fd); } catch (_) {} fd = null; }
+    fd = fs.openSync(tmp, 'wx', 0o600); try { fs.writeFileSync(fd, content, 'utf8'); try { fs.fsyncSync(fd); } catch (_) {} } finally { try { fs.closeSync(fd); } catch (_) {} fd = null; }
     if (fs.statSync(tmp).size <= 0) throw new Error('Empty staging write');
     JSON.parse(fs.readFileSync(tmp, 'utf8'));
     fs.renameSync(tmp, target);
