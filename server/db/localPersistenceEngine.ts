@@ -100,7 +100,7 @@ export function writeVerifiedAtomicFileSync(target: string, content: string): vo
   const tmp = path.join(dir, '.callcenter-db.' + process.pid + '.' + Date.now() + '.' + Math.random().toString(36).slice(2, 8) + '.tmp');
   let fd: number | null = null;
   try {
-    fd = fs.openSync(tmp, 'w', 0o600); fs.writeFileSync(fd, content, 'utf8'); try { fs.fsyncSync(fd); } catch (_) {} fs.closeSync(fd); fd = null;
+    ffd = fs.openSync(tmp, 'wx', 0o600); try { fs.writeFileSync(fd, content, 'utf8'); try { fs.fsyncSync(fd); } catch (_) {} } finally { try { fs.closeSync(fd); } catch (_) {} fd = null; }
     if (fs.statSync(tmp).size <= 0) throw new Error('Empty staging write');
     JSON.parse(fs.readFileSync(tmp, 'utf8'));
     fs.renameSync(tmp, target);
@@ -130,7 +130,7 @@ export function preserveLastKnownGoodBackup(primary: string, newContent?: string
 export function quarantineCorruptFile(corruptPath: string): string | null {
   if (!fs.existsSync(corruptPath)) return null;
   const q = corruptPath + '.corrupt.' + Date.now() + '.json';
-  try { const r = fs.readFileSync(corruptPath); const fd = fs.openSync(corruptPath, 'r'); const fd2 = fs.openSync(q, 'w', 0o600); fs.writeFileSync(fd2, r); try { fs.fsyncSync(fd2); } catch (_) {} fs.closeSync(fd2); return q; } catch (_) { return null; }
+  let c = false; try { const r = fs.readFileSync(corruptPath); const fd2 = fs.openSync(q, 'wx', 0o600); c = true; try { fs.writeFileSync(fd2, r); try { fs.fsyncSync(fd2); } catch (_) {} } finally { try { fs.closeSync(fd2); } catch (_) {} } if (!fs.existsSync(q) || !fs.readFileSync(q).equals(r)) { try { if (fs.existsSync(q)) fs.unlinkSync(q); } catch (_) {} return null; } return q; } catch (_) { if (c) { try { if (fs.existsSync(q)) fs.unlinkSync(q); } catch (_) {} } return null; }
 }
 
 export function validateAndMigrateSchemaPayload(p: any, target: string, simFail = false) {
@@ -192,8 +192,8 @@ export function installDurableStoreLifecycle(store: any): void {
         try { if (fs.existsSync(tmpVerify)) fs.unlinkSync(tmpVerify); } catch (_) {}
         if (!ok) { store.existingFileProtected = true; store.recordStorageError('loadFromDisk', 'UNRECOVERABLE_STORAGE_CORRUPTION', 'Backup failed integrity'); return false; }
         const qPath = quarantine && fs.existsSync(targetPath) ? quarantineCorruptFile(targetPath) : null;
-        store.existingFileProtected = false; store.existingFileProtectionReason = 'NONE'; store.saveToDisk();
-        store.lastRecoveryEvent = { timestamp: new Date().toISOString(), reason: msg, code: 'RECOVERED_FROM_VALIDATED_BACKUP', primaryPath: targetPath, backupSourcePath: bakPath, quarantinedCorruptPath: qPath, restoredSchemaVersion: CURRENT_SCHEMA_VERSION };
+        if (quarantine && fs.existsSync(targetPath) && !qPath) { for (const k of SCHEMA_V2_COLLECTION_KEYS) { if (store[k] instanceof Map) store[k].clear(); } store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.lastRecoveryEvent = null; store.recordStorageError('saveToDisk', 'DISK_PERSISTENCE_WRITE_FAILED', 'Quarantine write failed'); return false; } const bakRaw = fs.readFileSync(bakPath, 'utf8'); store.existingFileProtected = false; store.existingFileProtectionReason = 'NONE'; store.lastStorageError = null; const savedOk = !(store.simulateRecoveryWriteFailure || process.env.OMNIFLOW_SIMULATE_RECOVERY_WRITE_FAILURE === 'true') && Boolean(store.saveToDisk()); let vOk = false; if (savedOk && fs.existsSync(targetPath)) { try { const pp = JSON.parse(fs.readFileSync(targetPath, 'utf8')); vOk = Boolean(validateAndMigrateSchemaPayload(pp, targetPath).ok && isValidSnapshotObject(pp)); } catch (_) {} } if (!savedOk || !vOk) { for (const k of SCHEMA_V2_COLLECTION_KEYS) { if (store[k] instanceof Map) store[k].clear(); } store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.lastRecoveryEvent = null; try { writeVerifiedAtomicFileSync(bakPath, bakRaw); } catch (_) {} const dg = store.getLastStorageError ? store.getLastStorageError() : store.lastStorageError; store.recordStorageError('saveToDisk', dg?.code || 'DISK_PERSISTENCE_WRITE_FAILED', dg?.message || 'Recovery persistence write or verification failed'); return false; } 
+        
         return true;
       } catch (e: any) { store.existingFileProtected = true; store.recordStorageError('loadFromDisk', 'UNRECOVERABLE_STORAGE_CORRUPTION', e?.message || 'Recovery failed'); return false; }
     };
