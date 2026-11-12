@@ -237,7 +237,7 @@ export interface BackupImportResult {
   unconfiguredChannels?: string[];
 }
 
-export interface schedulePersist {
+export interface IDataStore {
   assertValidOrganizationId(orgId: unknown): UUID;
   getCustomers(orgId: UUID): Customer[];
   getConversations(orgId: UUID): Conversation[];
@@ -383,7 +383,7 @@ class DatabaseStore implements IDataStore {
     this.existingFileProtected = false;
     this.existingFileProtectionReason = 'NONE'; 
     this.customPersistFilePath = customPath;
-    this.persistFilePath = customPath ? customPath : (resolveDurableDataPath(null).filePath || this.defaultPersistFilePath);'NONE';
+    this.persistFilePath = customPath ? customPath : (resolveDurableDataPath(null).filePath || this.defaultPersistFilePath);
   }
 
   /**
