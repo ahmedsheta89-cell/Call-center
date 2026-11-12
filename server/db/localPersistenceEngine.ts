@@ -110,10 +110,9 @@ export function writeVerifiedAtomicFileSync(target: string, content: string): vo
 
 export function isValidSnapshotObject(p: any): boolean {
   if (!p || typeof p !== 'object' || Array.isArray(p) || !Array.isArray(p.organizations) || p.organizations.length === 0) return false;
-  if (p.schemaVersion !== undefined && (typeof p.schemaVersion !== 'number' || !Number.isInteger(  if (p.schemaVersion !== undefined && (typeof p.schemaVersion !== 'number' || !Number.isInteger(p.schemaVersion) || p.schemaVersion < 1 || p.schemaVersion > CURRENT_SCHEMA_VERSION)) return false; const orgIds = new Set<string>(); for (const o of p.organizations) { if (!o || typeof o !== 'object' || typeof o.id !== 'string' || !o.id.trim()) return false; orgIds.add(o.id); } for (const k of SCHEMA_V2_COLLECTION_KEYS) { if (p[k] !== undefined && !Array.isArray(p[k])) return false; } for (const k of ['users', 'tickets', 'conversations', 'calls', 'agents', 'teams', 'customers', 'channelConfigs']) { if (Array.isArray(p[k])) { for (const r of p[k]) { if (!r || typeof r !== 'object' || typeof r.id !== 'string' || !r.id.trim() || (typeof r.organizationId === 'string' && r.organizationId && !orgIds.has(r.organizationId))) return false; } } }p.schemaVersion) || p.schemaVersion < 1 || p.schemaVersion > CURRENT_SCHEMA_VERSION)) return false;
+  if (p.schemaVersion !== undefined && (typeof p.schemaVersion !== 'number' || p.schemaVersion < 1 || p.schemaVersion > CURRENT_SCHEMA_VERSION)) return false; for (const o of p.organizations) { if (!o || typeof o !== 'object' || typeof o.id !== 'string' || !o.id) return false; } for (const k of SCHEMA_V2_COLLECTION_KEYS) { if (p[k] !== undefined && !Array.isArray(p[k])) return false; } for (const k of ['users', 'tickets', 'conversations', 'calls', 'agents', 'teams', 'customers', 'channelConfigs']) { if (Array.isArray(p[k])) { for (const r of p[k]) { if (!r || typeof r !== 'object' || typeof r.id !== 'string' || !r.id) return false; if (typeof r.organizationId === 'string' && r.organizationId) { let f = false; for (const o of p.organizations) { if (o.id === r.organizationId) f = true; } if (!f) return false; } } } }
   return true;
 }
-
 export function preserveLastKnownGoodBackup(primary: string, newContent?: string): string {
   const bak = primary + '.bak';
   if (fs.existsSync(primary)) {
