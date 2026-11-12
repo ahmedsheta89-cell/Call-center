@@ -130,7 +130,7 @@ export function preserveLastKnownGoodBackup(primary: string, newContent?: string
 export function quarantineCorruptFile(corruptPath: string): string | null {
   if (!fs.existsSync(corruptPath)) return null;
   const q = corruptPath + '.corrupt.' + Date.now() + '.json';
-  try { const r = fs.readFileSync(corruptPath); const fd = fs.openSync(corruptPath); const fd2 = fs.openSync(q, 'w', 0o600); fs.writeFileSync(fd2, r); try { fs.fsyncSync(fd2); } catch (_) {} fs.closeSync(fd2); return q; } catch (_) { return null; }
+  try { const r = fs.readFileSync(corruptPath); const fd = fs.openSync(corruptPath, 'r'); const fd2 = fs.openSync(q, 'w', 0o600); fs.writeFileSync(fd2, r); try { fs.fsyncSync(fd2); } catch (_) {} fs.closeSync(fd2); return q; } catch (_) { return null; }
 }
 
 export function validateAndMigrateSchemaPayload(p: any, target: string, simFail = false) {
