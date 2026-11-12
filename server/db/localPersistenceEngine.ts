@@ -163,7 +163,7 @@ export function installDurableStoreLifecycle(store: any): void {
       preserveLastKnownGoodBackup(targetPath, serialized);
       store.lastStorageError = null;
       return true;
-    } catch (e: any) { store.recordStorageError('saveToDisk', e?.code || 'DISK_WRITE_FAILED', e?.message || 'Failed atomic write'); return false; }
+    } catch (e: any) { store.recordStorageError('saveToDisk', 'DISK_PERSISTENCE_WRITE_FAILED', e?.message || 'Failed atomic write'); return false; }
   };
 
   store.loadFromDisk = (): boolean => {
@@ -194,8 +194,8 @@ export function installDurableStoreLifecycle(store: any): void {
     };
     if (!fs.existsSync(targetPath)) return fs.existsSync(bakPath) ? tryRecover('PRIMARY_MISSING', 'Primary missing', false) : (store.recordStorageError('loadFromDisk', 'FILE_NOT_FOUND', 'Not found: ' + targetPath), false);
     let raw: string, parsed: any;
-    try { raw = fs.readFileSync(targetPath, 'utf8'); } catch (e: any) { store.recordStorageError('loadFromDisk', e?.code || 'DISK_READ_FAILED', e?.message || 'Read failed'); return false; }
-    try { parsed = JSON.parse(raw); } catch (e: any) { return tryRecover('DISK_LOAD_PARSE_ERROR', e?.message || 'Parse error', true); }
+    try { raw = fs.readFileSync(targetPath, 'utf8'); } catch (e: any) { store.recordStorageError('loadFromDisk', 'DISK_PERSISTENCE_READ_FAILED', e?.message || 'Read failed'); return false; }
+    try { parsed = JSON.parse(raw); } catch (e: any) { return tryRecover('DISK_PERSISTENCE_READ_FAILED', e?.message || 'Parse error', true); }
     const sc = validateAndMigrateSchemaPayload(parsed, targetPath);
     if (!sc.ok) {
       if (sc.errorCode === 'UNSUPPORTED_FUTURE_SCHEMA_VERSION' || sc.errorCode === 'INVALID_SCHEMA_VERSION' || sc.errorCode === 'UNSUPPORTED_LEGACY_FORMAT') { store.existingFileProtected = true; store.existingFileProtectionReason = 'CORRUPTED_OR_EMPTY'; store.recordStorageError('loadFromDisk', sc.errorCode, sc.errorMessage || 'Invalid schema'); return false; }
