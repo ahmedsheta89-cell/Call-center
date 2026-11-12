@@ -18,7 +18,9 @@ let activeDbRef: { flushPendingPersist: () => boolean; getPersistFilePath: () =>
 const gracefulShutdown = () => {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  let isFinalized = false; 
   const finalize = () => {
+    if (isFinalized) return; isFinalized = true; clearTimeout(t);
     let ok = true;
     try { if (activeDbRef) ok = activeDbRef.flushPendingPersist() !== false; } catch (_) { ok = false; }
     const rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
