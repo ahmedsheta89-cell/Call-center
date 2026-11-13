@@ -13,16 +13,16 @@ const durableDataPath = resolveDurableDataPath();
 if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process.exit(1); }
 const bootLock = acquireDirectoryLock(durableDataPath.filePath);
 if (!bootLock.ok) { console.error(`[Fatal Storage Lock] ${bootLock.errorCode}: ${bootLock.errorMessage}`); process.exit(1); }
-let isShuttingDown = false;
-let activeDbRef: { flushPendingPersist: () => boolean; getPersistFilePath: () => string } | null = null;
-const gracefulShutdown = () => {
+let isShuttingDown = false, isFinalized = false, isBootstrapReady = false, bootstrapFailed = false, canFlushPersistence = false;
+let activeDbRef: { flushPendingPersist: () => boolean; getPersistFilePath: () => string; isDiskOverwriteProtected?: () => boolean } | null = null;
+const gracefulShutdown = (fatalBootstrap: unknown = false) => {
+  if (fatalBootstrap === true) { bootstrapFailed = true; isBootstrapReady = false; }
   if (isShuttingDown) return;
-  isShuttingDown = true;
-  let isFinalized = false; 
+  isShuttingDown = true; isBootstrapReady = false;
   const finalize = () => {
     if (isFinalized) return; isFinalized = true; clearTimeout(t);
-    let ok = true;
-    try { if (activeDbRef) ok = activeDbRef.flushPendingPersist() !== false; } catch (_) { ok = false; }
+    let ok = !bootstrapFailed;
+    
     const rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
     process.exit(ok && rel ? 0 : 1);
   };
@@ -56,7 +56,7 @@ app.get('/api/health', async (_req, res) => {
       });
     }
   }
-  res.json({
+  if (!isBootstrapReady || bootstrapFailed || isShuttingDown) return res.status(503).json({ status: bootstrapFailed ? "unhealthy" : "starting", code: bootstrapFailed ? "BOOTSTRAP_FAILED" : "BOOTSTRAP_NOT_READY" }res.json({);   res.json({
     status: 'healthy',
     system: 'AI Contact Center OS',
     version: '1.0.2-enterprise',
@@ -127,15 +127,13 @@ import('./server/core/identity.ts'),
       console.error(
         `[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`
       );
-      releaseDirectoryLock(db.getPersistFilePath() || durableDataPath.filePath);
-      process.exit(1);
+          gracefulShutdown(true);
+            throw new Error("[Storage] Protected persistence file cannot be overwritten.");
     } else {
       console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
       initializeSeedData();
-      db.saveToDisk();
-      ensureEgyptSpecialCustomer();
-      ensureAdminUser();
-        if (!restored) db.saveToDisk();
+  if (      ensureEgyptSpecialCustomer();
+      !restored) db.saveToDisk();
     }
   } else {
     console.log('[Storage] Loaded live state from disk successfully.');
