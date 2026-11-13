@@ -134,8 +134,8 @@ import('./server/core/identity.ts'),
       initializeSeedData();
       db.saveToDisk();
       ensureEgyptSpecialCustomer();
-        if (!restored) db.saveToDisk();;
       ensureAdminUser();
+        if (!restored) db.saveToDisk();
     }
   } else {
     console.log('[Storage] Loaded live state from disk successfully.');
