@@ -139,7 +139,7 @@ import('./server/core/identity.ts'),
     console.log("[Storage] Loaded live state from disk successfully.");
     ensureEgyptSpecialCustomer();
     ensureAdminUser(); if (!db.saveToDisk()) throw new Error("[Storage] Final bootstrap persistence failed."); canFlushPersistence = true;
-} D
+} 
   // 2. ynamic PWA Binary Icon Serving
   ensurePwaIconsGenerated();
 
