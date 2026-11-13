@@ -162,7 +162,7 @@ export function installDurableStoreLifecycle(store: any): void {
     const pathRes = resolveDurableDataPath(store.customPersistFilePath ?? null);
     const targetPath = pathRes.ok ? pathRes.filePath : '';
         if (!pathRes.ok || !targetPath) { store.recordStorageError('saveToDisk', 'DISK_PERSISTENCE_WRITE_FAILED', pathRes.errorMessage || 'Invalid storage path'); return false; }
-        if (store.persistTimer) { clearTimeout(store.persistTimer); store.persistTimer = null; } s
+        if (store.persistTimer) { clearTimeout(store.persistTimer); store.persistTimer = null; } 
         store.persistFilePath = targetPath;
     const ok = origSave();
     if (ok && fs.existsSync(targetPath)) { try { preserveLastKnownGoodBackup(targetPath, fs.readFileSync(targetPath, 'utf8')); } catch (_) {} }
