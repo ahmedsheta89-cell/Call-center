@@ -56,7 +56,7 @@ app.get('/api/health', async (_req, res) => {
       });
     }
   }
-  if (!isBootstrapReady || bootstrapFailed || isShuttingDown) return res.status(503).json({ status: bootstrapFailed ? "unhealthy" : "starting", code: bootstrapFailed ? "BOOTSTRAP_FAILED" : "BOOTSTRAP_NOT_READY" }res.json({);   res.json({
+    if (!isBootstrapReady || bootstrapFailed || isShuttingDown) return res.status(503).json({ status: bootstrapFailed ? "unhealthy" : "starting", code: bootstrapFailed ? "BOOTSTRAP_FAILED" : "BOOTSTRAP_NOT_READY" }); res.json({
     status: 'healthy',
     system: 'AI Contact Center OS',
     version: '1.0.2-enterprise',
@@ -122,26 +122,25 @@ import('./server/core/identity.ts'),
   // 1. Initialize Seed Data or Load from Persistent Storage
   activeDbRef = db;
     const restored = db.loadFromDisk();
-  if (!restored) {
+    if (!restored) {
     if (db.isDiskOverwriteProtected()) {
-      console.error(
-        `[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`
-      );
-          gracefulShutdown(true);
-            throw new Error("[Storage] Protected persistence file cannot be overwritten.");
+      console.error(`[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`);
+      gracefulShutdown(true);
+      throw new Error("[Storage] Protected persistence file cannot be overwritten.");
     } else {
-      console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
+      console.log("[Storage] Initializing fresh enterprise dataset and saving to persistent storage...");
       initializeSeedData();
-  if (      ensureEgyptSpecialCustomer();
-      !restored) db.saveToDisk();
+      ensureEgyptSpecialCustomer();
+      ensureAdminUser();
+      if (!db.saveToDisk()) throw new Error("[Storage] Initial seed persistence failed.");
+      canFlushPersistence = true;
     }
   } else {
-    console.log('[Storage] Loaded live state from disk successfully.');
+    console.log("[Storage] Loaded live state from disk successfully.");
     ensureEgyptSpecialCustomer();
-    ensureAdminUser();
-  }
-
-  // 2. Dynamic PWA Binary Icon Serving
+    ensureAdminUser(); if (!db.saveToDisk()) throw new Error("[Storage] Final bootstrap persistence failed."); canFlushPersistence = true;
+} D
+  // 2. ynamic PWA Binary Icon Serving
   ensurePwaIconsGenerated();
 
   const innerRouter = express.Router();
