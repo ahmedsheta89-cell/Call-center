@@ -8,7 +8,7 @@ import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
 import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from './server/db/localPersistenceEngine.ts';
-dotenv.config(); if (process.env.NODE_ENV !== "production" && process.env.CHANNEL_SECRET_ENCRYPTION_KEY === undefined) process.env.CHANNEL_SECRET_ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+dotenv.config(); if (process.env.NODE_ENV !== "production" && process.env.CHANNEL_SECRET_ENCRYPTION_KEY === undefined) process.env.CHANNEL_SECRET_ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; if (process.env.NODE_ENV !== "production" && process.env.AUDIT_CHECKPOINT_HMAC_KEY === undefined) process.env.AUDIT_CHECKPOINT_HMAC_KEY = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const durableDataPath = resolveDurableDataPath();
 if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process.exit(1); }
 const bootLock = acquireDirectoryLock(durableDataPath.filePath);
