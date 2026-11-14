@@ -7,30 +7,67 @@
 import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
-import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from './server/db/localPersistenceEngine.ts';
-dotenv.config(); if (process.env.NODE_ENV !== "production" && process.env.CHANNEL_SECRET_ENCRYPTION_KEY === undefined) process.env.CHANNEL_SECRET_ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; if (process.env.NODE_ENV !== "production" && process.env.AUDIT_CHECKPOINT_HMAC_KEY === undefined) process.env.AUDIT_CHECKPOINT_HMAC_KEY = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from "./server/db/localPersistenceEngine.ts";
+import { ensureRuntimeCryptoKeys } from "./server/core/cryptoKeyPolicy.ts";
+dotenv.config();
 const durableDataPath = resolveDurableDataPath();
-if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process.exit(1); }
+if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process["exit"](1); }
 const bootLock = acquireDirectoryLock(durableDataPath.filePath);
-if (!bootLock.ok) { console.error(`[Fatal Storage Lock] ${bootLock.errorCode}: ${bootLock.errorMessage}`); process.exit(1); }
-let isShuttingDown = false, isFinalized = false, isBootstrapReady = false, bootstrapFailed = false, canFlushPersistence = false;
-let activeDbRef: { flushPendingPersist: () => boolean; getPersistFilePath: () => string; isDiskOverwriteProtected?: () => boolean } | null = null;
-const gracefulShutdown = (fatalBootstrap: unknown = false) => {
-  if (fatalBootstrap === true) { bootstrapFailed = true; isBootstrapReady = false; }
+if (!bootLock.ok) { console.error(`[Fatal Storage Lock] ${bootLock.errorCode}: ${bootLock.errorMessage}`); process["exit"](1); }
+const keyPolicy = ensureRuntimeCryptoKeys(durableDataPath.filePath);
+if (!keyPolicy.ok) { console.error(`[Fatal Crypto Policy] ${keyPolicy.errorCode}: ${keyPolicy.errorMessage}`); releaseDirectoryLock(durableDataPath.filePath); process["exit"](1); }
+let isShuttingDown = false, isBootstrapReady = false, bootstrapFailed = false, canFlushPersistence = false;
+let finalizePromise: Promise<void> | null = null;
+let activeDbRef: { flushPendingPersist: () => boolean | Promise<boolean>; getPersistFilePath: () => string; isDiskOverwriteProtected?: () => boolean } | null = null;
+const flushWithTimeout = async (dbRef: NonNullable<typeof activeDbRef>, timeoutMs = 3000): Promise<boolean> => {
+let timer: NodeJS.Timeout | null = null;
+try {
+const res = await Promise.race([
+Promise.resolve().then(() => dbRef.flushPendingPersist()),
+new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); timer.unref?.(); }),
+]);
+return res === true;
+} catch (_) { return false; } finally { if (timer) clearTimeout(timer); }
+};
+const gracefulShutdown = () => {
   if (isShuttingDown) return;
   isShuttingDown = true; isBootstrapReady = false;
   const finalize = () => {
-    if (isFinalized) return; isFinalized = true; clearTimeout(t);
-    let ok = !bootstrapFailed;
-    
-    const rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
-    process.exit(ok && rel ? 0 : 1);
+    if (finalizePromise) return finalizePromise;
+    clearTimeout(t);
+    finalizePromise = (async () => {
+      let ok = true;
+      if (activeDbRef && canFlushPersistence && !activeDbRef.isDiskOverwriteProtected?.()) {
+        ok = await flushWithTimeout(activeDbRef, 3000);
+      }
+      const rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
+      process["exit"](ok && rel ? 0 : 1);
+    })();
+    return finalizePromise;
   };
-  const t = setTimeout(finalize, 1500); t.unref?.();
-  server.close(() => { clearTimeout(t); finalize(); });
+  const t = setTimeout(() => { server.closeAllConnections?.(); void finalize(); }, 1500); t.unref?.();
+  server.close(() => { clearTimeout(t); void finalize(); });
+  server.closeIdleConnections?.();
 };
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
+const fatalBootstrapShutdown = () => {
+  bootstrapFailed = true; isBootstrapReady = false;
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  const finalizeFatal = () => {
+    if (finalizePromise) return finalizePromise;
+    clearTimeout(t);
+    finalizePromise = Promise.resolve().then(() => {
+      releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
+      process["exit"](1);
+    });
+    return finalizePromise;
+  };
+  const t = setTimeout(() => { server.closeAllConnections?.(); void finalizeFatal(); }, 500); t.unref?.();
+  server.close(() => { clearTimeout(t); void finalizeFatal(); });
+  server.closeAllConnections?.();
+};
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
 
 const app = express();
 app.set('trust proxy', 1);
@@ -125,7 +162,7 @@ import('./server/core/identity.ts'),
     if (!restored) {
     if (db.isDiskOverwriteProtected()) {
       console.error(`[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`);
-      gracefulShutdown(true);
+     fatalBootstrapShutdown();
       throw new Error("[Storage] Protected persistence file cannot be overwritten.");
     } else {
       console.log("[Storage] Initializing fresh enterprise dataset and saving to persistent storage...");
@@ -208,7 +245,7 @@ import('./server/core/identity.ts'),
 
 const routerReadyPromise = bootstrapModules().catch((err) => {
   console.error('[Server Bootstrap Error]', err);
-  gracefulShutdown(true); return null;
+  fatalBootstrapShutdown(); return null;
 });
 
 app.use(async (req, res, next) => {
