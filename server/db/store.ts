@@ -360,7 +360,7 @@ class DatabaseStore implements IDataStore {
     return this.existingFileProtected;
   }
     private readonly _durableLifecycleBound = installDurableStoreLifecycle(this);
-  
+    public hasPendingPersist(): boolean { return this.persistTimer !== null; }
     public flushPendingPersist(): boolean {
           if (this.persistTimer) {
                   clearTimeout(this.persistTimer);
