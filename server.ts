@@ -8,7 +8,7 @@ import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
 import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from './server/db/localPersistenceEngine.ts';
-dotenv.config();
+dotenv.config(); if (process.env.NODE_ENV !== "production" && process.env.CHANNEL_SECRET_ENCRYPTION_KEY === undefined) process.env.CHANNEL_SECRET_ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const durableDataPath = resolveDurableDataPath();
 if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process.exit(1); }
 const bootLock = acquireDirectoryLock(durableDataPath.filePath);
@@ -203,18 +203,18 @@ import('./server/core/identity.ts'),
     });
   }
 
-  return innerRouter;
+  isBootstrapReady = true; return innerRouter;
 }
 
 const routerReadyPromise = bootstrapModules().catch((err) => {
   console.error('[Server Bootstrap Error]', err);
-  throw err;
+  gracefulShutdown(true); return null;
 });
 
 app.use(async (req, res, next) => {
   try {
     const initializedRouter = await routerReadyPromise;
-    initializedRouter(req, res, next);
+    if (!initializedRouter || !isBootstrapReady || bootstrapFailed || isShuttingDown) return res.status(503).json({ status: "unhealthy", code: "BOOTSTRAP_FAILED" }); initializedRouter(req, res, next);
   } catch (err) {
     next(err);
   }
