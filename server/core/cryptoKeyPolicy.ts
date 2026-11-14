@@ -55,7 +55,7 @@ export function ensureRuntimeCryptoKeys(persistFilePath: string): KeyProvisionin
       return { ok: false, env, source: "none", errorCode: chCheck.code || "CHANNEL_SECRET_KEY_INVALID", errorMessage: "CHANNEL_SECRET_ENCRYPTION_KEY is missing or invalid for runtime environment." };
     }
     const auCheck = validateAuditHmacKey();
-    if (!auCheck.ok) {
+    if (!auCheck.valid) {
       return { ok: false, env, source: "none", errorCode: auCheck.code || "AUDIT_KEY_INVALID", errorMessage: "AUDIT_CHECKPOINT_HMAC_KEY is missing or invalid for runtime environment." };
     }
     return { ok: true, env, source: "env" };
@@ -70,7 +70,7 @@ export function ensureRuntimeCryptoKeys(persistFilePath: string): KeyProvisionin
       if (!hasAuditEnv) process.env.AUDIT_CHECKPOINT_HMAC_KEY = k2;
       const chCheck = validateChannelEncryptionKey(process.env.CHANNEL_SECRET_ENCRYPTION_KEY);
       const auCheck = validateAuditHmacKey();
-      if (!chCheck.valid || !auCheck.ok) {
+      if (!chCheck.valid || !auCheck.valid) {
         return { ok: false, env, source: "none", errorCode: "DEV_KEYFILE_CORRUPTED", errorMessage: "Local development keyfile failed validation.", keyFilePath };
       }
       return { ok: true, env, source: "dev_keyfile_existing", keyFilePath };
