@@ -7,8 +7,90 @@
 import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
-
+import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from "./server/db/localPersistenceEngine.ts";
+import { ensureRuntimeCryptoKeys } from "./server/core/cryptoKeyPolicy.ts";
 dotenv.config();
+const durableDataPath = resolveDurableDataPath();
+if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process["exit"](1); }
+const bootLock = acquireDirectoryLock(durableDataPath.filePath);
+if (!bootLock.ok) { console.error(`[Fatal Storage Lock] ${bootLock.errorCode}: ${bootLock.errorMessage}`); process["exit"](1); }
+const keyPolicy = ensureRuntimeCryptoKeys(durableDataPath.filePath);
+if (!keyPolicy.ok) { console.error(`[Fatal Crypto Policy] ${keyPolicy.errorCode}: ${keyPolicy.errorMessage}`); releaseDirectoryLock(durableDataPath.filePath); process["exit"](1); }
+let isShuttingDown = false, isBootstrapReady = false, bootstrapFailed = false, canFlushPersistence = false;
+let finalizePromise: Promise<void> | null = null;
+let activeDbRef: { flushPendingPersist: (signal?: AbortSignal) => boolean | Promise<boolean>; hasPendingPersist?: () => boolean; getPersistFilePath: () => string; isDiskOverwriteProtected?: () => boolean } | null = null;
+const flushWithTimeout = async (dbRef: NonNullable<typeof activeDbRef>, timeoutMs = 3000): Promise<{ ok: boolean; settled: boolean }> => {
+  const abortController = new AbortController();
+  let settled = false, timer: NodeJS.Timeout | null = null;
+  const flushPromise = Promise.resolve().then(() => dbRef.flushPendingPersist(abortController.signal)).then((r) => ({ ok: r === true, timedOut: false }), () => ({ ok: false, timedOut: false })).finally(() => { settled = true; });
+  try {
+    const res = await Promise.race([
+      flushPromise,
+      new Promise<{ ok: boolean; timedOut: boolean }>((resolve) => { timer = setTimeout(() => resolve({ ok: false, timedOut: true }), timeoutMs); timer.unref?.(); }),
+    ]);
+    if (res.timedOut && !settled) {
+      abortController.abort();
+      await Promise.race([flushPromise, new Promise<void>((r) => setTimeout(r, 200))]);
+      return { ok: false, settled };
+    }
+    return { ok: res.ok, settled: true };
+  } finally { if (timer) clearTimeout(timer); }
+};
+const gracefulShutdown = () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true; isBootstrapReady = false;
+  const finalize = () => {
+    if (finalizePromise) return finalizePromise;
+    clearTimeout(t);
+    finalizePromise = (async () => {
+      let ok = true, canReleaseLock = true;
+      if (activeDbRef) {
+        const hasPending = activeDbRef.hasPendingPersist ? activeDbRef.hasPendingPersist() : true;
+        if (canFlushPersistence) {
+          if (activeDbRef.isDiskOverwriteProtected?.()) {
+            if (hasPending) { ok = false; console.error("[Shutdown Error] Pending writes cannot be flushed because storage is overwrite-protected."); }
+          } else {
+            const flushOutcome = await flushWithTimeout(activeDbRef, 3000);
+            ok = flushOutcome.ok;
+            canReleaseLock = flushOutcome.settled;
+          }
+        } else if (hasPending) {
+          ok = false; console.error("[Shutdown Error] Pending writes exist while canFlushPersistence is false.");
+        }
+      }
+      let rel = false;
+      if (canReleaseLock) {
+        rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
+      } else {
+        console.error("[Fatal Shutdown Error] Flush exceeded timeout and did not settle after abort; preserving directory lock.");
+      }
+      process["exit"](ok && rel ? 0 : 1);
+    })();
+    return finalizePromise;
+  };
+  const t = setTimeout(() => { server.closeAllConnections?.(); void finalize(); }, 1500); t.unref?.();
+  server.close(() => { clearTimeout(t); void finalize(); });
+  server.closeIdleConnections?.();
+};
+const fatalBootstrapShutdown = () => {
+  bootstrapFailed = true; isBootstrapReady = false;
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  const finalizeFatal = () => {
+    if (finalizePromise) return finalizePromise;
+    clearTimeout(t);
+    finalizePromise = Promise.resolve().then(() => {
+      releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
+      process["exit"](1);
+    });
+    return finalizePromise;
+  };
+  const t = setTimeout(() => { server.closeAllConnections?.(); void finalizeFatal(); }, 500); t.unref?.();
+  server.close(() => { clearTimeout(t); void finalizeFatal(); });
+  server.closeAllConnections?.();
+};
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
 
 const app = express();
 app.set('trust proxy', 1);
@@ -34,7 +116,7 @@ app.get('/api/health', async (_req, res) => {
       });
     }
   }
-  res.json({
+    if (!isBootstrapReady || bootstrapFailed || isShuttingDown) return res.status(503).json({ status: bootstrapFailed ? "unhealthy" : "starting", code: bootstrapFailed ? "BOOTSTRAP_FAILED" : "BOOTSTRAP_NOT_READY" }); res.json({
     status: 'healthy',
     system: 'AI Contact Center OS',
     version: '1.0.2-enterprise',
@@ -94,30 +176,31 @@ async function bootstrapModules() {
     import('./server/db/seed.ts'),
     import('./server/core/pwaAssets.ts'),
     import('./server/api/router.ts'),
-    import('./server/core/identity.ts'),
+import('./server/core/identity.ts'),
   ]);
 
   // 1. Initialize Seed Data or Load from Persistent Storage
-  const restored = db.loadFromDisk();
-  if (!restored) {
+  activeDbRef = db;
+    const restored = db.loadFromDisk();
+    if (!restored) {
     if (db.isDiskOverwriteProtected()) {
-      console.error(
-        `[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`
-      );
+      console.error(`[Storage] Existing persistence file could not be loaded/migrated (${db.getLastStorageError()?.code}); keeping existing file untouched.`);
+     fatalBootstrapShutdown();
+      throw new Error("[Storage] Protected persistence file cannot be overwritten.");
     } else {
-      console.log('[Storage] Initializing fresh enterprise dataset and saving to persistent storage...');
+      console.log("[Storage] Initializing fresh enterprise dataset and saving to persistent storage...");
       initializeSeedData();
-      db.saveToDisk();
       ensureEgyptSpecialCustomer();
       ensureAdminUser();
+      if (!db.saveToDisk()) throw new Error("[Storage] Initial seed persistence failed.");
+      canFlushPersistence = true;
     }
   } else {
-    console.log('[Storage] Loaded live state from disk successfully.');
+    console.log("[Storage] Loaded live state from disk successfully.");
     ensureEgyptSpecialCustomer();
-    ensureAdminUser();
-  }
-
-  // 2. Dynamic PWA Binary Icon Serving
+    ensureAdminUser(); if (!db.saveToDisk()) throw new Error("[Storage] Final bootstrap persistence failed."); canFlushPersistence = true;
+} 
+  // 2. ynamic PWA Binary Icon Serving
   ensurePwaIconsGenerated();
 
   const innerRouter = express.Router();
@@ -180,18 +263,18 @@ async function bootstrapModules() {
     });
   }
 
-  return innerRouter;
+  isBootstrapReady = true; return innerRouter;
 }
 
 const routerReadyPromise = bootstrapModules().catch((err) => {
   console.error('[Server Bootstrap Error]', err);
-  throw err;
+  fatalBootstrapShutdown(); return null;
 });
 
 app.use(async (req, res, next) => {
   try {
     const initializedRouter = await routerReadyPromise;
-    initializedRouter(req, res, next);
+    if (!initializedRouter || !isBootstrapReady || bootstrapFailed || isShuttingDown) return res.status(503).json({ status: "unhealthy", code: "BOOTSTRAP_FAILED" }); initializedRouter(req, res, next);
   } catch (err) {
     next(err);
   }
