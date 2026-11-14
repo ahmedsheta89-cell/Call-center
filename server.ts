@@ -18,16 +18,23 @@ const keyPolicy = ensureRuntimeCryptoKeys(durableDataPath.filePath);
 if (!keyPolicy.ok) { console.error(`[Fatal Crypto Policy] ${keyPolicy.errorCode}: ${keyPolicy.errorMessage}`); releaseDirectoryLock(durableDataPath.filePath); process["exit"](1); }
 let isShuttingDown = false, isBootstrapReady = false, bootstrapFailed = false, canFlushPersistence = false;
 let finalizePromise: Promise<void> | null = null;
-let activeDbRef: { flushPendingPersist: () => boolean | Promise<boolean>; getPersistFilePath: () => string; isDiskOverwriteProtected?: () => boolean } | null = null;
-const flushWithTimeout = async (dbRef: NonNullable<typeof activeDbRef>, timeoutMs = 3000): Promise<boolean> => {
-let timer: NodeJS.Timeout | null = null;
-try {
-const res = await Promise.race([
-Promise.resolve().then(() => dbRef.flushPendingPersist()),
-new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); timer.unref?.(); }),
-]);
-return res === true;
-} catch (_) { return false; } finally { if (timer) clearTimeout(timer); }
+let activeDbRef: { flushPendingPersist: (signal?: AbortSignal) => boolean | Promise<boolean>; hasPendingPersist?: () => boolean; getPersistFilePath: () => string; isDiskOverwriteProtected?: () => boolean } | null = null;
+const flushWithTimeout = async (dbRef: NonNullable<typeof activeDbRef>, timeoutMs = 3000): Promise<{ ok: boolean; settled: boolean }> => {
+  const abortController = new AbortController();
+  let settled = false, timer: NodeJS.Timeout | null = null;
+  const flushPromise = Promise.resolve().then(() => dbRef.flushPendingPersist(abortController.signal)).then((r) => ({ ok: r === true, timedOut: false }), () => ({ ok: false, timedOut: false })).finally(() => { settled = true; });
+  try {
+    const res = await Promise.race([
+      flushPromise,
+      new Promise<{ ok: boolean; timedOut: boolean }>((resolve) => { timer = setTimeout(() => resolve({ ok: false, timedOut: true }), timeoutMs); timer.unref?.(); }),
+    ]);
+    if (res.timedOut && !settled) {
+      abortController.abort();
+      await Promise.race([flushPromise, new Promise<void>((r) => setTimeout(r, 200))]);
+      return { ok: false, settled };
+    }
+    return { ok: res.ok, settled: true };
+  } finally { if (timer) clearTimeout(timer); }
 };
 const gracefulShutdown = () => {
   if (isShuttingDown) return;
@@ -36,11 +43,27 @@ const gracefulShutdown = () => {
     if (finalizePromise) return finalizePromise;
     clearTimeout(t);
     finalizePromise = (async () => {
-      let ok = true;
-      if (activeDbRef && canFlushPersistence && !activeDbRef.isDiskOverwriteProtected?.()) {
-        ok = await flushWithTimeout(activeDbRef, 3000);
+      let ok = true, canReleaseLock = true;
+      if (activeDbRef) {
+        const hasPending = activeDbRef.hasPendingPersist ? activeDbRef.hasPendingPersist() : true;
+        if (canFlushPersistence) {
+          if (activeDbRef.isDiskOverwriteProtected?.()) {
+            if (hasPending) { ok = false; console.error("[Shutdown Error] Pending writes cannot be flushed because storage is overwrite-protected."); }
+          } else {
+            const flushOutcome = await flushWithTimeout(activeDbRef, 3000);
+            ok = flushOutcome.ok;
+            canReleaseLock = flushOutcome.settled;
+          }
+        } else if (hasPending) {
+          ok = false; console.error("[Shutdown Error] Pending writes exist while canFlushPersistence is false.");
+        }
       }
-      const rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
+      let rel = false;
+      if (canReleaseLock) {
+        rel = releaseDirectoryLock(activeDbRef?.getPersistFilePath() || durableDataPath.filePath);
+      } else {
+        console.error("[Fatal Shutdown Error] Flush exceeded timeout and did not settle after abort; preserving directory lock.");
+      }
       process["exit"](ok && rel ? 0 : 1);
     })();
     return finalizePromise;
