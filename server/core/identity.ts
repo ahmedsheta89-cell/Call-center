@@ -811,6 +811,9 @@ function verifyCsrfForCookieMutation(
 
 const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
   '/auth/login',
+  '/auth/local-owner/status',
+  '/auth/local-owner/bootstrap',
+  '/auth/local-owner/login',
   '/platforms/download/android',
   '/platforms/download/windows',
 ]);

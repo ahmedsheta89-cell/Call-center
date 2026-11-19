@@ -43,6 +43,13 @@ import { AIGateway } from '../modules/ai/gateway.ts';
 import { UnifiedMessage, UUID, Ticket, CallSession } from '../core/types.ts';
 import { EventBus } from '../core/events.ts';
 import { ensurePwaIconsGenerated, PWA_ICON_TMP_DIR } from '../core/pwaAssets.ts';
+import {
+  initLocalOwnerAuth,
+  completeLocalOwnerBootstrap,
+  authenticateLocalOwner,
+  completeLocalOwnerBootstrapAsync,
+  authenticateLocalOwnerAsync,
+} from '../core/localAuth.ts';
 
 export const apiRouter = Router();
 
@@ -124,7 +131,7 @@ apiRouter.use(authenticateApiRequest);
 // Organization context is derived exclusively from the verified session. Any request body attempting
 // to pass an empty/invalid/unregistered organizationId (400) or a cross-tenant organizationId (403) is rejected.
 apiRouter.use((req: Request, res: Response, next) => {
-  if (req.path === '/system/restore') {
+  if (req.path === '/system/restore' || req.path.startsWith('/auth/')) {
     next();
     return;
   }
@@ -300,6 +307,106 @@ apiRouter.get('/admin/profile', (req: Request, res: Response) => {
   });
 });
 
+apiRouter.get('/auth/local-owner/status', (_req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const status = initLocalOwnerAuth(dataDir);
+  res.json({ success: true, data: status });
+});
+
+apiRouter.post('/auth/local-owner/bootstrap', async (req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const { bootstrapToken, username, password, email, fullName } = req.body || {};
+  const clientIp = String(req.ip || req.socket?.remoteAddress || '127.0.0.1');
+  if (!bootstrapToken || !username || !password) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MISSING_REQUIRED_FIELDS', message: 'bootstrapToken, username, and password are required.' },
+    });
+    return;
+  }
+  const outcome = await completeLocalOwnerBootstrapAsync(dataDir, {
+    bootstrapToken,
+    username,
+    password,
+    email,
+    fullName,
+    ip: clientIp,
+  });
+  if (!outcome.ok) {
+    const isRateLimited = outcome.errorCode === 'TOO_MANY_FAILED_ATTEMPTS';
+    const isUnavailable = outcome.errorCode === 'AUTH_SUBSYSTEM_BUSY' || outcome.errorCode === 'AUTH_SUBSYSTEM_UNAVAILABLE';
+    res.status(isRateLimited ? 429 : isUnavailable ? 503 : 400).json({
+      success: false,
+      error: { code: outcome.errorCode, message: outcome.errorMessage },
+    });
+    return;
+  }
+  res.json({
+    success: true,
+    data: { message: 'Local Owner account successfully provisioned. You can now login.' },
+  });
+});
+
+apiRouter.post('/auth/local-owner/login', async (req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const { username, password, ttlMs } = req.body || {};
+  const clientIp = String(req.ip || req.socket?.remoteAddress || '127.0.0.1');
+
+  if (!username || !password) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'CREDENTIALS_REQUIRED', message: 'username and password are required.' },
+    });
+    return;
+  }
+
+  const authOutcome = await authenticateLocalOwnerAsync(dataDir, { username, password, ip: clientIp });
+  if (!authOutcome.ok) {
+    const isRateLimited = authOutcome.errorCode === 'TOO_MANY_FAILED_ATTEMPTS';
+    const isUnavailable = authOutcome.errorCode === 'AUTH_SUBSYSTEM_BUSY' || authOutcome.errorCode === 'AUTH_SUBSYSTEM_UNAVAILABLE';
+    res.status(isRateLimited ? 429 : isUnavailable ? 503 : 401).json({
+      success: false,
+      error: { code: authOutcome.errorCode, message: authOutcome.errorMessage },
+    });
+    return;
+  }
+
+  const user = authOutcome.user;
+  const { token, csrfToken, session, actor } = issueSessionToken({
+    userId: user.id,
+    activeRoleOverride: 'Owner',
+    ttlMs: typeof ttlMs === 'number' ? ttlMs : undefined,
+  });
+
+  AuditLogger.log({
+    organizationId: actor.organizationId,
+    actorId: actor.userId,
+    actorType: 'user',
+    action: 'auth.local_owner_session_issued',
+    entityType: 'session',
+    entityId: session.jti,
+    afterState: {
+      userId: actor.userId,
+      baseRole: actor.baseRole,
+      activeRole: actor.role,
+      method: 'local_scrypt_password',
+    },
+  });
+
+  res.setHeader('Set-Cookie', formatSessionCookie(req, token));
+  res.setHeader('X-CSRF-Token', csrfToken);
+  res.json({
+    success: true,
+    data: {
+      token,
+      csrfToken,
+      sessionId: session.jti,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      actor,
+    },
+  });
+});
+
 apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   const secretCheck = validateSessionSecretConfig();
   if (!secretCheck.valid) {
@@ -320,6 +427,7 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
     process.env.NODE_ENV === 'production' ||
     process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === 'true';
   const allowLocalTestLogin =
+    process.env.NODE_ENV === 'test' &&
     !isProductionOrLocked &&
     process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' &&
     isLoopbackRequest;

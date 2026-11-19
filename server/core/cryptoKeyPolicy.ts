@@ -17,6 +17,7 @@ export interface KeyProvisioningResult {
 
 export function classifyRuntimeEnvironment(rawEnv: string | undefined = process.env.NODE_ENV): RuntimeEnvironment {
   if (rawEnv === "production" || rawEnv === "development" || rawEnv === "test") return rawEnv;
+  if (!rawEnv || rawEnv.trim() === '') return "development";
   return "unknown";
 }
 

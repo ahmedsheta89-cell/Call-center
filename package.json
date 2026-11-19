@@ -1,19 +1,26 @@
 {
-  "name": "react-example",
+  "name": "omniflow-os",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.2",
   "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --outfile=dist-server/server.cjs",
     "start": "node dist-server/server.cjs",
     "preview": "vite preview",
-    "clean": "rm -rf dist dist-server server.js",
+    "clean": "node -e \"['dist','dist-server','server.js'].forEach(p=>{try{fs.rmSync(p,{recursive:true,force:true})}catch(e){}})\"",
     "lint": "tsc --noEmit",
-    "test": "OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true tsx server/test/run-enterprise-audit.ts",
-    "test:audit": "OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true tsx server/test/run-enterprise-audit.ts",
+    "test": "tsx server/test/run-enterprise-audit.ts",
+    "test:audit": "tsx server/test/run-enterprise-audit.ts",
     "test:firestore": "tsx server/test/firestore-rules-audit.ts",
-    "test:e2e": "OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true tsx scripts/test_all_operations.ts"
+    "test:isolation": "tsx scripts/test_workspace_isolation.ts",
+    "test:dr": "tsx scripts/test_disaster_recovery.ts",
+    "test:security": "tsx scripts/test_phase2_security.ts",
+    "owner:activate": "tsx scripts/activate_owner.ts",
+    "test:e2e": "tsx scripts/test_all_operations.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

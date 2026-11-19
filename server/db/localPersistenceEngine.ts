@@ -39,6 +39,13 @@ export function resolveDurableDataPath(customPath: string | null = null, envObj:
     if (!chk.ok) return { ok: false, filePath: path.join(dir, 'db_state.json'), dirPath: dir, source: 'OMNIFLOW_DATA_DIR', errorCode: chk.errorCode, errorMessage: chk.errorMessage };
     return { ok: true, filePath: path.join(dir, 'db_state.json'), dirPath: dir, source: 'OMNIFLOW_DATA_DIR' };
   }
+  const isolatedDir = path.resolve('F:\\Dev_Workspace\\Data\\OMNIFLOW_OS');
+  if (fs.existsSync(isolatedDir)) {
+    const chk = verifyDirectoryWritable(isolatedDir);
+    if (chk.ok) {
+      return { ok: true, filePath: path.join(isolatedDir, 'db_state.json'), dirPath: isolatedDir, source: 'PROJECT_ISOLATED_DATA_DIR' };
+    }
+  }
   const defDir = path.resolve(process.cwd(), 'data');
   return { ok: true, filePath: path.join(defDir, 'db_state.json'), dirPath: defDir, source: 'DEFAULT_DATA_DIR' };
 }
