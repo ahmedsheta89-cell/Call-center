@@ -3457,9 +3457,10 @@ const ALLOWED_WORKSPACE_ROOT_FILES = [
 ];
 
 const ALLOWED_WORKSPACE_DIRS = ['src', 'server', 'docs', 'scripts', '.github/workflows'];
-const ALLOWED_WORKSPACE_EXTENSIONS = /\.(ts|tsx|js|jsx|json|css|html|md|rules|yml|yaml|sql)$/;
+const ALLOWED_WORKSPACE_EXTENSIONS = /\.(ts|tsx|js|jsx|json|css|html|md|rules|yml|yaml|sql|ps1)$/;
 const ALLOWED_EXACT_WORKSPACE_FILE_PATHS = new Set([
   'docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256',
+  'scripts/windows/prepare_ntfs_acl_hardening.ps1',
 ]);
 const EXCLUDED_DIR_NAMES = new Set([
   'node_modules',
