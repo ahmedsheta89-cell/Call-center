@@ -427,7 +427,6 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
     process.env.NODE_ENV === 'production' ||
     process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === 'true';
   const allowLocalTestLogin =
-    process.env.NODE_ENV === 'test' &&
     !isProductionOrLocked &&
     process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' &&
     isLoopbackRequest;
