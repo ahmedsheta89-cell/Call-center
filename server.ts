@@ -256,14 +256,14 @@ async function bootstrapModules() {
   });
 
   // 4. Vite Middleware for Development / Static Serve for Production
-  if (process.env.NODE_ENV !== 'production') {
+  if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false, watch: null },
       appType: 'spa',
     });
     innerRouter.use(vite.middlewares);
-  } else {
+  } else if (process.env.NODE_ENV === 'production') {
     const distPath = path.join(process.cwd(), 'dist');
     // Security Gate: Never allow static exposure of server bundle or sourcemaps
     innerRouter.use((req, res, next) => {

@@ -18,8 +18,10 @@ import {
 import { ensureRuntimeCryptoKeys, classifyRuntimeEnvironment } from '../server/core/cryptoKeyPolicy.ts';
 import { issueSessionToken, verifySessionToken, validateSessionSecretConfig } from '../server/core/identity.ts';
 import { db } from '../server/db/store.ts';
+import express from 'express';
+import { apiRouter } from '../server/api/router.ts';
 
-function runPhase2SecurityVerificationSuite() {
+async function runPhase2SecurityVerificationSuite() {
   console.log('========================================================================');
   console.log('🔐  OMNIFLOW OS — PHASE 2 COMPREHENSIVE SECURITY VERIFICATION SUITE');
   console.log('========================================================================\n');
@@ -30,13 +32,13 @@ function runPhase2SecurityVerificationSuite() {
   fs.mkdirSync(testSandboxDir, { recursive: true, mode: 0o700 });
 
   let passed = 0;
-  const total = 9;
+  const total = 11;
 
   try {
     // -------------------------------------------------------------------------
     // TEST 1: Password Strength Invariants
     // -------------------------------------------------------------------------
-    console.log('[TEST 1/9] Testing Password Complexity Policy Enforcement...');
+    console.log('[TEST 1/11] Testing Password Complexity Policy Enforcement...');
     if (validatePasswordStrength('short').valid) throw new Error('Short password allowed');
     if (validatePasswordStrength('alllowercase123!').valid) throw new Error('Password without uppercase allowed');
     if (validatePasswordStrength('ALLUPPERCASE123!').valid) throw new Error('Password without lowercase allowed');
@@ -49,7 +51,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 2: Local Owner First-Run Bootstrap Flow
     // -------------------------------------------------------------------------
-    console.log('[TEST 2/9] Testing One-Time Owner Bootstrap Token & Credential Provisioning...');
+    console.log('[TEST 2/11] Testing One-Time Owner Bootstrap Token & Credential Provisioning...');
     const status1 = initLocalOwnerAuth(testSandboxDir);
     if (status1.status !== 'BOOTSTRAP_PENDING' || status1.configured !== false) {
       throw new Error(`Unexpected initial status: ${JSON.stringify(status1)}`);
@@ -117,7 +119,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 3: Local Owner Login & Constant-Time Scrypt Verification
     // -------------------------------------------------------------------------
-    console.log('[TEST 3/9] Testing Local Owner Authentication & Constant-Time Verification...');
+    console.log('[TEST 3/11] Testing Local Owner Authentication & Constant-Time Verification...');
     // Wrong password
     const wrongPw = authenticateLocalOwner(testSandboxDir, {
       username: 'localowner',
@@ -145,7 +147,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 4: Brute-Force Rate Limiting (5 Attempts Sliding Window)
     // -------------------------------------------------------------------------
-    console.log('[TEST 4/9] Testing Brute-Force Rate Limiting Defense...');
+    console.log('[TEST 4/11] Testing Brute-Force Rate Limiting Defense...');
     const testIp = '192.168.1.100';
     resetRateLimit(testIp);
 
@@ -169,7 +171,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 5: Cryptographic Key Durability & Environment Isolation
     // -------------------------------------------------------------------------
-    console.log('[TEST 5/9] Testing Cryptographic Key Durability Across Cold Restarts...');
+    console.log('[TEST 5/11] Testing Cryptographic Key Durability Across Cold Restarts...');
     const fakeDbPath = path.join(testSandboxDir, 'db_state.json');
     // Ensure clean state
     delete process.env.CHANNEL_SECRET_ENCRYPTION_KEY;
@@ -209,7 +211,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 6: Fail-Closed Protection Against Key Regeneration for Existing DB
     // -------------------------------------------------------------------------
-    console.log('[TEST 6/9] Testing Fail-Closed Protection on Missing Keys for Existing DB...');
+    console.log('[TEST 6/11] Testing Fail-Closed Protection on Missing Keys for Existing DB...');
     const orphanDbDir = path.join(testSandboxDir, 'orphan_db_dir');
     fs.mkdirSync(orphanDbDir, { recursive: true, mode: 0o700 });
     const orphanDbPath = path.join(orphanDbDir, 'db_state.json');
@@ -228,7 +230,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 7: Cryptographic Session Token Verification & Revocation
     // -------------------------------------------------------------------------
-    console.log('[TEST 7/9] Testing Session Token Issuance, Constant-Time Signature & Revocation...');
+    console.log('[TEST 7/11] Testing Session Token Issuance, Constant-Time Signature & Revocation...');
     // Seed test org and user in db
     db.organizations.set('org-sec-test', { id: 'org-sec-test', name: 'Security Test Org', isActive: true } as any);
     db.users.set('usr-sec-test', {
@@ -273,7 +275,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 8: TLS Configuration & CA File Verification
     // -------------------------------------------------------------------------
-    console.log('[TEST 8/9] Testing TLS Certificate Verification & CAfile Configuration...');
+    console.log('[TEST 8/11] Testing TLS Certificate Verification & CAfile Configuration...');
     const npmrcPath = path.resolve('F:\\Dev_Workspace\\Call-center\\.npmrc');
     const npmrcContent = fs.readFileSync(npmrcPath, 'utf8');
     if (npmrcContent.includes('strict-ssl=false')) {
@@ -301,7 +303,7 @@ function runPhase2SecurityVerificationSuite() {
     // -------------------------------------------------------------------------
     // TEST 9: Production Environment Fail-Closed Secret Requirements
     // -------------------------------------------------------------------------
-    console.log('[TEST 9/9] Testing Production Environment Strict Secret Validation...');
+    console.log('[TEST 9/11] Testing Production Environment Strict Secret Validation...');
     const prodWeak = validateSessionSecretConfig('production', 'weak_secret');
     if (prodWeak.valid) throw new Error('Short secret allowed in production');
 
@@ -317,6 +319,136 @@ function runPhase2SecurityVerificationSuite() {
     console.log('  ✅ [PASS] Production environment requires explicit >=32 char high-entropy SESSION_SECRET (fail-closed).\n');
     passed++;
 
+    // -------------------------------------------------------------------------
+    // TEST 10: Authentication Bypass Policy Enforcement (Strict Lockdown)
+    // -------------------------------------------------------------------------
+    console.log('[TEST 10/11] Testing Authentication Bypass Policy (Strict Lockdown)...');
+    const app = express();
+    app.use(express.json());
+    app.use('/api/v1', apiRouter);
+
+    const testServer = await new Promise<any>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const addr = testServer.address();
+    const testPort = typeof addr === 'object' ? addr.port : 0;
+    const testLoginUrl = `http://127.0.0.1:${testPort}/api/v1/auth/login`;
+
+    try {
+      const origNodeEnv = process.env.NODE_ENV;
+      const origAllow = process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN;
+
+      // 1. In NODE_ENV=development, raw userId login MUST be rejected even with OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true
+      process.env.NODE_ENV = 'development';
+      process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN = 'true';
+
+      const devRes = await fetch(testLoginUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'usr-sec-test' }),
+      });
+      if (devRes.status === 200) {
+        throw new Error('Authentication bypass was erroneously permitted in development mode');
+      }
+
+      // 2. In NODE_ENV=production, raw userId login MUST be rejected
+      process.env.NODE_ENV = 'production';
+      process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN = 'true';
+
+      const prodRes = await fetch(testLoginUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'usr-sec-test' }),
+      });
+      if (prodRes.status === 200) {
+        throw new Error('Authentication bypass was erroneously permitted in production mode');
+      }
+
+      // 3. In NODE_ENV=test and OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true from loopback, it is allowed
+      process.env.NODE_ENV = 'test';
+      process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN = 'true';
+
+      const testRes = await fetch(testLoginUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'usr-sec-test' }),
+      });
+      if (testRes.status !== 200) {
+        const errJson = await testRes.json().catch(() => ({}));
+        throw new Error(`Test login should be allowed in test mode from loopback, got status ${testRes.status}: ${JSON.stringify(errJson)}`);
+      }
+
+      // 4. In NODE_ENV=test without OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true, it is rejected
+      process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN = 'false';
+      const noFlagRes = await fetch(testLoginUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'usr-sec-test' }),
+      });
+      if (noFlagRes.status === 200) {
+        throw new Error('Test login without OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN flag should be rejected');
+      }
+
+      // Restore environment
+      process.env.NODE_ENV = origNodeEnv;
+      process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN = origAllow;
+
+      console.log('  ✅ [PASS] Authentication bypass rejected in development mode.');
+      console.log('  ✅ [PASS] Authentication bypass rejected in production mode.');
+      console.log('  ✅ [PASS] Authentication bypass strictly confined to NODE_ENV=test from loopback with explicit flag.\n');
+      passed++;
+    } finally {
+      testServer.close();
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 11: Owner Personal Data Privacy & Hygiene (Zero Unsolicited Contact Data)
+    // -------------------------------------------------------------------------
+    console.log('[TEST 11/11] Testing Owner Personal Data Privacy & Hygiene...');
+    const privacySandboxDir = path.join(testSandboxDir, 'privacy_sandbox');
+    fs.mkdirSync(privacySandboxDir, { recursive: true, mode: 0o700 });
+
+    initLocalOwnerAuth(privacySandboxDir);
+    const privTokenFile = path.join(privacySandboxDir, '.owner_bootstrap_token');
+    const privToken = JSON.parse(fs.readFileSync(privTokenFile, 'utf8')).token;
+
+    // Bootstrap without phone number
+    const noPhoneBootstrap = completeLocalOwnerBootstrap(privacySandboxDir, {
+      bootstrapToken: privToken,
+      username: 'priv_owner',
+      password: 'StrongLocalOwner#2026!',
+      email: 'priv_owner@local.test',
+      fullName: 'Privacy Owner',
+      // No phoneNumber supplied
+    });
+    if (!noPhoneBootstrap.ok) {
+      throw new Error(`Bootstrap failed: ${noPhoneBootstrap.errorMessage}`);
+    }
+
+    const privAuth = authenticateLocalOwner(privacySandboxDir, {
+      username: 'priv_owner',
+      password: 'StrongLocalOwner#2026!',
+    });
+    if (!privAuth.ok || !privAuth.user) {
+      throw new Error(`Auth failed: ${privAuth.errorMessage}`);
+    }
+
+    if (privAuth.user.phoneNumber !== null && privAuth.user.phoneNumber !== undefined) {
+      throw new Error(`Unsolicited phone number was stored on Owner: ${privAuth.user.phoneNumber}`);
+    }
+
+    // Verify schema file on disk has no hardcoded phone default
+    const schemaPath = path.resolve('src/db/schema.ts');
+    const schemaCode = fs.readFileSync(schemaPath, 'utf8');
+    if (schemaCode.includes(".default('01018108979')") || schemaCode.includes('01018108979')) {
+      throw new Error('Hardcoded personal phone number found in src/db/schema.ts');
+    }
+
+    console.log('  ✅ [PASS] Owner bootstrap without phone number results in null phoneNumber (no unsolicited data).');
+    console.log('  ✅ [PASS] Owner authentication returns null phoneNumber.');
+    console.log('  ✅ [PASS] Schema verified clean of hardcoded personal phone numbers.\n');
+    passed++;
+
     console.log('========================================================================');
     console.log(`🎉 ALL PHASE 2 SECURITY TESTS PASSED: ${passed}/${total}`);
     console.log('========================================================================\n');
@@ -330,4 +462,7 @@ function runPhase2SecurityVerificationSuite() {
   }
 }
 
-runPhase2SecurityVerificationSuite();
+runPhase2SecurityVerificationSuite().catch((err) => {
+  console.error('Fatal test error:', err);
+  process.exit(1);
+});

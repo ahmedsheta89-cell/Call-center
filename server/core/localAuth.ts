@@ -33,6 +33,7 @@ export interface LocalOwnerRecord {
   username: string;
   email: string;
   fullName: string;
+  phoneNumber?: string | null;
   saltHex: string;
   hashHex: string;
   scryptParams: {
@@ -80,8 +81,19 @@ export interface RateLimitEntry {
 
 export interface PersistentRateLimitStore {
   version: 1;
+  generation: number;
   updatedAt: string;
   entries: Record<string, RateLimitEntry>;
+}
+
+let latestKnownGeneration = 0;
+
+export function getLatestKnownGeneration(): number {
+  return latestKnownGeneration;
+}
+
+export function setLatestKnownGenerationForTesting(gen: number): void {
+  latestKnownGeneration = gen;
 }
 
 export type RateLimitStorageHealth =
@@ -209,6 +221,19 @@ function writeStateFile(filePath: string, bakPath: string, payload: PersistentRa
   const dataDir = path.dirname(filePath);
   cleanupStaleTmpFiles(dataDir, filePath);
 
+  // If primary currently exists, replicate to .bak before overwriting.
+  // CRITICAL: If backup copy fails, do NOT silently ignore! Fail fast and fail safe.
+  if (fs.existsSync(filePath)) {
+    try {
+      fs.copyFileSync(filePath, bakPath);
+    } catch (copyErr: any) {
+      currentStorageHealth = 'STORAGE_UNWRITABLE';
+      lastStorageError = `Failed to replicate rate limit state to backup before overwrite: ${copyErr?.message || copyErr}`;
+      console.error(`[RateLimit Storage Error] ${lastStorageError}`);
+      throw new Error(lastStorageError);
+    }
+  }
+
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const serialized = JSON.stringify(payload, null, 2);
 
@@ -220,14 +245,8 @@ function writeStateFile(filePath: string, bakPath: string, payload: PersistentRa
     fs.closeSync(fd);
   }
 
-  // If primary currently exists and is healthy, replicate to .bak before overwriting
-  if (fs.existsSync(filePath)) {
-    try {
-      fs.copyFileSync(filePath, bakPath);
-    } catch {}
-  }
-
   fs.renameSync(tmpPath, filePath);
+  latestKnownGeneration = Math.max(latestKnownGeneration, payload.generation);
 }
 
 export function loadRateLimitStateFromDisk(dataDir: string): void {
@@ -239,11 +258,34 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
       try {
         const bakRaw = fs.readFileSync(bakPath, 'utf8');
         const parsed: PersistentRateLimitStore = JSON.parse(bakRaw);
-        if (parsed && typeof parsed.entries === 'object') {
+        const isBakValid =
+          parsed &&
+          typeof parsed === 'object' &&
+          typeof parsed.entries === 'object' &&
+          parsed.version === 1 &&
+          typeof parsed.generation === 'number' &&
+          Number.isFinite(parsed.generation);
+
+        const isBakFresh =
+          isBakValid &&
+          (latestKnownGeneration === 0 || parsed.generation >= latestKnownGeneration - 1);
+
+        if (isBakValid && isBakFresh) {
           populateRateLimitMap(parsed.entries);
-          writeStateFile(filePath, bakPath, parsed);
+          latestKnownGeneration = Math.max(latestKnownGeneration, parsed.generation + 1);
+          const recoveredPayload: PersistentRateLimitStore = {
+            version: 1,
+            generation: latestKnownGeneration,
+            updatedAt: new Date().toISOString(),
+            entries: Object.fromEntries(rateLimitMap.entries()),
+          };
+          writeStateFile(filePath, bakPath, recoveredPayload);
           currentStorageHealth = 'CORRUPTED_RECOVERED';
           lastStorageError = 'Primary state missing; restored restrictive state from .bak';
+          return;
+        } else {
+          currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
+          lastStorageError = 'Primary state missing and backup is stale or unverified. Halting authentication fail-secure.';
           return;
         }
       } catch {}
@@ -267,7 +309,14 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
   let parsed: PersistentRateLimitStore | null = null;
   try {
     parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.entries !== 'object' || parsed.version !== 1) {
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      typeof parsed.entries !== 'object' ||
+      parsed.version !== 1 ||
+      typeof parsed.generation !== 'number' ||
+      !Number.isFinite(parsed.generation)
+    ) {
       parsed = null;
     }
   } catch {
@@ -275,6 +324,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
   }
 
   if (parsed) {
+    latestKnownGeneration = Math.max(latestKnownGeneration, parsed.generation);
     populateRateLimitMap(parsed.entries);
     if (currentStorageHealth !== 'CORRUPTED_RECOVERED') {
       currentStorageHealth = 'HEALTHY';
@@ -299,21 +349,48 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     console.error(`[RateLimit Security] Failed to quarantine corrupt state file: ${qErr?.message}`);
   }
 
-  // 2. Attempt recovery from backup (.bak)
+  // 2. Attempt recovery from backup (.bak) with monotonic generation verification
   if (fs.existsSync(bakPath)) {
     try {
       const bakRaw = fs.readFileSync(bakPath, 'utf8');
       const bakParsed: PersistentRateLimitStore = JSON.parse(bakRaw);
-      if (bakParsed && typeof bakParsed.entries === 'object' && bakParsed.version === 1) {
+      const isBakStructureValid =
+        bakParsed &&
+        typeof bakParsed === 'object' &&
+        typeof bakParsed.entries === 'object' &&
+        bakParsed.version === 1 &&
+        typeof bakParsed.generation === 'number' &&
+        Number.isFinite(bakParsed.generation);
+
+      // Anti-rollback / anti-relaxation gate:
+      // If latestKnownGeneration is established and the backup generation is older than latestKnownGeneration - 1,
+      // the backup is stale. Restoring an outdated backup might relax an active block or give extra attempts.
+      const isBackupFresh =
+        isBakStructureValid &&
+        (latestKnownGeneration === 0 || bakParsed.generation >= latestKnownGeneration - 1);
+
+      if (isBakStructureValid && isBackupFresh) {
         populateRateLimitMap(bakParsed.entries);
-        writeStateFile(filePath, bakPath, bakParsed);
+        latestKnownGeneration = Math.max(latestKnownGeneration, bakParsed.generation + 1);
+
+        const recoveredPayload: PersistentRateLimitStore = {
+          version: 1,
+          generation: latestKnownGeneration,
+          updatedAt: new Date().toISOString(),
+          entries: Object.fromEntries(rateLimitMap.entries()),
+        };
+        writeStateFile(filePath, bakPath, recoveredPayload);
         currentStorageHealth = 'CORRUPTED_RECOVERED';
-        lastStorageError = `Corrupt primary state quarantined to ${path.basename(corruptPath)}; restored restrictive state from .bak`;
+        lastStorageError = `Corrupt primary state quarantined to ${path.basename(corruptPath)}; restored restrictive state from .bak (gen ${bakParsed.generation} -> ${latestKnownGeneration})`;
         console.warn(`[RateLimit Security] ${lastStorageError}`);
         return;
       } else {
         const corruptBakPath = `${bakPath}.corrupt.${timestamp}`;
         try { fs.renameSync(bakPath, corruptBakPath); } catch {}
+        currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
+        lastStorageError = `Primary corrupt and backup is stale/unverified (bakGen=${bakParsed?.generation}, knownGen=${latestKnownGeneration}). Refusing restore fail-closed.`;
+        console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
+        return;
       }
     } catch {
       const corruptBakPath = `${bakPath}.corrupt.${timestamp}`;
@@ -321,7 +398,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     }
   }
 
-  // 3. Unrecoverable: No valid backup exists
+  // 3. Unrecoverable: No valid or verified backup exists -> FAIL-CLOSED
   currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
   lastStorageError = `Corrupted state file quarantined to ${path.basename(corruptPath)}; no valid backup available. Halting authentication fail-secure.`;
   console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
@@ -359,8 +436,10 @@ export function saveRateLimitStateToDisk(dataDir: string): void {
         });
     }
 
+    const nextGeneration = Math.max(latestKnownGeneration + 1, 1);
     const payload: PersistentRateLimitStore = {
       version: 1,
+      generation: nextGeneration,
       updatedAt: new Date().toISOString(),
       entries,
     };
@@ -452,9 +531,14 @@ export function resetRateLimit(key: string, dataDir?: string): void {
   }
 }
 
-export function clearAllRateLimits(dataDir?: string): void {
+export function clearAllRateLimits(dataDir?: string, authorizationToken?: string): void {
+  const isAllowedTest = process.env.NODE_ENV === 'test' || authorizationToken === 'EXPLICIT_TEST_RECOVERY_AUTH';
+  if (!isAllowedTest) {
+    throw new Error('UNAUTHORIZED_RATE_LIMIT_CLEAR: Full rate limit reset is forbidden outside test mode.');
+  }
   rateLimitMap.clear();
   resetRateLimitStorageHealth('HEALTHY');
+  latestKnownGeneration = 0;
   if (dataDir) {
     const filePath = getRateLimitFilePath(dataDir);
     const bakPath = getRateLimitBackupFilePath(dataDir);
@@ -718,6 +802,7 @@ export function completeLocalOwnerBootstrap(
     password: string;
     email?: string;
     fullName?: string;
+    phoneNumber?: string | null;
     ip?: string;
     scryptParams?: { N: number; r: number; p: number; keyLen: number };
   }
@@ -781,6 +866,7 @@ export function completeLocalOwnerBootstrap(
 
   const cleanEmail = String(params.email || 'owner@omniflow.local').trim().toLowerCase();
   const cleanFullName = String(params.fullName || 'System Owner').trim();
+  const cleanPhoneNumber = params.phoneNumber ? String(params.phoneNumber).trim() : null;
   const ownerUserId = 'usr-owner-01';
 
   // Generate salt and derive scrypt hash with OWASP recommended or custom parameters
@@ -795,6 +881,7 @@ export function completeLocalOwnerBootstrap(
     username: cleanUsername,
     email: cleanEmail,
     fullName: cleanFullName,
+    phoneNumber: cleanPhoneNumber,
     saltHex: salt.toString('hex'),
     hashHex: hash.toString('hex'),
     scryptParams: scryptConfig,
@@ -829,7 +916,7 @@ export function completeLocalOwnerBootstrap(
     role: 'Owner',
     isActive: true,
     mfaEnabled: false,
-    phoneNumber: '01018108979',
+    phoneNumber: cleanPhoneNumber,
     createdAt: nowIso,
     updatedAt: nowIso,
   });
@@ -995,7 +1082,7 @@ export function authenticateLocalOwner(
       role: 'Owner',
       isActive: true,
       mfaEnabled: false,
-      phoneNumber: '01018108979',
+      phoneNumber: record.phoneNumber ?? null,
       createdAt: record.createdAt,
       updatedAt: new Date().toISOString(),
     };
@@ -1027,6 +1114,7 @@ export async function completeLocalOwnerBootstrapAsync(
     password: string;
     email?: string;
     fullName?: string;
+    phoneNumber?: string | null;
     ip?: string;
     scryptParams?: { N: number; r: number; p: number; keyLen: number };
   }
@@ -1090,6 +1178,7 @@ export async function completeLocalOwnerBootstrapAsync(
 
   const cleanEmail = String(params.email || 'owner@omniflow.local').trim().toLowerCase();
   const cleanFullName = String(params.fullName || 'System Owner').trim();
+  const cleanPhoneNumber = params.phoneNumber ? String(params.phoneNumber).trim() : null;
   const ownerUserId = 'usr-owner-01';
 
   const scryptConfig = params.scryptParams || SCRYPT_DEFAULTS;
@@ -1111,6 +1200,7 @@ export async function completeLocalOwnerBootstrapAsync(
     username: cleanUsername,
     email: cleanEmail,
     fullName: cleanFullName,
+    phoneNumber: cleanPhoneNumber,
     saltHex: salt.toString('hex'),
     hashHex: hash.toString('hex'),
     scryptParams: scryptConfig,
@@ -1142,7 +1232,7 @@ export async function completeLocalOwnerBootstrapAsync(
     role: 'Owner',
     isActive: true,
     mfaEnabled: false,
-    phoneNumber: '01018108979',
+    phoneNumber: cleanPhoneNumber,
     createdAt: nowIso,
     updatedAt: nowIso,
   });
@@ -1318,7 +1408,7 @@ export async function authenticateLocalOwnerAsync(
       role: 'Owner',
       isActive: true,
       mfaEnabled: false,
-      phoneNumber: '01018108979',
+      phoneNumber: record.phoneNumber ?? null,
       createdAt: record.createdAt,
       updatedAt: new Date().toISOString(),
     };

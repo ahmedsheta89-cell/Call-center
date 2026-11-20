@@ -50,7 +50,7 @@ export function ensureRuntimeCryptoKeys(persistFilePath: string): KeyProvisionin
   const hasChannelEnv = typeof process.env.CHANNEL_SECRET_ENCRYPTION_KEY === "string" && process.env.CHANNEL_SECRET_ENCRYPTION_KEY.length > 0;
   const hasAuditEnv = typeof process.env.AUDIT_CHECKPOINT_HMAC_KEY === "string" && process.env.AUDIT_CHECKPOINT_HMAC_KEY.length > 0;
 
-  if (env === "production" || env === "test" || (hasChannelEnv && hasAuditEnv)) {
+  if (env === "production" || (hasChannelEnv && hasAuditEnv)) {
     const chCheck = validateChannelEncryptionKey(process.env.CHANNEL_SECRET_ENCRYPTION_KEY);
     if (!chCheck.valid) {
       return { ok: false, env, source: "none", errorCode: chCheck.code || "CHANNEL_SECRET_KEY_INVALID", errorMessage: "CHANNEL_SECRET_ENCRYPTION_KEY is missing or invalid for runtime environment." };

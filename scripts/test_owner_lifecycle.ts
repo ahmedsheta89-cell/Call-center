@@ -6,6 +6,8 @@
  * DOES NOT TOUCH OR MUTATE PRODUCTION OPERATIONAL DATA.
  */
 
+process.env.NODE_ENV = 'test';
+
 import fs from 'fs';
 import path from 'path';
 import os from 'os';

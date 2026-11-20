@@ -1,16 +1,9 @@
 /**
  * @file scripts/test_rate_limiting_failures.ts
  * Enterprise Test Suite: Rate Limiting Fail-Secure Storage Integrity & Recovery
- *
- * Verifies:
- * 1. Storage Health State Machine (HEALTHY, CORRUPTED_RECOVERED, CORRUPTED_UNRECOVERABLE, STORAGE_UNWRITABLE)
- * 2. Corrupt State Quarantine: Corrupt files quarantined to .corrupt.<timestamp> as forensic evidence
- * 3. Automated State Recovery: Seamless restoration from .rate_limit_state.json.bak
- * 4. Fail-Secure Halting: Login / bootstrap halt with AUTH_SUBSYSTEM_UNAVAILABLE (503) when unrecoverable
- * 5. Non-Authentication Route Immunity: In-flight operations remain fully functional during auth degradation
- * 6. Scrypt Concurrency & libuv Slot Release: Slot release in finally block under success, error, and timeout
- * 7. Stale Tmp File Pruning & Atomic Fsync Verification
  */
+
+process.env.NODE_ENV = 'test';
 
 import fs from 'fs';
 import path from 'path';

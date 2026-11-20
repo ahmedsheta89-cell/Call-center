@@ -20,31 +20,76 @@ import {
 } from '../server/core/localAuth.ts';
 import { resolveDurableDataPath } from '../server/db/localPersistenceEngine.ts';
 
-function askHidden(query: string): Promise<string> {
-  return new Promise((resolve) => {
+export function verifyInteractiveTty(): void {
+  if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== 'function') {
+    throw new Error('NON_INTERACTIVE_TERMINAL: Real interactive TTY with raw mode support is strictly required to securely suppress terminal echo.');
+  }
+}
+
+export function askHidden(query: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    try {
+      verifyInteractiveTty();
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
     process.stdout.write(query);
     const stdin = process.stdin;
     let password = '';
+    let cleanedUp = false;
 
-    const isTTY = Boolean(stdin.isTTY);
-    if (isTTY && typeof stdin.setRawMode === 'function') {
-      stdin.setRawMode(true);
-    }
-    stdin.resume();
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      stdin.removeListener('data', onData);
+      stdin.removeListener('error', onError);
+      stdin.removeListener('end', onEnd);
+      process.removeListener('SIGINT', onSigInt);
+      try {
+        stdin.setRawMode(false);
+      } catch {}
+      stdin.pause();
+    };
+
+    const onSigInt = () => {
+      cleanup();
+      process.stdout.write('\n[Aborted by user via SIGINT]\n');
+      process.exit(130);
+    };
+
+    const onError = (err: Error) => {
+      cleanup();
+      process.stdout.write('\n');
+      reject(err);
+    };
+
+    const onEnd = () => {
+      cleanup();
+      process.stdout.write('\n');
+      reject(new Error('EOF_BEFORE_INPUT_COMPLETED: Unexpected EOF encountered on stdin.'));
+    };
 
     const onData = (chunk: Buffer) => {
       const str = chunk.toString('utf-8');
       for (const c of str) {
-        if (c === '\r' || c === '\n' || c === '\u0004') {
+        if (c === '\r' || c === '\n') {
           cleanup();
           process.stdout.write('\n');
           resolve(password);
           return;
+        } else if (c === '\u0004') {
+          // EOF (Ctrl+D)
+          cleanup();
+          process.stdout.write('\n');
+          reject(new Error('EOF_BEFORE_INPUT_COMPLETED: EOF received on stdin.'));
+          return;
         } else if (c === '\u0003') {
           // Ctrl+C
           cleanup();
-          process.stdout.write('\n[Aborted by user]\n');
-          process.exit(1);
+          process.stdout.write('\n[Aborted by user via Ctrl+C]\n');
+          process.exit(130);
         } else if (c === '\u0008' || c === '\x7f') {
           // Backspace
           if (password.length > 0) {
@@ -58,15 +103,18 @@ function askHidden(query: string): Promise<string> {
       }
     };
 
-    const cleanup = () => {
-      stdin.removeListener('data', onData);
-      if (isTTY && typeof stdin.setRawMode === 'function') {
-        stdin.setRawMode(false);
-      }
-      stdin.pause();
-    };
-
+    process.on('SIGINT', onSigInt);
     stdin.on('data', onData);
+    stdin.on('error', onError);
+    stdin.on('end', onEnd);
+
+    try {
+      stdin.setRawMode(true);
+      stdin.resume();
+    } catch (err) {
+      cleanup();
+      reject(err);
+    }
   });
 }
 
@@ -87,6 +135,15 @@ async function runOwnerActivation() {
   console.log('========================================================================');
   console.log('🛡️  OMNIFLOW OS — SECURE LOCAL OWNER ACTIVATION CLI');
   console.log('========================================================================\n');
+
+  try {
+    verifyInteractiveTty();
+  } catch (err: any) {
+    console.error('\n❌ SECURITY ABORT: activate_owner must be run interactively in a real terminal (TTY).');
+    console.error('Non-interactive execution, piped input, and background processes are forbidden');
+    console.error('to prevent terminal echo compromise and automated credential leakage.\n');
+    process.exit(1);
+  }
 
   const dataPathRes = resolveDurableDataPath();
   if (!dataPathRes.ok || !dataPathRes.dirPath) {
@@ -150,7 +207,7 @@ async function runOwnerActivation() {
     break;
   }
 
-  console.log('\n⏳ Deriving scrypt hash (RFC 7914; N=16384, r=8, p=1) and saving...');
+  console.log('\n⏳ Deriving scrypt hash (RFC 7914 / OWASP; N=131072, r=8, p=1, keyLen=64) and saving...');
   const outcome = completeLocalOwnerBootstrap(dataDir, {
     bootstrapToken,
     username,
@@ -172,7 +229,7 @@ async function runOwnerActivation() {
     ip: '127.0.0.1',
   });
 
-  // Zero-out password variable references
+  // Reset local variable references
   password = '';
   confirmedPassword = '';
 

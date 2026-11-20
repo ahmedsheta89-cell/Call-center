@@ -1,17 +1,9 @@
 /**
  * @file scripts/test_rate_limiting_deep.ts
  * Deep Independent Verification Suite for Persistent Rate Limiting
- *
- * Scenarios tested independently:
- * 1. Known Account vs Unknown Account Lockout Isolation
- * 2. Concurrent Attempt Writes & Race Condition Immunity
- * 3. Repeated Process Cold Restarts & State Persistence
- * 4. Corrupted State File Detection & Safe Fail-Open/Fail-Safe Recovery
- * 5. Unwritable / Read-Only Storage Fallback (graceful memory operation)
- * 6. Expiry & Timed Unlock Verification
- * 7. Clock Skew Resilience (Forward & Backward system clock anomalies)
- * 8. Permanent Lockout Prevention (Time-clamped blockedUntil bounds)
  */
+
+process.env.NODE_ENV = 'test';
 
 import fs from 'fs';
 import path from 'path';
@@ -26,6 +18,8 @@ import {
   getRateLimitBackupFilePath,
   getRateLimitStorageHealth,
   resetRateLimitStorageHealth,
+  getLatestKnownGeneration,
+  setLatestKnownGenerationForTesting,
 } from '../server/core/localAuth.ts';
 
 const sandboxDir = path.join('F:', 'Dev_Workspace', 'Temp', 'OMNIFLOW_OS', `rate_limit_deep_${Date.now()}`);
@@ -174,14 +168,16 @@ async function runDeepTests() {
     // --------------------------------------------------------------------------
     // Scenario 6: Expiry & Timed Unlock Verification
     // --------------------------------------------------------------------------
-    console.log('\n[6/8] Scenario 6: Expiry & Timed Unlock Verification...');
+    console.log('\n[6/11] Scenario 6: Expiry & Timed Unlock Verification...');
     clearAllRateLimits(sandboxDir);
+    setLatestKnownGenerationForTesting(0);
     const expiredKey = 'login:expired_account:127.0.0.1';
 
     // Inject entry with expired timestamp (blockedUntil in past)
     const now = Date.now();
     const expiredPayload = {
       version: 1,
+      generation: 1,
       updatedAt: new Date().toISOString(),
       entries: {
         [expiredKey]: {
@@ -201,13 +197,15 @@ async function runDeepTests() {
     // --------------------------------------------------------------------------
     // Scenario 7: Clock Skew Resilience (Forward & Backward)
     // --------------------------------------------------------------------------
-    console.log('\n[7/8] Scenario 7: Clock Skew Resilience (Time Jumps)...');
+    console.log('\n[7/11] Scenario 7: Clock Skew Resilience (Time Jumps)...');
     clearAllRateLimits(sandboxDir);
+    setLatestKnownGenerationForTesting(0);
     const skewKey = 'login:clock_skew:127.0.0.1';
 
     // Time in future (e.g. system clock jumped 1 year into future and then back)
     const futurePayload = {
       version: 1,
+      generation: 1,
       updatedAt: new Date().toISOString(),
       entries: {
         [skewKey]: {
@@ -232,7 +230,7 @@ async function runDeepTests() {
     // --------------------------------------------------------------------------
     // Scenario 8: Permanent Lockout Prevention
     // --------------------------------------------------------------------------
-    console.log('\n[8/8] Scenario 8: Permanent Lockout Prevention...');
+    console.log('\n[8/11] Scenario 8: Permanent Lockout Prevention...');
     clearAllRateLimits(sandboxDir);
     const ownerKey = 'login:owner:127.0.0.1';
 
@@ -247,6 +245,102 @@ async function runDeepTests() {
     resetRateLimit(ownerKey, sandboxDir);
     const unlockedRes = checkRateLimit(ownerKey, sandboxDir);
     assert(unlockedRes.allowed === true, 'Owner lockout cleared immediately via resetRateLimit');
+
+    // --------------------------------------------------------------------------
+    // Scenario 9: Anti-Rollback Protection with Stale Backup
+    // --------------------------------------------------------------------------
+    console.log('\n[9/11] Scenario 9: Anti-Rollback Gate / Stale Backup Rejection...');
+    clearAllRateLimits(sandboxDir);
+    resetRateLimitStorageHealth('HEALTHY');
+
+    // Write a stale backup at generation 5
+    const staleBackupPayload = {
+      version: 1,
+      generation: 5,
+      updatedAt: new Date().toISOString(),
+      entries: {
+        'login:attacker:127.0.0.1': { attempts: 1, firstAttemptAt: Date.now(), blockedUntil: 0 },
+      },
+    };
+    fs.writeFileSync(backupFile, JSON.stringify(staleBackupPayload));
+    // Corrupt primary
+    fs.writeFileSync(stateFile, '{ corrupt_primary_json: true');
+
+    // Simulate in-memory latest known generation having reached 10 (gap > 1)
+    setLatestKnownGenerationForTesting(10);
+
+    // Load must reject stale backup and fail closed with CORRUPTED_UNRECOVERABLE
+    loadRateLimitStateFromDisk(sandboxDir);
+
+    const staleHealth = getRateLimitStorageHealth(sandboxDir);
+    assert(
+      staleHealth.health === 'CORRUPTED_UNRECOVERABLE',
+      `Stale backup rejected fail-closed to prevent rollback (health: ${staleHealth.health})`
+    );
+
+    // --------------------------------------------------------------------------
+    // Scenario 10: Attacker Receives Zero Extra Attempts Post-Recovery
+    // --------------------------------------------------------------------------
+    console.log('\n[10/11] Scenario 10: Zero Extra Attempts Granted Post-Recovery...');
+    clearAllRateLimits(sandboxDir);
+    resetRateLimitStorageHealth('HEALTHY');
+    setLatestKnownGenerationForTesting(0);
+
+    const attackerKey = 'login:brute_force_attacker:127.0.0.1';
+    for (let i = 0; i < 5; i++) {
+      recordFailedAttempt(attackerKey, sandboxDir);
+    }
+    saveRateLimitStateToDisk(sandboxDir);
+
+    // Corrupt primary but keep fresh backup
+    clearAllRateLimits();
+    fs.writeFileSync(stateFile, '{ truncated:');
+    loadRateLimitStateFromDisk(sandboxDir);
+
+    const postRecoveryCheck = checkRateLimit(attackerKey, sandboxDir);
+    assert(
+      postRecoveryCheck.allowed === false,
+      'Locked attacker remains locked after recovery from backup'
+    );
+    assert(
+      postRecoveryCheck.remainingAttempts === 0,
+      `Zero attempts granted post-recovery (remainingAttempts: ${postRecoveryCheck.remainingAttempts})`
+    );
+
+    // --------------------------------------------------------------------------
+    // Scenario 11: Fail-Secure Behavior Under Backup Replication Failure
+    // --------------------------------------------------------------------------
+    console.log('\n[11/11] Scenario 11: Fail-Secure on Backup Write/Replication Failure...');
+    clearAllRateLimits(sandboxDir);
+    resetRateLimitStorageHealth('HEALTHY');
+    setLatestKnownGenerationForTesting(0);
+
+    // Create an initial state file on disk so that filePath exists
+    recordFailedAttempt('login:unwritable_test:127.0.0.1', sandboxDir);
+    saveRateLimitStateToDisk(sandboxDir);
+
+    // Now replace backup file path with a directory to force copyFileSync failure on next write
+    if (fs.existsSync(backupFile)) {
+      fs.unlinkSync(backupFile);
+    }
+    fs.mkdirSync(backupFile); // Directory prevents copyFileSync to backup file path
+
+    let caughtError = false;
+    try {
+      recordFailedAttempt('login:unwritable_test:127.0.0.1', sandboxDir);
+    } catch {
+      caughtError = true;
+    }
+    // Storage health should reflect STORAGE_UNWRITABLE
+    const unwritableHealth = getRateLimitStorageHealth(sandboxDir);
+    assert(
+      unwritableHealth.health === 'STORAGE_UNWRITABLE',
+      `Storage transitions to STORAGE_UNWRITABLE when backup replication fails (health: ${unwritableHealth.health})`
+    );
+
+    // Clean up directory so subsequent runs are clean
+    fs.rmdirSync(backupFile);
+    resetRateLimitStorageHealth('HEALTHY');
 
     console.log('\n================================================================================');
     console.log(`🏆 DEEP RATE LIMITING VERIFICATION: ${totalPassed} PASSED, ${totalFailed} FAILED`);

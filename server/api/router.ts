@@ -315,7 +315,7 @@ apiRouter.get('/auth/local-owner/status', (_req: Request, res: Response) => {
 
 apiRouter.post('/auth/local-owner/bootstrap', async (req: Request, res: Response) => {
   const dataDir = path.dirname(db.getPersistFilePath());
-  const { bootstrapToken, username, password, email, fullName } = req.body || {};
+  const { bootstrapToken, username, password, email, fullName, phoneNumber } = req.body || {};
   const clientIp = String(req.ip || req.socket?.remoteAddress || '127.0.0.1');
   if (!bootstrapToken || !username || !password) {
     res.status(400).json({
@@ -330,6 +330,7 @@ apiRouter.post('/auth/local-owner/bootstrap', async (req: Request, res: Response
     password,
     email,
     fullName,
+    phoneNumber: phoneNumber ? String(phoneNumber).trim() : null,
     ip: clientIp,
   });
   if (!outcome.ok) {
@@ -427,6 +428,7 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
     process.env.NODE_ENV === 'production' ||
     process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === 'true';
   const allowLocalTestLogin =
+    process.env.NODE_ENV === 'test' &&
     !isProductionOrLocked &&
     process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' &&
     isLoopbackRequest;
