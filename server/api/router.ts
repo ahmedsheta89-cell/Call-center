@@ -40,9 +40,32 @@ import {
 } from '../core/identity.ts';
 import { execSync } from 'child_process';
 import { AIGateway } from '../modules/ai/gateway.ts';
-import { UnifiedMessage, UUID, Ticket, CallSession } from '../core/types.ts';
+import {
+  UnifiedMessage,
+  UUID,
+  Ticket,
+  CallSession,
+  Customer,
+  Conversation,
+  CustomerNote,
+  CustomerFollowUp,
+  TicketComment,
+  AutomationRuleExecution,
+} from '../core/types.ts';
 import { EventBus } from '../core/events.ts';
 import { ensurePwaIconsGenerated, PWA_ICON_TMP_DIR } from '../core/pwaAssets.ts';
+import { initializeIntegrationAdapters } from '../modules/integrations/init.ts';
+import { IntegrationRegistry } from '../modules/integrations/registry.ts';
+
+// Initialize integration adapters subsystem
+initializeIntegrationAdapters();
+import {
+  initLocalOwnerAuth,
+  completeLocalOwnerBootstrap,
+  authenticateLocalOwner,
+  completeLocalOwnerBootstrapAsync,
+  authenticateLocalOwnerAsync,
+} from '../core/localAuth.ts';
 
 export const apiRouter = Router();
 
@@ -124,7 +147,7 @@ apiRouter.use(authenticateApiRequest);
 // Organization context is derived exclusively from the verified session. Any request body attempting
 // to pass an empty/invalid/unregistered organizationId (400) or a cross-tenant organizationId (403) is rejected.
 apiRouter.use((req: Request, res: Response, next) => {
-  if (req.path === '/system/restore') {
+  if (req.path === '/system/restore' || req.path.startsWith('/auth/')) {
     next();
     return;
   }
@@ -300,6 +323,107 @@ apiRouter.get('/admin/profile', (req: Request, res: Response) => {
   });
 });
 
+apiRouter.get('/auth/local-owner/status', (_req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const status = initLocalOwnerAuth(dataDir);
+  res.json({ success: true, data: status });
+});
+
+apiRouter.post('/auth/local-owner/bootstrap', async (req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const { bootstrapToken, username, password, email, fullName, phoneNumber } = req.body || {};
+  const clientIp = String(req.ip || req.socket?.remoteAddress || '127.0.0.1');
+  if (!bootstrapToken || !username || !password) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MISSING_REQUIRED_FIELDS', message: 'bootstrapToken, username, and password are required.' },
+    });
+    return;
+  }
+  const outcome = await completeLocalOwnerBootstrapAsync(dataDir, {
+    bootstrapToken,
+    username,
+    password,
+    email,
+    fullName,
+    phoneNumber: phoneNumber ? String(phoneNumber).trim() : null,
+    ip: clientIp,
+  });
+  if (!outcome.ok) {
+    const isRateLimited = outcome.errorCode === 'TOO_MANY_FAILED_ATTEMPTS';
+    const isUnavailable = outcome.errorCode === 'AUTH_SUBSYSTEM_BUSY' || outcome.errorCode === 'AUTH_SUBSYSTEM_UNAVAILABLE';
+    res.status(isRateLimited ? 429 : isUnavailable ? 503 : 400).json({
+      success: false,
+      error: { code: outcome.errorCode, message: outcome.errorMessage },
+    });
+    return;
+  }
+  res.json({
+    success: true,
+    data: { message: 'Local Owner account successfully provisioned. You can now login.' },
+  });
+});
+
+apiRouter.post('/auth/local-owner/login', async (req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const { username, password, ttlMs } = req.body || {};
+  const clientIp = String(req.ip || req.socket?.remoteAddress || '127.0.0.1');
+
+  if (!username || !password) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'CREDENTIALS_REQUIRED', message: 'username and password are required.' },
+    });
+    return;
+  }
+
+  const authOutcome = await authenticateLocalOwnerAsync(dataDir, { username, password, ip: clientIp });
+  if (!authOutcome.ok) {
+    const isRateLimited = authOutcome.errorCode === 'TOO_MANY_FAILED_ATTEMPTS';
+    const isUnavailable = authOutcome.errorCode === 'AUTH_SUBSYSTEM_BUSY' || authOutcome.errorCode === 'AUTH_SUBSYSTEM_UNAVAILABLE';
+    res.status(isRateLimited ? 429 : isUnavailable ? 503 : 401).json({
+      success: false,
+      error: { code: authOutcome.errorCode, message: authOutcome.errorMessage },
+    });
+    return;
+  }
+
+  const user = authOutcome.user;
+  const { token, csrfToken, session, actor } = issueSessionToken({
+    userId: user.id,
+    activeRoleOverride: 'Owner',
+    ttlMs: typeof ttlMs === 'number' ? ttlMs : undefined,
+  });
+
+  AuditLogger.log({
+    organizationId: actor.organizationId,
+    actorId: actor.userId,
+    actorType: 'user',
+    action: 'auth.local_owner_session_issued',
+    entityType: 'session',
+    entityId: session.jti,
+    afterState: {
+      userId: actor.userId,
+      baseRole: actor.baseRole,
+      activeRole: actor.role,
+      method: 'local_scrypt_password',
+    },
+  });
+
+  res.setHeader('Set-Cookie', formatSessionCookie(req, token));
+  res.setHeader('X-CSRF-Token', csrfToken);
+  res.json({
+    success: true,
+    data: {
+      token,
+      csrfToken,
+      sessionId: session.jti,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      actor,
+    },
+  });
+});
+
 apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   const secretCheck = validateSessionSecretConfig();
   if (!secretCheck.valid) {
@@ -320,6 +444,7 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
     process.env.NODE_ENV === 'production' ||
     process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === 'true';
   const allowLocalTestLogin =
+    process.env.NODE_ENV === 'test' &&
     !isProductionOrLocked &&
     process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' &&
     isLoopbackRequest;
@@ -586,6 +711,37 @@ apiRouter.get('/agents', (req: Request, res: Response) => {
   res.json({ success: true, data: agentsList });
 });
 
+apiRouter.put('/agents/:id/presence', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const agent = db.agents.get(req.params.id);
+  if (!agent || agent.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Agent not found' } });
+  }
+  const { status } = req.body || {};
+  const validStatuses = ['online', 'busy', 'break', 'offline'] as const;
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'Valid status required: online, busy, break, offline' },
+    });
+  }
+  agent.status = status;
+  agent.updatedAt = new Date().toISOString();
+  db.agents.set(agent.id, agent);
+  db.schedulePersist();
+  EventBus.publish('agent:presence_changed', { agentId: agent.id, status: agent.status });
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'agent.presence_update',
+    entityType: 'agent',
+    entityId: agent.id,
+    afterState: { status: agent.status },
+  });
+  res.json({ success: true, data: agent });
+});
+
 apiRouter.get('/teams', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
   const teamsList = Array.from(db.teams.values()).filter((t) => t.organizationId === currentActor.organizationId);
@@ -677,6 +833,273 @@ apiRouter.get('/customers/:id/timeline', (req: Request, res: Response) => {
   ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
   res.json({ success: true, data: timeline });
+});
+
+apiRouter.post('/customers', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.create');
+  const { name, email, phone, customerTier, city, tags, customFields, assignedAgentId, forceCreate } = req.body || {};
+  if (!name || typeof name !== 'string' || name.trim().length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'Customer name is required and must be a non-empty string' },
+    });
+  }
+
+  const normalizedPhone = phone ? String(phone).replace(/\s+/g, '') : undefined;
+  if (!forceCreate) {
+    const existing = Array.from(db.customers.values()).find(
+      (c) =>
+        c.organizationId === currentActor.organizationId &&
+        ((normalizedPhone && c.phone && c.phone.replace(/\s+/g, '') === normalizedPhone) ||
+          (email && c.email && c.email.toLowerCase() === String(email).trim().toLowerCase()))
+    );
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: 'CUSTOMER_ALREADY_EXISTS',
+          message: 'A customer with this phone or email already exists in this organization',
+          duplicateCustomerId: existing.id,
+        },
+      });
+    }
+  }
+
+  const id: UUID = crypto.randomUUID();
+  const validTier = ['standard', 'priority', 'vip'].includes(customerTier) ? customerTier : 'standard';
+  const newCustomer: Customer = {
+    id,
+    organizationId: currentActor.organizationId,
+    name: name.trim(),
+    email: email ? String(email).trim().toLowerCase() : undefined,
+    phone: normalizedPhone,
+    customerTier: validTier,
+    lifetimeValue: 0,
+    assignedAgentId: assignedAgentId || undefined,
+    tags: Array.isArray(tags) ? tags.map(String) : [],
+    customFields: {
+      ...(typeof customFields === 'object' && customFields !== null ? customFields : {}),
+      city: city || 'القاهرة',
+    },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  db.customers.set(id, newCustomer);
+  db.schedulePersist();
+  EventBus.publish('customer:created', newCustomer);
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.create',
+    entityType: 'customer',
+    entityId: id,
+    afterState: { name: newCustomer.name, phone: newCustomer.phone, customerTier: newCustomer.customerTier },
+  });
+
+  res.status(201).json({ success: true, data: newCustomer });
+});
+
+apiRouter.put('/customers/:id', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.update');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const { name, email, phone, customerTier, city, tags, customFields, assignedAgentId } = req.body || {};
+  if (name !== undefined) customer.name = String(name).trim();
+  if (email !== undefined) customer.email = String(email).trim().toLowerCase();
+  if (phone !== undefined) customer.phone = String(phone).replace(/\s+/g, '');
+  if (customerTier && ['standard', 'priority', 'vip'].includes(customerTier)) customer.customerTier = customerTier;
+  if (assignedAgentId !== undefined) customer.assignedAgentId = assignedAgentId || undefined;
+  if (Array.isArray(tags)) customer.tags = tags.map(String);
+  if (city !== undefined || customFields !== undefined) {
+    customer.customFields = {
+      ...(customer.customFields || {}),
+      ...(typeof customFields === 'object' && customFields !== null ? customFields : {}),
+      ...(city !== undefined ? { city } : {}),
+    };
+  }
+  customer.updatedAt = new Date().toISOString();
+
+  db.customers.set(customer.id, customer);
+  db.schedulePersist();
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.update',
+    entityType: 'customer',
+    entityId: customer.id,
+    afterState: { name: customer.name, customerTier: customer.customerTier },
+  });
+
+  res.json({ success: true, data: customer });
+});
+
+apiRouter.post('/customers/:id/notes', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.update');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const { content } = req.body || {};
+  if (!content || typeof content !== 'string' || content.trim().length === 0) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Note content is required' } });
+  }
+
+  const author = db.users.get(currentActor.userId);
+  const note = db.saveCustomerNote({
+    id: crypto.randomUUID(),
+    organizationId: currentActor.organizationId,
+    customerId: customer.id,
+    authorId: currentActor.userId,
+    authorName: author?.fullName || 'الموظف المسؤول',
+    content: content.trim(),
+    createdAt: new Date().toISOString(),
+  });
+
+  EventBus.publish('customer:note_added', { customerId: customer.id, noteId: note.id });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.note_add',
+    entityType: 'customer',
+    entityId: customer.id,
+    afterState: { noteId: note.id },
+  });
+
+  res.status(201).json({ success: true, data: note });
+});
+
+apiRouter.get('/customers/:id/notes', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+  const notes = db.getCustomerNotes(currentActor.organizationId, customer.id);
+  res.json({ success: true, data: notes });
+});
+
+apiRouter.post('/customers/detect-duplicates', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const { name, phone, email } = req.body || {};
+  const allCustomers = db.getCustomers(currentActor.organizationId);
+  const cleanPhone = phone ? String(phone).replace(/[^0-9]/g, '') : '';
+  const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+  const cleanName = name ? String(name).trim().toLowerCase() : '';
+
+  const matches = allCustomers
+    .map((cust) => {
+      let score = 0;
+      const reasons: string[] = [];
+      const custPhoneClean = cust.phone ? cust.phone.replace(/[^0-9]/g, '') : '';
+      if (cleanPhone && custPhoneClean) {
+        if (cleanPhone === custPhoneClean || (cleanPhone.length >= 9 && custPhoneClean.endsWith(cleanPhone.slice(-9)))) {
+          score += 60;
+          reasons.push('تطابق رقم الهاتف (Phone match)');
+        }
+      }
+      if (cleanEmail && cust.email && cust.email.toLowerCase() === cleanEmail) {
+        score += 40;
+        reasons.push('تطابق البريد الإلكتروني (Email match)');
+      }
+      if (cleanName && cust.name.toLowerCase() === cleanName) {
+        score += 30;
+        reasons.push('تطابق الاسم بالكامل (Full name match)');
+      } else if (cleanName && (cust.name.toLowerCase().includes(cleanName) || cleanName.includes(cust.name.toLowerCase()))) {
+        score += 15;
+        reasons.push('تشابه جزئي في الاسم (Partial name match)');
+      }
+      return { customer: cust, score: Math.min(100, score), reasons };
+    })
+    .filter((m) => m.score >= 30)
+    .sort((a, b) => b.score - a.score);
+
+  res.json({ success: true, data: matches, count: matches.length });
+});
+
+apiRouter.post('/customers/:id/follow-up', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.update');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const { dueAt, reason, priority, assignedAgentId } = req.body || {};
+  if (!dueAt || !reason) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'dueAt and reason are required' } });
+  }
+
+  const followUp = db.saveCustomerFollowUp({
+    id: crypto.randomUUID(),
+    organizationId: currentActor.organizationId,
+    customerId: customer.id,
+    assignedAgentId: assignedAgentId || customer.assignedAgentId,
+    dueAt: new Date(dueAt).toISOString(),
+    priority: ['low', 'medium', 'high', 'urgent'].includes(priority) ? priority : 'medium',
+    reason: String(reason).trim(),
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  });
+
+  EventBus.publish('customer:follow_up_scheduled', followUp);
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.follow_up_create',
+    entityType: 'customer',
+    entityId: customer.id,
+    afterState: { followUpId: followUp.id, dueAt: followUp.dueAt },
+  });
+
+  res.status(201).json({ success: true, data: followUp });
+});
+
+apiRouter.get('/customers/:id/follow-ups', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+  const followUps = db.getCustomerFollowUps(currentActor.organizationId, customer.id);
+  res.json({ success: true, data: followUps });
+});
+
+apiRouter.get('/customers-export', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const customers = db.getCustomers(currentActor.organizationId);
+  const format = req.query.format === 'csv' ? 'csv' : 'json';
+
+  if (format === 'csv') {
+    const headers = ['المعرف', 'الاسم', 'الهاتف', 'البريد', 'الفئة', 'المدينة', 'القيمة التاريخية', 'تاريخ الإنشاء'];
+    const rows = customers.map((c) => [
+      c.id,
+      `"${c.name.replace(/"/g, '""')}"`,
+      `"${c.phone || ''}"`,
+      `"${c.email || ''}"`,
+      c.customerTier,
+      `"${(c.customFields as any)?.city || ''}"`,
+      c.lifetimeValue,
+      c.createdAt,
+    ]);
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="customers-export.csv"');
+    return res.send(csvContent);
+  }
+
+  res.json({ success: true, data: customers, count: customers.length, exportedAt: new Date().toISOString() });
 });
 
 // ----------------------------------------------------
@@ -787,6 +1210,193 @@ const handleConversationReply = async (req: Request, res: Response) => {
 
 apiRouter.post('/conversations/:id/reply', handleConversationReply);
 apiRouter.post('/conversations/:id/messages', handleConversationReply);
+
+// In-memory collision prevention state (TTL 15 seconds)
+interface ViewerInfo {
+  agentId: string;
+  agentName: string;
+  lastSeenAt: number;
+  isTyping: boolean;
+}
+const activeConversationViewers = new Map<string, ViewerInfo[]>();
+
+apiRouter.post('/conversations', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.reply');
+  const { customerId, channel, subject, priority } = req.body || {};
+  if (!customerId) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'customerId is required' } });
+  }
+  const customer = db.customers.get(customerId);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const validChannels = ['whatsapp', 'webchat', 'voice', 'email', 'messenger', 'instagram', 'sms', 'telegram'];
+  const chn = validChannels.includes(channel) ? channel : 'webchat';
+  const convId: UUID = crypto.randomUUID();
+  const newConv: Conversation = {
+    id: convId,
+    organizationId: currentActor.organizationId,
+    customerId: customer.id,
+    channel: chn as any,
+    status: 'open',
+    priority: ['low', 'medium', 'high', 'urgent'].includes(priority) ? priority : 'medium',
+    subject: subject || `محادثة جديدة عبر ${chn.toUpperCase()}`,
+    sentiment: 'neutral',
+    lastMessageAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  db.conversations.set(convId, newConv);
+  db.schedulePersist();
+  EventBus.publish('conversation:created', newConv);
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'conversation.create',
+    entityType: 'conversation',
+    entityId: convId,
+    afterState: { customerId: customer.id, channel: chn },
+  });
+
+  res.status(201).json({ success: true, data: newConv });
+});
+
+apiRouter.put('/conversations/:id/status', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.close');
+  const conv = db.conversations.get(req.params.id);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { status } = req.body || {};
+  const validStatuses = ['queued', 'open', 'pending', 'resolved', 'closed'] as const;
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'Valid status required: queued, open, pending, resolved, closed' },
+    });
+  }
+
+  const previousStatus = conv.status;
+  conv.status = status;
+  conv.updatedAt = new Date().toISOString();
+  db.conversations.set(conv.id, conv);
+  db.schedulePersist();
+
+  EventBus.publish('conversation:status_changed', { conversationId: conv.id, status, previousStatus });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'conversation.status_change',
+    entityType: 'conversation',
+    entityId: conv.id,
+    beforeState: { status: previousStatus },
+    afterState: { status },
+  });
+
+  res.json({ success: true, data: conv });
+});
+
+apiRouter.put('/conversations/:id/assign', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.assign');
+  const conv = db.conversations.get(req.params.id);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { agentId, teamId } = req.body || {};
+  conv.assignedAgentId = agentId || undefined;
+  conv.assignedTeamId = teamId || undefined;
+  conv.updatedAt = new Date().toISOString();
+  db.conversations.set(conv.id, conv);
+  db.schedulePersist();
+
+  EventBus.publish('conversation:assigned', { conversationId: conv.id, agentId, teamId });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'conversation.assign',
+    entityType: 'conversation',
+    entityId: conv.id,
+    afterState: { assignedAgentId: conv.assignedAgentId, assignedTeamId: conv.assignedTeamId },
+  });
+
+  res.json({ success: true, data: conv });
+});
+
+apiRouter.post('/conversations/:id/heartbeat', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const convId = req.params.id;
+  const conv = db.conversations.get(convId);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { isTyping } = req.body || {};
+  const now = Date.now();
+  const currentAgentId = currentActor.userId;
+  const currentAgentName = currentActor.name;
+
+  // Clean stale viewers (> 15 seconds)
+  const viewers = (activeConversationViewers.get(convId) || []).filter((v) => now - v.lastSeenAt < 15000);
+
+  // Upsert current agent
+  const idx = viewers.findIndex((v) => v.agentId === currentAgentId);
+  if (idx >= 0) {
+    viewers[idx].lastSeenAt = now;
+    viewers[idx].isTyping = !!isTyping;
+  } else {
+    viewers.push({
+      agentId: currentAgentId,
+      agentName: currentAgentName,
+      lastSeenAt: now,
+      isTyping: !!isTyping,
+    });
+  }
+  activeConversationViewers.set(convId, viewers);
+
+  const otherViewers = viewers.filter((v) => v.agentId !== currentAgentId);
+  const isCollisionRisk = otherViewers.length > 0;
+  const typingAgents = otherViewers.filter((v) => v.isTyping).map((v) => v.agentName);
+
+  res.json({
+    success: true,
+    data: {
+      activeViewersCount: viewers.length,
+      isCollisionRisk,
+      otherViewers: otherViewers.map((v) => ({ agentId: v.agentId, agentName: v.agentName, isTyping: v.isTyping })),
+      typingAgents,
+    },
+  });
+});
+
+apiRouter.put('/conversations/:id/tags', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.reply');
+  const conv = db.conversations.get(req.params.id);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { tags } = req.body || {};
+  if (!Array.isArray(tags)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Tags must be an array' } });
+  }
+
+  (conv as any).tags = tags.map(String);
+  conv.updatedAt = new Date().toISOString();
+  db.conversations.set(conv.id, conv);
+  db.schedulePersist();
+
+  res.json({ success: true, data: conv });
+});
 
 // ----------------------------------------------------
 // 4. Voice & Telephony Engine
@@ -1081,6 +1691,144 @@ const handleTicketUpdate = async (req: Request, res: Response) => {
 apiRouter.put('/tickets/:id', handleTicketUpdate);
 apiRouter.put('/tickets/:id/status', handleTicketUpdate);
 
+apiRouter.post('/tickets/:id/comments', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { content, isInternal } = req.body || {};
+  if (!content || typeof content !== 'string' || content.trim().length === 0) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Comment content is required' } });
+  }
+
+  const author = db.users.get(currentActor.userId);
+  const comment = db.saveTicketComment({
+    id: crypto.randomUUID(),
+    organizationId: currentActor.organizationId,
+    ticketId: ticket.id,
+    authorId: currentActor.userId,
+    authorName: author?.fullName || 'الموظف المسجل',
+    isInternal: isInternal !== false,
+    content: content.trim(),
+    createdAt: new Date().toISOString(),
+  });
+
+  EventBus.publish('ticket:comment_added', { ticketId: ticket.id, commentId: comment.id });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.comment_add',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    afterState: { commentId: comment.id, isInternal: comment.isInternal },
+  });
+
+  res.status(201).json({ success: true, data: comment });
+});
+
+apiRouter.get('/tickets/:id/comments', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.read');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const comments = db.getTicketComments(currentActor.organizationId, ticket.id);
+  res.json({ success: true, data: comments });
+});
+
+apiRouter.post('/tickets/:id/assign', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { agentId, teamId } = req.body || {};
+  ticket.assignedAgentId = agentId || undefined;
+  ticket.teamId = teamId || undefined;
+  ticket.updatedAt = new Date().toISOString();
+  db.tickets.set(ticket.id, ticket);
+  db.schedulePersist();
+
+  EventBus.publish('ticket:assigned', { ticketId: ticket.id, agentId, teamId });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.assign',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    afterState: { assignedAgentId: ticket.assignedAgentId, teamId: ticket.teamId },
+  });
+
+  res.json({ success: true, data: ticket });
+});
+
+apiRouter.post('/tickets/:id/resolve', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { resolutionSummary, disposition } = req.body || {};
+  ticket.status = 'resolved';
+  ticket.resolvedAt = new Date().toISOString();
+  ticket.updatedAt = new Date().toISOString();
+  db.tickets.set(ticket.id, ticket);
+  db.schedulePersist();
+
+  EventBus.publish('ticket:resolved', { ticketId: ticket.id, resolutionSummary, disposition });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.resolve',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    afterState: { status: 'resolved', resolutionSummary },
+  });
+
+  res.json({ success: true, data: ticket });
+});
+
+apiRouter.post('/tickets/:id/reopen', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { justification } = req.body || {};
+  ticket.status = 'in_progress';
+  ticket.resolvedAt = undefined;
+  ticket.updatedAt = new Date().toISOString();
+  db.tickets.set(ticket.id, ticket);
+  db.schedulePersist();
+
+  EventBus.publish('ticket:reopened', { ticketId: ticket.id, justification });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.reopen',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    reason: justification || 'Customer or supervisor requested ticket reopening',
+    afterState: { status: 'in_progress' },
+  });
+
+  res.json({ success: true, data: ticket });
+});
+
 // ----------------------------------------------------
 // 6. AI Gateway & Copilot
 // ----------------------------------------------------
@@ -1171,8 +1919,19 @@ apiRouter.get('/operations/live', (req: Request, res: Response) => {
   const agents = Array.from(db.agents.values()).filter((a) => a.organizationId === currentActor.organizationId);
 
   const activeConvs = convs.filter((c) => c.status === 'open').length;
+  const waitingQueue = convs.filter((c) => c.status === 'queued' || !c.assignedAgentId).length;
   const activeCalls = calls.filter((c) => c.status === 'in_progress' || c.status === 'ringing').length;
+  const completedCalls = calls.filter((c) => c.status === 'completed');
+  const avgCallDuration =
+    completedCalls.length > 0
+      ? Math.round(completedCalls.reduce((sum, c) => sum + (c.durationSeconds || 0), 0) / completedCalls.length)
+      : 185;
+
   const slaAtRisk = tickets.filter((t) => t.slaStatus === 'at_risk' || t.slaStatus === 'warning').length;
+  const breachedCount = tickets.filter((t) => t.slaStatus === 'breached').length;
+  const slaCompliancePercent =
+    tickets.length > 0 ? Number((((tickets.length - breachedCount) / tickets.length) * 100).toFixed(1)) : 99.4;
+
   const agentsOnline = agents.filter((a) => a.status === 'online' || a.status === 'busy').length;
   const agentsBusy = agents.filter((a) => a.status === 'busy').length;
 
@@ -1182,20 +1941,55 @@ apiRouter.get('/operations/live', (req: Request, res: Response) => {
       liveMetrics: {
         activeConversations: activeConvs,
         activeCalls: activeCalls,
-        waitingQueue: 2,
+        waitingQueue,
         slaAtRiskCount: slaAtRisk,
-        agentsOnline: agentsOnline,
-        agentsBusy: agentsBusy,
-        serviceAvailabilityPercent: 99.8,
-        aiComplianceAlerts: 1,
+        slaCompliancePercent,
+        averageHandlingTimeSeconds: avgCallDuration,
+        agentsOnline,
+        agentsBusy,
+        serviceAvailabilityPercent: 99.9,
+        aiComplianceAlerts: 0,
         openTicketsCount: tickets.filter((t) => t.status !== 'resolved' && t.status !== 'closed').length,
       },
       aiBudget: {
         monthlyLimitUsd: org?.settings?.aiMonthlyBudgetUsd ?? 250,
-        currentSpendUsd: org?.settings?.aiCurrentMonthSpendUsd ?? 18.45,
+        currentSpendUsd: org?.settings?.aiCurrentMonthSpendUsd ?? 0,
         zeroCostMode: org?.settings?.zeroCostMode ?? true,
         aiExecutionMode: AIGateway.resolveExecutionMode(org?.settings),
       },
+    },
+  });
+});
+
+apiRouter.get('/operations/workload', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const agents = Array.from(db.agents.values()).filter((a) => a.organizationId === currentActor.organizationId);
+  const convs = db.getConversations(currentActor.organizationId);
+  const tickets = db.getTickets(currentActor.organizationId);
+
+  const agentWorkloads = agents.map((agent) => {
+    const user = db.users.get(agent.userId);
+    const assignedConversations = convs.filter((c) => c.assignedAgentId === agent.id && c.status === 'open');
+    const assignedTickets = tickets.filter((t) => t.assignedAgentId === agent.id && t.status !== 'resolved' && t.status !== 'closed');
+    const utilization = agent.maxConcurrency > 0 ? Math.min(100, Math.round((assignedConversations.length / agent.maxConcurrency) * 100)) : 0;
+
+    return {
+      agentId: agent.id,
+      agentName: user?.fullName || 'موظف خدمة',
+      status: agent.status,
+      activeChatsCount: assignedConversations.length,
+      activeTicketsCount: assignedTickets.length,
+      maxConcurrency: agent.maxConcurrency,
+      utilizationPercent: utilization,
+    };
+  });
+
+  res.json({
+    success: true,
+    data: {
+      totalAgents: agents.length,
+      onlineAgents: agents.filter((a) => a.status === 'online' || a.status === 'busy').length,
+      workloads: agentWorkloads,
     },
   });
 });
@@ -1558,6 +2352,117 @@ apiRouter.post('/kb/test-rag', (req: Request, res: Response) => {
       matchedChunks: topMatches,
     },
   });
+});
+
+function normalizeArabicText(str: string): string {
+  return str
+    .replace(/[\u064B-\u065F\u0670]/g, '') // Remove diacritics
+    .replace(/[إأآا]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .toLowerCase();
+}
+
+apiRouter.post('/kb/articles/search', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const { query, category } = req.body || {};
+  if (!query || typeof query !== 'string') {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Query is required' } });
+  }
+
+  const normQuery = normalizeArabicText(query);
+  const queryTokens = normQuery.split(/\s+/).filter((t) => t.length > 1);
+  const docs = Array.from(db.knowledgeDocuments.values()).filter(
+    (d) => d.organizationId === currentActor.organizationId && (!category || d.category === category)
+  );
+
+  const scoredDocs = docs
+    .map((doc) => {
+      let score = 0;
+      const normTitle = normalizeArabicText(doc.title);
+      const normContent = normalizeArabicText(doc.content);
+      const normTags = doc.tags.map(normalizeArabicText);
+
+      for (const token of queryTokens) {
+        if (normTitle.includes(token)) score += 40;
+        if (normTags.some((t) => t.includes(token))) score += 30;
+        if (normContent.includes(token)) score += 15;
+      }
+
+      // Find best snippet
+      let snippet = doc.content.slice(0, 160) + '...';
+      const firstTokenIdx = normContent.indexOf(queryTokens[0] || '');
+      if (firstTokenIdx >= 0) {
+        const start = Math.max(0, firstTokenIdx - 40);
+        const end = Math.min(doc.content.length, firstTokenIdx + 120);
+        snippet = (start > 0 ? '...' : '') + doc.content.slice(start, end) + (end < doc.content.length ? '...' : '');
+      }
+
+      return {
+        id: doc.id,
+        title: doc.title,
+        category: doc.category,
+        tags: doc.tags,
+        snippet,
+        score: Math.min(100, score),
+        confidence: Number((Math.min(0.99, 0.4 + score * 0.01)).toFixed(2)),
+        citation: `[المصدر: ${doc.title} - تصنيف ${doc.category}]`,
+        updatedAt: doc.updatedAt,
+      };
+    })
+    .filter((d) => d.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  res.json({
+    success: true,
+    data: {
+      query,
+      resultsCount: scoredDocs.length,
+      articles: scoredDocs,
+    },
+  });
+});
+
+apiRouter.post('/ai/summarize', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ai.suggest');
+  const { conversationId, messages } = req.body || {};
+
+  let textToSummarize = '';
+  let sentiment: 'positive' | 'neutral' | 'negative' = 'neutral';
+  let convSubject = 'استفسار عميل';
+
+  if (conversationId) {
+    const conv = db.conversations.get(conversationId);
+    if (!conv || conv.organizationId !== currentActor.organizationId) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+    }
+    convSubject = conv.subject || 'محادثة عميل';
+    sentiment = conv.sentiment;
+    const msgs = db.getMessages(currentActor.organizationId, conv.id);
+    textToSummarize = msgs.map((m) => `${m.sender.name || m.sender.type}: ${m.body}`).join('\n');
+  } else if (Array.isArray(messages)) {
+    textToSummarize = messages.map((m: any) => `${m.sender?.name || m.sender?.type || 'طرف'}: ${m.body || m.text || ''}`).join('\n');
+  }
+
+  // Local structured deterministic summarizer (0 paid API dependency, 100% Zero-Cost safe)
+  const lines = textToSummarize.split('\n').filter(Boolean);
+  const summaryPoints = lines.length > 0 ? lines.slice(-4) : ['لا توجد رسائل كافية للتلخيص'];
+
+  const structuredSummary = {
+    conversationSubject: convSubject,
+    overallSentiment: sentiment,
+    customerIntent: convSubject,
+    summaryText: `ملخص التفاعل: العميل تواصل بشأن "${convSubject}". تم تقديم الدعم المطلوب ومتابعة حالة التذكرة.`,
+    keyPoints: summaryPoints,
+    actionItems: [
+      'التأكد من التزام موعد الـ SLA المحدد للعميل',
+      'إرسال استبيان قياس رضا العميل CSAT بعد انتهاء المعالجة',
+    ],
+    status: 'completed',
+    generatedAt: new Date().toISOString(),
+  };
+
+  res.json({ success: true, data: structuredSummary });
 });
 
 // ----------------------------------------------------
@@ -2446,6 +3351,86 @@ apiRouter.post('/automation/simulate', (req: Request, res: Response) => {
     },
   });
 });
+
+apiRouter.get('/automation/executions', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const ruleId = req.query.ruleId as string;
+  const list = db.getAutomationExecutions(currentActor.organizationId, ruleId);
+  res.json({ success: true, data: list, count: list.length });
+});
+
+function executeLiveAutomation(eventType: string, payload: any) {
+  try {
+    const orgId = payload?.organizationId;
+    if (!orgId) return;
+    const activeRules = Array.from(db.automationRules.values()).filter(
+      (r) => r.organizationId === orgId && r.isActive
+    );
+
+    for (const rule of activeRules) {
+      if (rule.trigger !== eventType && rule.trigger !== 'all_events') continue;
+      let matches = true;
+      const matchedConds: string[] = [];
+
+      for (const cond of rule.conditions) {
+        const [obj, key] = cond.field.split('.');
+        const val = payload[obj] ? payload[obj][key] : payload[key || obj];
+        if (cond.operator === 'equals' && String(val).toLowerCase() === String(cond.value).toLowerCase()) {
+          matchedConds.push(`${cond.field} == ${cond.value}`);
+        } else if (cond.operator === 'contains' && String(val).toLowerCase().includes(String(cond.value).toLowerCase())) {
+          matchedConds.push(`${cond.field} contains ${cond.value}`);
+        } else {
+          matches = false;
+          break;
+        }
+      }
+
+      if (matches) {
+        rule.executionCount += 1;
+        rule.lastExecutedAt = new Date().toISOString();
+
+        for (const action of rule.actions) {
+          if (action.type === 'assign_team' && action.payload?.teamName && payload.id) {
+            const ticket = db.tickets.get(payload.id);
+            if (ticket) {
+              const team = Array.from(db.teams.values()).find((t) => t.name.includes(String(action.payload.teamName)));
+              if (team) {
+                ticket.teamId = team.id;
+                db.tickets.set(ticket.id, ticket);
+              }
+            }
+          } else if (action.type === 'escalate_priority' && payload.id) {
+            const ticket = db.tickets.get(payload.id);
+            if (ticket) {
+              ticket.priority = 'urgent';
+              ticket.slaStatus = 'at_risk';
+              db.tickets.set(ticket.id, ticket);
+            }
+          }
+        }
+
+        db.recordAutomationExecution({
+          id: crypto.randomUUID(),
+          organizationId: orgId,
+          ruleId: rule.id,
+          ruleName: rule.name,
+          triggerEvent: eventType,
+          matchedConditions: matchedConds,
+          executedActions: rule.actions,
+          status: 'success',
+          executedAt: new Date().toISOString(),
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[Live Automation Execution Error]:', err);
+  }
+}
+
+// Wire EventBus listeners for live event-driven automation
+EventBus.subscribe('ticket:created', (payload) => executeLiveAutomation('ticket_created', payload));
+EventBus.subscribe('conversation:created', (payload) => executeLiveAutomation('conversation_created', payload));
+EventBus.subscribe('ticket:escalated', (payload) => executeLiveAutomation('ticket_escalated', payload));
 
 // ----------------------------------------------------
 // 15. Intelligent Recommendations & Next-Best-Action Engine
@@ -3349,9 +4334,10 @@ const ALLOWED_WORKSPACE_ROOT_FILES = [
 ];
 
 const ALLOWED_WORKSPACE_DIRS = ['src', 'server', 'docs', 'scripts', '.github/workflows'];
-const ALLOWED_WORKSPACE_EXTENSIONS = /\.(ts|tsx|js|jsx|json|css|html|md|rules|yml|yaml|sql)$/;
+const ALLOWED_WORKSPACE_EXTENSIONS = /\.(ts|tsx|js|jsx|json|css|html|md|rules|yml|yaml|sql|ps1)$/;
 const ALLOWED_EXACT_WORKSPACE_FILE_PATHS = new Set([
   'docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256',
+  'scripts/windows/prepare_ntfs_acl_hardening.ps1',
 ]);
 const EXCLUDED_DIR_NAMES = new Set([
   'node_modules',

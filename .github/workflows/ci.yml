@@ -62,7 +62,13 @@ jobs:
 
       - name: Run End-to-End Operations Suite
         run: |
-          OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true PORT=3000 NODE_ENV=development npx tsx server.ts > /tmp/ci-omniflow-server.log 2>&1 &
+          CHANNEL_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+          AUDIT_CHECKPOINT_HMAC_KEY="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" \
+          SESSION_SECRET="ci-session-secret-must-be-at-least-32-chars-long-123456789" \
+          OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true \
+          PORT=3000 \
+          NODE_ENV=test \
+          npx tsx server.ts > /tmp/ci-omniflow-server.log 2>&1 &
           SERVER_PID=$!
           trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
           READY=0

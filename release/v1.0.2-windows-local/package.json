@@ -1,0 +1,57 @@
+{
+  "name": "omniflow-os",
+  "private": true,
+  "version": "1.0.2",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --outfile=dist-server/server.cjs",
+    "start": "node dist-server/server.cjs",
+    "preview": "vite preview",
+    "clean": "node -e \"['dist','dist-server','server.js'].forEach(p=>{try{fs.rmSync(p,{recursive:true,force:true})}catch(e){}})\"",
+    "lint": "tsc --noEmit",
+    "test": "tsx server/test/run-enterprise-audit.ts",
+    "test:audit": "tsx server/test/run-enterprise-audit.ts",
+    "test:firestore": "tsx server/test/firestore-rules-audit.ts",
+    "test:isolation": "tsx scripts/test_workspace_isolation.ts",
+    "test:dr": "tsx scripts/test_disaster_recovery.ts",
+    "test:security": "tsx scripts/test_phase2_security.ts",
+    "owner:activate": "tsx scripts/activate_owner.ts",
+    "test:e2e": "tsx scripts/test_all_operations.ts"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "dotenv": "^17.2.3",
+    "drizzle-kit": "^0.31.10",
+    "drizzle-orm": "^0.45.2",
+    "express": "^4.21.2",
+    "firebase": "^12.19.0",
+    "firebase-admin": "^14.4.0",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "pg": "^8.23.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^6.2.3"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.0",
+    "@playwright/test": "^1.65.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/pg": "^8.23.1",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "firebase-tools": "^13.29.0",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3",
+    "vite-plugin-pwa": "^2.0.0"
+  }
+}

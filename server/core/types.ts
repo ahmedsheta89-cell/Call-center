@@ -84,7 +84,55 @@ export interface CustomerChannel {
   lastInteractionAt: string;
 }
 
-export type ChannelType = 'whatsapp' | 'messenger' | 'instagram' | 'email' | 'webchat' | 'voice';
+export type ChannelType = 'whatsapp' | 'messenger' | 'instagram' | 'email' | 'webchat' | 'voice' | 'telegram' | 'sms';
+
+export interface CustomerNote {
+  id: UUID;
+  organizationId: UUID;
+  customerId: UUID;
+  authorId: UUID;
+  authorName: string;
+  content: string;
+  createdAt: string;
+}
+
+export interface CustomerFollowUp {
+  id: UUID;
+  organizationId: UUID;
+  customerId: UUID;
+  assignedAgentId?: UUID;
+  dueAt: string;
+  priority: 'low' | 'medium' | 'high' | 'urgent';
+  reason: string;
+  status: 'pending' | 'completed' | 'cancelled';
+  createdAt: string;
+  completedAt?: string;
+}
+
+export interface TicketComment {
+  id: UUID;
+  organizationId: UUID;
+  ticketId: UUID;
+  authorId: UUID;
+  authorName: string;
+  isInternal: boolean;
+  content: string;
+  createdAt: string;
+}
+
+export interface AutomationRuleExecution {
+  id: UUID;
+  organizationId: UUID;
+  ruleId: string;
+  ruleName: string;
+  triggerEvent: string;
+  matchedConditions: string[];
+  executedActions: Array<{ type: string; payload: Record<string, unknown> }>;
+  status: 'success' | 'failed' | 'dead_letter';
+  error?: string;
+  idempotencyKey?: string;
+  executedAt: string;
+}
 
 export interface UnifiedMessage {
   id: UUID;

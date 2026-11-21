@@ -20,6 +20,10 @@ import {
   Ticket,
   AuditEvent,
   UUID,
+  CustomerNote,
+  CustomerFollowUp,
+  TicketComment,
+  AutomationRuleExecution,
 } from '../core/types.ts';
 import { AuditLogger, redactSensitiveValue } from '../core/audit.ts';
 import {
@@ -263,6 +267,14 @@ export interface IDataStore {
   saveConnectedDevice(orgIdOrDevice: UUID | ConnectedDeviceRecord, maybeDevice?: ConnectedDeviceRecord): ConnectedDeviceRecord;
   getCrossDeviceSyncEvents(orgId: UUID): CrossDeviceSyncEventRecord[];
   saveCrossDeviceSyncEvent(orgIdOrEvent: UUID | CrossDeviceSyncEventRecord, maybeEvent?: CrossDeviceSyncEventRecord): CrossDeviceSyncEventRecord;
+  getCustomerNotes(orgId: UUID, customerId: UUID): CustomerNote[];
+  saveCustomerNote(note: CustomerNote): CustomerNote;
+  getCustomerFollowUps(orgId: UUID, customerId?: UUID): CustomerFollowUp[];
+  saveCustomerFollowUp(followUp: CustomerFollowUp): CustomerFollowUp;
+  getTicketComments(orgId: UUID, ticketId: UUID): TicketComment[];
+  saveTicketComment(comment: TicketComment): TicketComment;
+  getAutomationExecutions(orgId: UUID, ruleId?: string): AutomationRuleExecution[];
+  recordAutomationExecution(exec: AutomationRuleExecution): AutomationRuleExecution;
   exportFullBackup(): Record<string, any>;
   exportTenantBackup(orgId: UUID): Record<string, any>;
   importFullBackup(data: any): boolean;
@@ -322,6 +334,10 @@ class DatabaseStore implements IDataStore {
   public teamQaFeedback: Map<UUID, TeamQAFeedbackRecord> = new Map();
   public connectedDevices: Map<UUID, ConnectedDeviceRecord> = new Map();
   public crossDeviceSyncEvents: Map<UUID, CrossDeviceSyncEventRecord> = new Map();
+  public customerNotes: Map<UUID, CustomerNote> = new Map();
+  public customerFollowUps: Map<UUID, CustomerFollowUp> = new Map();
+  public ticketComments: Map<UUID, TicketComment> = new Map();
+  public automationRuleExecutions: Map<UUID, AutomationRuleExecution> = new Map();
 
   // Indexes for high performance tenant filtering
   public orgIndex = {
@@ -836,6 +852,90 @@ class DatabaseStore implements IDataStore {
     return normalized;
   }
 
+  public getCustomerNotes(orgId: UUID, customerId: UUID): CustomerNote[] {
+    const validOrgId = this.assertValidOrganizationId(orgId);
+    return Array.from(this.customerNotes.values())
+      .filter((n) => n.organizationId === validOrgId && n.customerId === customerId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  }
+
+  public saveCustomerNote(note: CustomerNote): CustomerNote {
+    const validOrgId = this.assertValidOrganizationId(note.organizationId);
+    const id = note.id || crypto.randomUUID();
+    const record: CustomerNote = {
+      ...note,
+      id,
+      organizationId: validOrgId,
+      createdAt: note.createdAt || new Date().toISOString(),
+    };
+    this.customerNotes.set(id, record);
+    this.schedulePersist();
+    return record;
+  }
+
+  public getCustomerFollowUps(orgId: UUID, customerId?: UUID): CustomerFollowUp[] {
+    const validOrgId = this.assertValidOrganizationId(orgId);
+    return Array.from(this.customerFollowUps.values())
+      .filter((f) => f.organizationId === validOrgId && (!customerId || f.customerId === customerId))
+      .sort((a, b) => new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime());
+  }
+
+  public saveCustomerFollowUp(followUp: CustomerFollowUp): CustomerFollowUp {
+    const validOrgId = this.assertValidOrganizationId(followUp.organizationId);
+    const id = followUp.id || crypto.randomUUID();
+    const record: CustomerFollowUp = {
+      ...followUp,
+      id,
+      organizationId: validOrgId,
+      createdAt: followUp.createdAt || new Date().toISOString(),
+    };
+    this.customerFollowUps.set(id, record);
+    this.schedulePersist();
+    return record;
+  }
+
+  public getTicketComments(orgId: UUID, ticketId: UUID): TicketComment[] {
+    const validOrgId = this.assertValidOrganizationId(orgId);
+    return Array.from(this.ticketComments.values())
+      .filter((tc) => tc.organizationId === validOrgId && tc.ticketId === ticketId)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  }
+
+  public saveTicketComment(comment: TicketComment): TicketComment {
+    const validOrgId = this.assertValidOrganizationId(comment.organizationId);
+    const id = comment.id || crypto.randomUUID();
+    const record: TicketComment = {
+      ...comment,
+      id,
+      organizationId: validOrgId,
+      createdAt: comment.createdAt || new Date().toISOString(),
+    };
+    this.ticketComments.set(id, record);
+    this.schedulePersist();
+    return record;
+  }
+
+  public getAutomationExecutions(orgId: UUID, ruleId?: string): AutomationRuleExecution[] {
+    const validOrgId = this.assertValidOrganizationId(orgId);
+    return Array.from(this.automationRuleExecutions.values())
+      .filter((ae) => ae.organizationId === validOrgId && (!ruleId || ae.ruleId === ruleId))
+      .sort((a, b) => new Date(b.executedAt).getTime() - new Date(a.executedAt).getTime());
+  }
+
+  public recordAutomationExecution(exec: AutomationRuleExecution): AutomationRuleExecution {
+    const validOrgId = this.assertValidOrganizationId(exec.organizationId);
+    const id = exec.id || crypto.randomUUID();
+    const record: AutomationRuleExecution = {
+      ...exec,
+      id,
+      organizationId: validOrgId,
+      executedAt: exec.executedAt || new Date().toISOString(),
+    };
+    this.automationRuleExecutions.set(id, record);
+    this.schedulePersist();
+    return record;
+  }
+
   /**
    * Purges operational records belonging to a specific organization (used for isolated test tenant cleanup).
    */
@@ -859,6 +959,10 @@ class DatabaseStore implements IDataStore {
       this.teamQaFeedback,
       this.connectedDevices,
       this.crossDeviceSyncEvents,
+      this.customerNotes,
+      this.customerFollowUps,
+      this.ticketComments,
+      this.automationRuleExecutions,
     ];
     for (const map of maps) {
       for (const [key, val] of map.entries()) {
@@ -929,6 +1033,10 @@ class DatabaseStore implements IDataStore {
       teamQaFeedback: Array.from(this.teamQaFeedback.values()),
       connectedDevices: Array.from(this.connectedDevices.values()),
       crossDeviceSyncEvents: Array.from(this.crossDeviceSyncEvents.values()),
+      customerNotes: Array.from(this.customerNotes.values()),
+      customerFollowUps: Array.from(this.customerFollowUps.values()),
+      ticketComments: Array.from(this.ticketComments.values()),
+      automationRuleExecutions: Array.from(this.automationRuleExecutions.values()),
       auditEvents,
       auditCheckpoint,
       auditIntegrityManifest,
@@ -1001,6 +1109,18 @@ class DatabaseStore implements IDataStore {
       ),
       crossDeviceSyncEvents: Array.from(this.crossDeviceSyncEvents.values()).filter(
         (e) => e.organizationId === validOrgId
+      ),
+      customerNotes: Array.from(this.customerNotes.values()).filter(
+        (n) => n.organizationId === validOrgId
+      ),
+      customerFollowUps: Array.from(this.customerFollowUps.values()).filter(
+        (f) => f.organizationId === validOrgId
+      ),
+      ticketComments: Array.from(this.ticketComments.values()).filter(
+        (tc) => tc.organizationId === validOrgId
+      ),
+      automationRuleExecutions: Array.from(this.automationRuleExecutions.values()).filter(
+        (ae) => ae.organizationId === validOrgId
       ),
       auditEvents: tenantAuditEvents,
       auditTenantCheckpoint,
@@ -1079,6 +1199,10 @@ class DatabaseStore implements IDataStore {
       teamQaFeedback: Array.from(this.teamQaFeedback.values()),
       connectedDevices: Array.from(this.connectedDevices.values()),
       crossDeviceSyncEvents: Array.from(this.crossDeviceSyncEvents.values()),
+      customerNotes: Array.from(this.customerNotes.values()),
+      customerFollowUps: Array.from(this.customerFollowUps.values()),
+      ticketComments: Array.from(this.ticketComments.values()),
+      automationRuleExecutions: Array.from(this.automationRuleExecutions.values()),
       auditEvents,
       auditCheckpoint,
       auditIntegrityManifest,
@@ -1232,6 +1356,10 @@ class DatabaseStore implements IDataStore {
         'teamQaFeedback',
         'connectedDevices',
         'crossDeviceSyncEvents',
+        'customerNotes',
+        'customerFollowUps',
+        'ticketComments',
+        'automationRuleExecutions',
       ];
       const preLoadSnapshots: Record<string, Map<UUID, any>> = {};
       for (const k of collectionKeys) {
@@ -1367,6 +1495,10 @@ class DatabaseStore implements IDataStore {
       { key: 'teamQaFeedback', requireOrgId: true },
       { key: 'connectedDevices', requireOrgId: true },
       { key: 'crossDeviceSyncEvents', requireOrgId: true },
+      { key: 'customerNotes', requireOrgId: true },
+      { key: 'customerFollowUps', requireOrgId: true },
+      { key: 'ticketComments', requireOrgId: true },
+      { key: 'automationRuleExecutions', requireOrgId: true },
     ];
 
     const stagedMaps: Record<string, Map<UUID, any>> = {};

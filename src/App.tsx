@@ -901,6 +901,7 @@ export default function App() {
                       return (
                         <button
                           key={sib.id}
+                          data-nav-pill={sib.id}
                           onClick={() => setActiveTab(sib.id)}
                           className={`text-xs px-2.5 py-1 rounded-lg transition whitespace-nowrap ${
                             isSibActive

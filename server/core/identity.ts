@@ -460,7 +460,7 @@ export function issueSessionToken(options: {
     baseRole,
     name: user.fullName,
     email: user.email,
-    phoneNumber: user.phoneNumber || '01018108979',
+    phoneNumber: user.phoneNumber || null,
     csrfToken,
     authenticated: true,
     authMethod: 'session_token',
@@ -618,7 +618,7 @@ export function verifySessionToken(
     baseRole: currentBaseRole,
     name: user.fullName,
     email: user.email,
-    phoneNumber: user.phoneNumber || '01018108979',
+    phoneNumber: user.phoneNumber || null,
     csrfToken: sessionRecord.csrfToken,
     authenticated: true,
     authMethod,
@@ -811,6 +811,9 @@ function verifyCsrfForCookieMutation(
 
 const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
   '/auth/login',
+  '/auth/local-owner/status',
+  '/auth/local-owner/bootstrap',
+  '/auth/local-owner/login',
   '/platforms/download/android',
   '/platforms/download/windows',
 ]);

@@ -10,6 +10,9 @@ import dotenv from 'dotenv';
 import { resolveDurableDataPath, acquireDirectoryLock, releaseDirectoryLock } from "./server/db/localPersistenceEngine.ts";
 import { ensureRuntimeCryptoKeys } from "./server/core/cryptoKeyPolicy.ts";
 dotenv.config();
+if (!process.env.NODE_ENV) {
+  process.env.NODE_ENV = 'development';
+}
 const durableDataPath = resolveDurableDataPath();
 if (!durableDataPath.ok || !durableDataPath.filePath) { console.error(`[Fatal Storage Path] ${durableDataPath.errorCode}`); process["exit"](1); }
 const bootLock = acquireDirectoryLock(durableDataPath.filePath);
@@ -95,10 +98,16 @@ process.on("SIGINT", gracefulShutdown);
 const app = express();
 app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT) || 3000;
+let HOST = process.env.HOST || '127.0.0.1';
+const isZeroCostLocalMode = !process.env.NODE_ENV || process.env.NODE_ENV !== 'production' || process.env.OMNIFLOW_ZERO_COST === 'true';
+if (isZeroCostLocalMode && HOST !== '127.0.0.1' && HOST !== 'localhost') {
+  console.warn(`[Security Policy] Non-loopback HOST [${HOST}] rejected in Local Zero-Cost mode. Forcing 127.0.0.1.`);
+  HOST = '127.0.0.1';
+}
 
-// Bind port 3000 immediately so control-plane health checks succeed within <100ms
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[AI Contact Center OS] Server listening on http://0.0.0.0:${PORT}`);
+// Bind loopback host immediately so control-plane health checks succeed within <100ms
+const server = app.listen(PORT, HOST, () => {
+  console.log(`[AI Contact Center OS] Server listening on http://${HOST}:${PORT} (Local-First Zero-Cost Mode)`);
 });
 
 app.use(express.json({ limit: '10mb' }));
@@ -120,6 +129,8 @@ app.get('/api/health', async (_req, res) => {
     status: 'healthy',
     system: 'AI Contact Center OS',
     version: '1.0.2-enterprise',
+    mode: 'LOCAL_ZERO_COST',
+    host: `${HOST}:${PORT}`,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
   });
@@ -171,12 +182,14 @@ async function bootstrapModules() {
     { ensurePwaIconsGenerated, getPwaIconBuffer },
     { apiRouter },
     { mountLegacyUserRouteClosuresAndApiFallback },
+    { initLocalOwnerAuth },
   ] = await Promise.all([
     import('./server/db/store.ts'),
     import('./server/db/seed.ts'),
     import('./server/core/pwaAssets.ts'),
     import('./server/api/router.ts'),
-import('./server/core/identity.ts'),
+    import('./server/core/identity.ts'),
+    import('./server/core/localAuth.ts'),
   ]);
 
   // 1. Initialize Seed Data or Load from Persistent Storage
@@ -200,6 +213,9 @@ import('./server/core/identity.ts'),
     ensureEgyptSpecialCustomer();
     ensureAdminUser(); if (!db.saveToDisk()) throw new Error("[Storage] Final bootstrap persistence failed."); canFlushPersistence = true;
 } 
+  // 1.1. Initialize Local Owner Auth Engine
+  initLocalOwnerAuth(path.dirname(durableDataPath.filePath));
+
   // 2. ynamic PWA Binary Icon Serving
   ensurePwaIconsGenerated();
 
@@ -240,14 +256,14 @@ import('./server/core/identity.ts'),
   });
 
   // 4. Vite Middleware for Development / Static Serve for Production
-  if (process.env.NODE_ENV !== 'production') {
+  if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false, watch: null },
       appType: 'spa',
     });
     innerRouter.use(vite.middlewares);
-  } else {
+  } else if (process.env.NODE_ENV === 'production') {
     const distPath = path.join(process.cwd(), 'dist');
     // Security Gate: Never allow static exposure of server bundle or sourcemaps
     innerRouter.use((req, res, next) => {
