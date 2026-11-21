@@ -491,6 +491,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                     return (
                       <button
                         key={item.id}
+                        data-tab-id={item.id}
                         onClick={() => onSelectTab(item.id)}
                         title={isCollapsed ? item.label : undefined}
                         className={`w-full flex items-center justify-between px-2.5 py-2 rounded-xl text-xs font-medium transition-all ${

@@ -79,6 +79,11 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
   } | null>(null);
   const [copilotLoading, setCopilotLoading] = useState(false);
 
+  // Active Viewers Collision Prevention State
+  const [activeViewers, setActiveViewers] = useState<Array<{ agentId: string; agentName: string; lastSeenAt: string }>>([]);
+  const [currentStatus, setCurrentStatus] = useState<string>('open');
+  const [assignedAgent, setAssignedAgent] = useState<string>('usr-agent-01');
+
   const activeConv = conversations.find((c) => c.id === selectedConvId) || conversations[0];
 
   // Fetch macros on mount
@@ -124,6 +129,26 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
     if (!activeConv) return;
     setLoadingMessages(true);
     setCopilotSuggestion(null);
+    setCurrentStatus(activeConv.status);
+    setAssignedAgent(activeConv.assignedToAgentId || 'usr-agent-01');
+
+    // Polling heartbeat for active viewer collision prevention
+    const sendHeartbeat = async () => {
+      try {
+        const res = await fetch(`/api/v1/conversations/${activeConv.id}/heartbeat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agentId: 'usr-agent-01', agentName: 'سارة أحمد' }),
+        });
+        const d = await res.json();
+        if (d.success && Array.isArray(d.data?.activeViewers)) {
+          setActiveViewers(d.data.activeViewers);
+        }
+      } catch {}
+    };
+
+    sendHeartbeat();
+    const interval = setInterval(sendHeartbeat, 6000);
 
     // Fetch messages
     fetch(`/api/v1/conversations/${activeConv.id}/messages`)
@@ -146,7 +171,33 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
       .then((data) => {
         if (data.success) setCustomer(data.data);
       });
+
+    return () => clearInterval(interval);
   }, [activeConv?.id]);
+
+  const handleUpdateStatus = async (newStatus: string) => {
+    if (!activeConv) return;
+    setCurrentStatus(newStatus);
+    try {
+      await fetch(`/api/v1/conversations/${activeConv.id}/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: newStatus }),
+      });
+    } catch {}
+  };
+
+  const handleUpdateAssignee = async (agentId: string, agentName: string) => {
+    if (!activeConv) return;
+    setAssignedAgent(agentId);
+    try {
+      await fetch(`/api/v1/conversations/${activeConv.id}/assign`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId, agentName }),
+      });
+    } catch {}
+  };
 
   const triggerCopilot = (text: string) => {
     setCopilotLoading(true);
@@ -290,7 +341,7 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
         {activeConv ? (
           <>
             {/* Conversation Header */}
-            <div className="px-5 py-3 border-b border-slate-800 bg-slate-900/60 flex items-center justify-between">
+            <div className="px-5 py-3 border-b border-slate-800 bg-slate-900/60 flex items-center justify-between flex-wrap gap-3">
               <div>
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-bold text-white">{activeConv.customerName}</h2>
@@ -318,19 +369,57 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
                 </div>
               </div>
 
+              {/* Status and Assignment Selectors */}
               <div className="flex items-center gap-2">
-                <span className="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                  الحالة:{' '}
-                  {activeConv.status === 'open'
-                    ? 'مفتوحة'
-                    : activeConv.status === 'pending'
-                    ? 'قيد المعالجة'
-                    : activeConv.status === 'resolved'
-                    ? 'تم الحل'
-                    : 'مغلقة'}
-                </span>
+                <div className="flex items-center gap-1 bg-slate-950 px-2.5 py-1 rounded-xl border border-slate-800 text-xs">
+                  <span className="text-slate-400 text-[10px]">المسند:</span>
+                  <select
+                    value={assignedAgent}
+                    onChange={(e) => {
+                      const name = e.target.options[e.target.selectedIndex].text;
+                      handleUpdateAssignee(e.target.value, name);
+                    }}
+                    className="bg-transparent text-white text-xs font-semibold focus:outline-none cursor-pointer"
+                  >
+                    <option value="usr-agent-01" className="bg-slate-900 text-white">سارة أحمد</option>
+                    <option value="usr-agent-02" className="bg-slate-900 text-white">فهد السالم</option>
+                    <option value="usr-agent-03" className="bg-slate-900 text-white">عمر خالد</option>
+                    <option value="usr-agent-04" className="bg-slate-900 text-white">منى زكي</option>
+                  </select>
+                </div>
+
+                <div className="flex items-center gap-1 bg-slate-950 px-2.5 py-1 rounded-xl border border-slate-800 text-xs">
+                  <span className="text-slate-400 text-[10px]">الحالة:</span>
+                  <select
+                    value={currentStatus}
+                    onChange={(e) => handleUpdateStatus(e.target.value)}
+                    className="bg-transparent text-white text-xs font-semibold focus:outline-none cursor-pointer"
+                  >
+                    <option value="open" className="bg-slate-900 text-white">مفتوحة</option>
+                    <option value="pending" className="bg-slate-900 text-white">قيد المعالجة</option>
+                    <option value="resolved" className="bg-slate-900 text-white">تم الحل</option>
+                    <option value="closed" className="bg-slate-900 text-white">مغلقة</option>
+                  </select>
+                </div>
               </div>
             </div>
+
+            {/* Active Collision Warning Banner */}
+            {activeViewers.filter((v) => v.agentId !== 'usr-agent-01').length > 0 && (
+              <div className="px-5 py-2.5 bg-rose-950/70 border-b border-rose-500/40 flex items-center justify-between text-xs text-rose-200 animate-pulse">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span className="font-bold">تحذير تفادي التضارب (Active Collision Alert):</span>
+                  <span>
+                    الموظف ({activeViewers.filter((v) => v.agentId !== 'usr-agent-01').map((v) => v.agentName).join(', ')})
+                    يقرأ هذه المحادثة الآن. يُرجى التنسيق لتجنب الازدواجية في الرد.
+                  </span>
+                </div>
+                <span className="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 font-mono font-bold">
+                  متصل الآن
+                </span>
+              </div>
+            )}
 
             {/* AI Next-Best-Action (NBA) Live Recommendation Banner */}
             <div className="px-4 py-2.5 bg-gradient-to-r from-amber-950/40 via-slate-900 to-indigo-950/40 border-b border-slate-800 flex items-center justify-between gap-3 text-xs">
