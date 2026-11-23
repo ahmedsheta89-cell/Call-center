@@ -117,11 +117,14 @@ app.use(express.urlencoded({ extended: true }));
 app.get('/api/health', async (_req, res) => {
   if (process.env.NODE_ENV === 'production') {
     const rawSecret = process.env.SESSION_SECRET;
-    if (!rawSecret || rawSecret.trim().length < 32) {
+    const isPlaceholder = !rawSecret ||
+      rawSecret.trim().length < 32 ||
+      /^(REPLACE_WITH|YOUR_|CHANGEME|MY_|DEFAULT|EXAMPLE|TEMPLATE)/i.test(rawSecret.trim());
+    if (isPlaceholder) {
       return res.status(503).json({
         status: 'misconfigured',
         code: 'SESSION_SECRET_MISCONFIGURED',
-        message: 'SESSION_SECRET must be set (>= 32 chars) in production.',
+        message: 'SESSION_SECRET must be set (>= 32 chars of high-entropy non-placeholder text) in production. Run setup-keys to configure.',
       });
     }
   }

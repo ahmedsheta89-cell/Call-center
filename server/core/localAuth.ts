@@ -93,7 +93,27 @@ export function getLatestKnownGeneration(): number {
 }
 
 export function setLatestKnownGenerationForTesting(gen: number): void {
+  const isAllowedTest =
+    process.env.NODE_ENV === 'test' ||
+    process.env.OMNIFLOW_TEST_MODE === '1' ||
+    process.env.VITEST === 'true';
+  if (!isAllowedTest) {
+    throw new Error('UNAUTHORIZED_CALL: setLatestKnownGenerationForTesting is restricted strictly to test mode.');
+  }
   latestKnownGeneration = gen;
+}
+
+export interface RateLimitCheckpoint {
+  schemaVersion: 1;
+  durableGeneration: number;
+  lastPersistedAt: string;
+  lockedKeys: string[];
+  primarySha256?: string;
+  backupSha256?: string;
+}
+
+export function getRateLimitCheckpointFilePath(dataDir: string): string {
+  return path.join(dataDir, '.rate_limit_checkpoint.json');
 }
 
 export type RateLimitStorageHealth =
@@ -247,12 +267,75 @@ function writeStateFile(filePath: string, bakPath: string, payload: PersistentRa
 
   fs.renameSync(tmpPath, filePath);
   latestKnownGeneration = Math.max(latestKnownGeneration, payload.generation);
+
+  // Persist durable checkpoint (anti-rollback freshness & lockout anchor)
+  try {
+    const checkpointPath = getRateLimitCheckpointFilePath(dataDir);
+    const now = Date.now();
+    const lockedKeys: string[] = [];
+    for (const [k, v] of Object.entries(payload.entries)) {
+      if (v.blockedUntil > now || v.attempts >= MAX_FAILED_ATTEMPTS) {
+        lockedKeys.push(k);
+      }
+    }
+
+    const primarySha256 = crypto.createHash('sha256').update(serialized).digest('hex');
+    let backupSha256: string | undefined = undefined;
+    if (fs.existsSync(bakPath)) {
+      try {
+        backupSha256 = crypto.createHash('sha256').update(fs.readFileSync(bakPath)).digest('hex');
+      } catch {}
+    }
+
+    const checkpointPayload: RateLimitCheckpoint = {
+      schemaVersion: 1,
+      durableGeneration: payload.generation,
+      lastPersistedAt: payload.updatedAt,
+      lockedKeys,
+      primarySha256,
+      backupSha256,
+    };
+
+    const cpTmpPath = `${checkpointPath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    const cpSerialized = JSON.stringify(checkpointPayload, null, 2);
+    const cpFd = fs.openSync(cpTmpPath, 'w', 0o600);
+    try {
+      fs.writeSync(cpFd, cpSerialized, 0, 'utf8');
+      fs.fsyncSync(cpFd);
+    } finally {
+      fs.closeSync(cpFd);
+    }
+    fs.renameSync(cpTmpPath, checkpointPath);
+  } catch (cpErr: any) {
+    console.warn(`[RateLimit Security] Failed to update durable checkpoint: ${cpErr?.message}`);
+  }
 }
 
 export function loadRateLimitStateFromDisk(dataDir: string): void {
   const filePath = getRateLimitFilePath(dataDir);
   const bakPath = getRateLimitBackupFilePath(dataDir);
+  const checkpointPath = getRateLimitCheckpointFilePath(dataDir);
 
+  // Read durable checkpoint to establish baseline freshness and anti-relaxation requirements
+  let checkpoint: RateLimitCheckpoint | null = null;
+  if (fs.existsSync(checkpointPath)) {
+    try {
+      const cpRaw = fs.readFileSync(checkpointPath, 'utf8');
+      const cpParsed = JSON.parse(cpRaw);
+      if (
+        cpParsed &&
+        cpParsed.schemaVersion === 1 &&
+        typeof cpParsed.durableGeneration === 'number' &&
+        Number.isFinite(cpParsed.durableGeneration) &&
+        Array.isArray(cpParsed.lockedKeys)
+      ) {
+        checkpoint = cpParsed;
+        latestKnownGeneration = Math.max(latestKnownGeneration, checkpoint.durableGeneration);
+      }
+    } catch {}
+  }
+
+  // 1. Primary file missing check
   if (!fs.existsSync(filePath)) {
     if (fs.existsSync(bakPath)) {
       try {
@@ -266,12 +349,32 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
           typeof parsed.generation === 'number' &&
           Number.isFinite(parsed.generation);
 
+        // Anti-rollback / anti-relaxation across cold restart:
+        // Freshness can ONLY be proven if:
+        // A) A valid checkpoint exists, AND
+        // B) The backup generation is at least (checkpoint.durableGeneration - 1)
+        // If checkpoint is absent or backup generation is older, freshness CANNOT be proven!
         const isBakFresh =
           isBakValid &&
-          (latestKnownGeneration === 0 || parsed.generation >= latestKnownGeneration - 1);
+          checkpoint !== null &&
+          parsed.generation >= checkpoint.durableGeneration - 1;
 
         if (isBakValid && isBakFresh) {
           populateRateLimitMap(parsed.entries);
+          // Enforce anti-relaxation: all locked keys from checkpoint remain locked
+          if (checkpoint && Array.isArray(checkpoint.lockedKeys)) {
+            for (const lk of checkpoint.lockedKeys) {
+              const existing = rateLimitMap.get(lk);
+              if (!existing || existing.blockedUntil <= Date.now() || existing.attempts < MAX_FAILED_ATTEMPTS) {
+                rateLimitMap.set(lk, {
+                  attempts: MAX_FAILED_ATTEMPTS,
+                  firstAttemptAt: Date.now(),
+                  blockedUntil: Date.now() + BLOCK_DURATION_MS,
+                });
+              }
+            }
+          }
+
           latestKnownGeneration = Math.max(latestKnownGeneration, parsed.generation + 1);
           const recoveredPayload: PersistentRateLimitStore = {
             version: 1,
@@ -281,15 +384,25 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
           };
           writeStateFile(filePath, bakPath, recoveredPayload);
           currentStorageHealth = 'CORRUPTED_RECOVERED';
-          lastStorageError = 'Primary state missing; restored restrictive state from .bak';
+          lastStorageError = 'Primary state missing; restored restrictive state from verified fresh .bak';
           return;
         } else {
           currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
-          lastStorageError = 'Primary state missing and backup is stale or unverified. Halting authentication fail-secure.';
+          lastStorageError = checkpoint === null
+            ? 'Primary state missing and checkpoint absent; freshness cannot be proven across restart. Halting authentication fail-secure.'
+            : `Primary state missing and backup generation (${parsed?.generation}) is stale compared to durable checkpoint (${checkpoint.durableGeneration}). Halting authentication fail-secure.`;
           return;
         }
       } catch {}
     }
+
+    // Neither primary nor backup exists
+    if (checkpoint) {
+      currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
+      lastStorageError = 'Durable checkpoint exists but primary and backup rate-limit states are missing. Halting authentication fail-secure.';
+      return;
+    }
+
     if (currentStorageHealth !== 'STORAGE_UNWRITABLE' && currentStorageHealth !== 'CORRUPTED_UNRECOVERABLE') {
       currentStorageHealth = 'HEALTHY';
       lastStorageError = null;
@@ -297,6 +410,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     return;
   }
 
+  // 2. Primary file exists: attempt to read and validate
   let raw: string;
   try {
     raw = fs.readFileSync(filePath, 'utf8');
@@ -323,9 +437,30 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     parsed = null;
   }
 
+  // Verify primary freshness against durable checkpoint if checkpoint exists
+  if (parsed && checkpoint && parsed.generation < checkpoint.durableGeneration) {
+    console.warn(`[RateLimit Security] Primary state generation (${parsed.generation}) is older than durable checkpoint (${checkpoint.durableGeneration}). Treating primary as corrupt.`);
+    parsed = null;
+  }
+
   if (parsed) {
     latestKnownGeneration = Math.max(latestKnownGeneration, parsed.generation);
     populateRateLimitMap(parsed.entries);
+
+    // Enforce anti-relaxation from durable checkpoint
+    if (checkpoint && Array.isArray(checkpoint.lockedKeys)) {
+      for (const lk of checkpoint.lockedKeys) {
+        const existing = rateLimitMap.get(lk);
+        if (!existing || existing.blockedUntil <= Date.now() || existing.attempts < MAX_FAILED_ATTEMPTS) {
+          rateLimitMap.set(lk, {
+            attempts: MAX_FAILED_ATTEMPTS,
+            firstAttemptAt: Date.now(),
+            blockedUntil: Date.now() + BLOCK_DURATION_MS,
+          });
+        }
+      }
+    }
+
     if (currentStorageHealth !== 'CORRUPTED_RECOVERED') {
       currentStorageHealth = 'HEALTHY';
       lastStorageError = null;
@@ -338,8 +473,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     return;
   }
 
-  // === CORRUPTION DETECTED ===
-  // 1. Quarantine corrupted file as forensic evidence
+  // === CORRUPTION DETECTED IN PRIMARY ===
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const corruptPath = `${filePath}.corrupt.${timestamp}`;
   try {
@@ -349,7 +483,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     console.error(`[RateLimit Security] Failed to quarantine corrupt state file: ${qErr?.message}`);
   }
 
-  // 2. Attempt recovery from backup (.bak) with monotonic generation verification
+  // Attempt recovery from backup (.bak) with durable freshness verification
   if (fs.existsSync(bakPath)) {
     try {
       const bakRaw = fs.readFileSync(bakPath, 'utf8');
@@ -362,15 +496,29 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
         typeof bakParsed.generation === 'number' &&
         Number.isFinite(bakParsed.generation);
 
-      // Anti-rollback / anti-relaxation gate:
-      // If latestKnownGeneration is established and the backup generation is older than latestKnownGeneration - 1,
-      // the backup is stale. Restoring an outdated backup might relax an active block or give extra attempts.
+      const minRequiredGen = checkpoint ? checkpoint.durableGeneration - 1 : (latestKnownGeneration > 0 ? latestKnownGeneration - 1 : -1);
       const isBackupFresh =
         isBakStructureValid &&
-        (latestKnownGeneration === 0 || bakParsed.generation >= latestKnownGeneration - 1);
+        minRequiredGen >= 0 &&
+        bakParsed.generation >= minRequiredGen;
 
       if (isBakStructureValid && isBackupFresh) {
         populateRateLimitMap(bakParsed.entries);
+
+        // Anti-relaxation: locked keys from checkpoint must remain locked
+        if (checkpoint && Array.isArray(checkpoint.lockedKeys)) {
+          for (const lk of checkpoint.lockedKeys) {
+            const existing = rateLimitMap.get(lk);
+            if (!existing || existing.blockedUntil <= Date.now() || existing.attempts < MAX_FAILED_ATTEMPTS) {
+              rateLimitMap.set(lk, {
+                attempts: MAX_FAILED_ATTEMPTS,
+                firstAttemptAt: Date.now(),
+                blockedUntil: Date.now() + BLOCK_DURATION_MS,
+              });
+            }
+          }
+        }
+
         latestKnownGeneration = Math.max(latestKnownGeneration, bakParsed.generation + 1);
 
         const recoveredPayload: PersistentRateLimitStore = {
@@ -381,14 +529,14 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
         };
         writeStateFile(filePath, bakPath, recoveredPayload);
         currentStorageHealth = 'CORRUPTED_RECOVERED';
-        lastStorageError = `Corrupt primary state quarantined to ${path.basename(corruptPath)}; restored restrictive state from .bak (gen ${bakParsed.generation} -> ${latestKnownGeneration})`;
+        lastStorageError = `Corrupt primary state quarantined to ${path.basename(corruptPath)}; restored restrictive state from verified .bak (gen ${bakParsed.generation} -> ${latestKnownGeneration})`;
         console.warn(`[RateLimit Security] ${lastStorageError}`);
         return;
       } else {
         const corruptBakPath = `${bakPath}.corrupt.${timestamp}`;
         try { fs.renameSync(bakPath, corruptBakPath); } catch {}
         currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
-        lastStorageError = `Primary corrupt and backup is stale/unverified (bakGen=${bakParsed?.generation}, knownGen=${latestKnownGeneration}). Refusing restore fail-closed.`;
+        lastStorageError = `Primary corrupt and backup is stale or unverified (bakGen=${bakParsed?.generation}, minRequired=${minRequiredGen}). Refusing restore fail-closed.`;
         console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
         return;
       }
@@ -400,7 +548,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
 
   // 3. Unrecoverable: No valid or verified backup exists -> FAIL-CLOSED
   currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
-  lastStorageError = `Corrupted state file quarantined to ${path.basename(corruptPath)}; no valid backup available. Halting authentication fail-secure.`;
+  lastStorageError = `Corrupted state file quarantined to ${path.basename(corruptPath)}; no valid or verified backup available. Halting authentication fail-secure.`;
   console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
 }
 
@@ -542,11 +690,15 @@ export function clearAllRateLimits(dataDir?: string, authorizationToken?: string
   if (dataDir) {
     const filePath = getRateLimitFilePath(dataDir);
     const bakPath = getRateLimitBackupFilePath(dataDir);
+    const cpPath = getRateLimitCheckpointFilePath(dataDir);
     try {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     } catch (_) {}
     try {
       if (fs.existsSync(bakPath)) fs.unlinkSync(bakPath);
+    } catch (_) {}
+    try {
+      if (fs.existsSync(cpPath)) fs.unlinkSync(cpPath);
     } catch (_) {}
   }
 }

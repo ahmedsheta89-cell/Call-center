@@ -1,15 +1,27 @@
 /**
  * @file server/modules/integrations/adapters/webchat.ts
  * Website Live Chat Zero-Cost Local Adapter
+ * State: CONNECTED (Native zero-cost channel)
  */
 
 import crypto from 'crypto';
 import { ChannelType, UnifiedMessage, UUID } from '../../../core/types.ts';
-import { ChannelAdapter, WebhookVerificationResult } from '../contracts.ts';
+import {
+  ChannelAdapter,
+  WebhookVerificationResult,
+  AdapterOperationalState,
+  AdapterHealthStatus,
+  MessageDeliveryStatus,
+} from '../contracts.ts';
 
 export class WebChatChannelAdapter implements ChannelAdapter {
   public channelType: ChannelType = 'webchat';
   public name = 'OmniFlow Web Chat Widget (Local Zero-Cost)';
+  private state: AdapterOperationalState = 'CONNECTED';
+
+  public getState(): AdapterOperationalState {
+    return this.state;
+  }
 
   public async verifyWebhook(
     headers: Record<string, string>,
@@ -64,15 +76,16 @@ export class WebChatChannelAdapter implements ChannelAdapter {
 
   public async dispatchOutboundMessage(
     message: UnifiedMessage
-  ): Promise<{ externalMessageId: string; status: 'sent' | 'delivered' | 'failed' }> {
+  ): Promise<{ externalMessageId: string; status: MessageDeliveryStatus }> {
     return {
       externalMessageId: `web-out-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
       status: 'delivered',
     };
   }
 
-  public async fetchHealthStatus(): Promise<{ isHealthy: boolean; latencyMs: number; details?: string }> {
+  public async fetchHealthStatus(): Promise<AdapterHealthStatus> {
     return {
+      state: 'CONNECTED',
       isHealthy: true,
       latencyMs: 1,
       details: 'Local Web Chat engine operational (0 external dependencies, $0.00)',

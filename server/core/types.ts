@@ -156,7 +156,7 @@ export interface UnifiedMessage {
     sizeBytes: number;
     hashSha256: string;
   }>;
-  status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
+  status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed' | 'simulated';
   metadata: Record<string, unknown>;
   createdAt: string;
 }

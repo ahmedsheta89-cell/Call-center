@@ -777,10 +777,12 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
 
               <div className="grid grid-cols-3 gap-3">
                 <div>
-                  <label className="block text-slate-400 mb-1">الفئة (Tier):</label>
+                  <label htmlFor="new-cust-tier" className="block text-slate-400 mb-1">الفئة (Tier):</label>
                   <select
+                    id="new-cust-tier"
                     value={newCustTier}
                     onChange={(e) => setNewCustTier(e.target.value as any)}
+                    aria-label="فئة العميل"
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-emerald-500 font-mono"
                   >
                     <option value="standard">Standard</option>
@@ -1021,10 +1023,12 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">الأولوية:</label>
+                  <label htmlFor="fu-priority" className="block text-slate-400 mb-1">الأولوية:</label>
                   <select
+                    id="fu-priority"
                     value={fuPriority}
                     onChange={(e) => setFuPriority(e.target.value)}
+                    aria-label="أولوية المتابعة"
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500 font-mono"
                   >
                     <option value="low">منخفضة</option>

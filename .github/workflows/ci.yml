@@ -2,25 +2,25 @@ name: Enterprise CI, Security Gate & Firestore Rules Verification Pipeline
 
 on:
   push:
-    branches: [main, master, 'fix/**']
+    branches: [main, master, 'feat/**', 'fix/**']
   pull_request:
-    branches: [main, master, 'fix/**']
+    branches: [main, master, 'feat/**', 'fix/**']
 
 permissions:
   contents: read
 
 jobs:
   verify-build-and-audit:
-    name: TypeScript Lint, Production Build, Static Firestore AST & E2E Audit
+    name: TypeScript Lint, Build, Rate-Limit Cold-Restart, Playwright E2E, Clean Release & Firestore Verification
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Java 21 Runtime (Temurin — Required by Firebase Firestore Emulator v1.22+)
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
@@ -31,12 +31,12 @@ jobs:
           java -version
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Install Dependencies (Lockfile-Free Workspace Strategy)
-        run: npm install --no-audit --no-fund
+      - name: Install Dependencies with Exact Lockfile Verification
+        run: npm ci --no-audit --no-fund
 
       - name: TypeScript Strict Typecheck (Zero Errors)
         run: npm run lint
@@ -44,8 +44,20 @@ jobs:
       - name: Build Production Frontend & Backend Bundle
         run: npm run build
 
+      - name: Install Playwright Browsers & System Dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Rate-Limiting Cold-Restart Anti-Rollback Suite
+        run: npm run test:cold-restart
+
+      - name: Run Omnichannel & Telephony Adapter Contract Suite (State Separation & Crypto Validation)
+        run: npm run test:adapters
+
+      - name: Run Clean Isolated Release Installation Suite (Zero node_modules)
+        run: npm run test:release:clean
+
       - name: Cache Firebase Emulators
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: ~/.cache/firebase/emulators
           key: firebase-emulators-${{ runner.os }}-v1
@@ -59,6 +71,31 @@ jobs:
 
       - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
         run: npm run test:audit
+
+      - name: Run Playwright 9-Scenario Human User Journey & WCAG 2.2 AA Accessibility Suite
+        env:
+          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}/audit-artifacts
+        run: npm run test:e2e:browser
+
+      - name: Package Standalone Windows Distribution Archive & Generate Manifest
+        run: npm run package:release
+
+      - name: Upload Playwright E2E Screenshots & Audit Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-e2e-artifacts
+          path: |
+            audit-artifacts/screenshots/
+            audit-artifacts/playwright_e2e_results.json
+          retention-days: 14
+
+      - name: Upload Standalone Release Distribution Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniflow-release-package
+          path: release/v*.zip
+          retention-days: 14
 
       - name: Run End-to-End Operations Suite
         run: |

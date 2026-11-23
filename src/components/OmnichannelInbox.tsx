@@ -379,6 +379,7 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
                       const name = e.target.options[e.target.selectedIndex].text;
                       handleUpdateAssignee(e.target.value, name);
                     }}
+                    aria-label="تحديد الموظف المسند"
                     className="bg-transparent text-white text-xs font-semibold focus:outline-none cursor-pointer"
                   >
                     <option value="usr-agent-01" className="bg-slate-900 text-white">سارة أحمد</option>
@@ -393,6 +394,7 @@ export const OmnichannelInbox: React.FC<OmnichannelInboxProps> = ({
                   <select
                     value={currentStatus}
                     onChange={(e) => handleUpdateStatus(e.target.value)}
+                    aria-label="تحديد حالة المحادثة"
                     className="bg-transparent text-white text-xs font-semibold focus:outline-none cursor-pointer"
                   >
                     <option value="open" className="bg-slate-900 text-white">مفتوحة</option>

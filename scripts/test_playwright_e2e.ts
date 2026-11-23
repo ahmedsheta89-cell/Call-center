@@ -1,19 +1,22 @@
 /**
  * @file scripts/test_playwright_e2e.ts
  * OmniFlow OS — Master Playwright End-to-End Human User Journey Suite
- * Tests 8 Complete Scenarios, Real Browser Rendering, RTL UX, and WCAG 2.2 AA Accessibility
+ * Tests 9 Complete Scenarios, Real Browser Rendering, RTL UX, and WCAG 2.2 AA Accessibility with axe-core
  */
 
 import { chromium, Browser, BrowserContext, Page } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as http from 'http';
 
-const TEST_PORT = 3199;
+const TEST_PORT = parseInt(process.env.E2E_PORT || '3199', 10);
 const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
-const SCREENSHOTS_DIR = 'F:\\Dev_Workspace\\Audit\\OMNIFLOW_OS\\MASTER_COMPLETION_MISSION\\screenshots';
-const E2E_DATA_DIR = 'F:\\Dev_Workspace\\Call-center\\data-e2e';
+const WORKSPACE_DIR = process.cwd();
+const AUDIT_DIR = process.env.OMNIFLOW_AUDIT_DIR || path.resolve(WORKSPACE_DIR, '..', 'Audit', 'OMNIFLOW_OS', 'MASTER_COMPLETION_MISSION');
+const SCREENSHOTS_DIR = path.resolve(AUDIT_DIR, 'screenshots');
+const E2E_DATA_DIR = process.env.OMNIFLOW_E2E_DATA_DIR || path.resolve(WORKSPACE_DIR, 'data-e2e');
 
 interface ScenarioResult {
   scenarioId: number;
@@ -36,6 +39,41 @@ async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function safeCleanTestDir(dir: string): void {
+  if (!fs.existsSync(dir)) return;
+  const markerPath = path.join(dir, '.omniflow_test_owner');
+  if (fs.existsSync(markerPath)) {
+    try {
+      const content = JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
+      if (content.tag === 'OMNIFLOW_E2E_TEST_ISOLATION') {
+        fs.rmSync(dir, { recursive: true, force: true });
+        return;
+      }
+    } catch {
+      // Fall through to basename check
+    }
+  }
+  const baseName = path.basename(dir).toLowerCase();
+  if (baseName.includes('e2e') || baseName.includes('test')) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  }
+  throw new Error(`SECURITY SAFETY ABORT: Directory "${dir}" lacks ownership marker .omniflow_test_owner. Aborting deletion.`);
+}
+
+function initTestDirWithMarker(dir: string): void {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const marker = {
+    tag: 'OMNIFLOW_E2E_TEST_ISOLATION',
+    createdBy: 'test_playwright_e2e.ts',
+    pid: process.pid,
+    createdAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(dir, '.omniflow_test_owner'), JSON.stringify(marker, null, 2), 'utf-8');
+}
+
 async function waitForServer(url: string, timeoutMs = 15000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -54,14 +92,10 @@ async function waitForServer(url: string, timeoutMs = 15000): Promise<boolean> {
 }
 
 async function startServerProcess(cleanDir = true): Promise<ChildProcess> {
-  if (cleanDir && fs.existsSync(E2E_DATA_DIR)) {
-    try {
-      fs.rmSync(E2E_DATA_DIR, { recursive: true, force: true });
-    } catch {}
+  if (cleanDir) {
+    safeCleanTestDir(E2E_DATA_DIR);
   }
-  if (!fs.existsSync(E2E_DATA_DIR)) {
-    fs.mkdirSync(E2E_DATA_DIR, { recursive: true });
-  }
+  initTestDirWithMarker(E2E_DATA_DIR);
 
   const testChannelKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
   const testAuditKey = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
@@ -79,7 +113,7 @@ async function startServerProcess(cleanDir = true): Promise<ChildProcess> {
   };
 
   const serverProc = spawn('node', ['dist-server/server.cjs'], {
-    cwd: 'F:\\Dev_Workspace\\Call-center',
+    cwd: WORKSPACE_DIR,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -95,13 +129,25 @@ async function startServerProcess(cleanDir = true): Promise<ChildProcess> {
 
 async function stopServerProcess(proc: ChildProcess): Promise<void> {
   return new Promise((resolve) => {
-    proc.on('exit', () => resolve());
-    proc.kill('SIGTERM');
+    let resolved = false;
+    const finish = () => {
+      if (!resolved) {
+        resolved = true;
+        resolve();
+      }
+    };
+    proc.on('exit', finish);
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      finish();
+      return;
+    }
     setTimeout(() => {
       try {
         proc.kill('SIGKILL');
       } catch {}
-      resolve();
+      finish();
     }, 3000);
   });
 }
@@ -724,12 +770,33 @@ async function main() {
     // SCENARIO 9: ACCESSIBILITY & WCAG 2.2 AA AUDIT
     // -------------------------------------------------------------
     await runScenario(9, 'WCAG 2.2 AA Accessibility & Usability Audit', 'تدقيق إمكانية الوصول والتوافق مع WCAG 2.2 AA', async (details, capture) => {
-      details.push('1. Check document title and language attributes');
+      details.push('1. Run automated axe-core accessibility engine analysis');
+      const axeResults = await new AxeBuilder({ page })
+        .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
+        .analyze();
+
+      const criticalViolations = axeResults.violations.filter((v) => v.impact === 'critical');
+      const seriousViolations = axeResults.violations.filter((v) => v.impact === 'serious');
+      const moderateViolations = axeResults.violations.filter((v) => v.impact === 'moderate');
+      const minorViolations = axeResults.violations.filter((v) => v.impact === 'minor');
+
+      details.push(
+        `axe-core analysis completed: ${axeResults.passes.length} rules passed, ${axeResults.violations.length} total violations ` +
+        `[Critical: ${criticalViolations.length}, Serious: ${seriousViolations.length}, Moderate: ${moderateViolations.length}, Minor: ${minorViolations.length}]`
+      );
+
+      if (criticalViolations.length > 0) {
+        const issues = criticalViolations.map((v) => `${v.id}: ${v.description} (${v.nodes.length} nodes)`).join('; ');
+        throw new Error(`Critical accessibility violations detected: ${issues}`);
+      }
+      details.push('Verified: 0 critical accessibility violations detected across evaluated interface');
+
+      details.push('2. Check document title and language attributes');
       const langAttr = await page.getAttribute('html', 'lang');
       const dirAttr = await page.getAttribute('html', 'dir');
       details.push(`html[lang="${langAttr}"], html[dir="${dirAttr}"]`);
 
-      details.push('2. Check button accessibility names');
+      details.push('3. Check button accessibility names');
       const buttonCount = await page.locator('button').count();
       let unnamedButtons = 0;
       for (let i = 0; i < Math.min(buttonCount, 30); i++) {
@@ -741,11 +808,11 @@ async function main() {
       }
       details.push(`Sampled ${Math.min(buttonCount, 30)} buttons: ${unnamedButtons} unnamed`);
 
-      details.push('3. Check input labels');
+      details.push('4. Check input labels');
       const inputCount = await page.locator('input').count();
       details.push(`Inspected ${inputCount} interactive inputs for labels and placeholders`);
 
-      details.push('4. Keyboard tab navigation traversal test');
+      details.push('5. Keyboard tab navigation traversal test');
       await page.keyboard.press('Tab');
       await page.keyboard.press('Tab');
       await page.keyboard.press('Tab');
@@ -758,8 +825,11 @@ async function main() {
     });
 
   } finally {
-    await browser.close();
-    await stopServerProcess(serverProc);
+    if (browser) await browser.close().catch(() => {});
+    if (serverProc) await stopServerProcess(serverProc).catch(() => {});
+    try {
+      safeCleanTestDir(E2E_DATA_DIR);
+    } catch {}
   }
 
   // -------------------------------------------------------------
@@ -784,10 +854,8 @@ async function main() {
   log(`Failed: ${scenarioResults.filter((r) => !r.passed).length}`);
 
   // Write structured JSON results to audit folder
-  const resultsJsonPath = path.join(
-    'F:\\Dev_Workspace\\Audit\\OMNIFLOW_OS\\MASTER_COMPLETION_MISSION',
-    'playwright_e2e_results.json'
-  );
+  const resultsJsonPath = path.join(AUDIT_DIR, 'playwright_e2e_results.json');
+  fs.mkdirSync(path.dirname(resultsJsonPath), { recursive: true });
   fs.writeFileSync(resultsJsonPath, JSON.stringify(scenarioResults, null, 2), 'utf-8');
   log(`Detailed JSON results written to: ${resultsJsonPath}`);
 

@@ -31,9 +31,10 @@ export function resolveDurableDataPath(customPath: string | null = null, envObj:
     if (FORBIDDEN_SYS.test(t) || FORBIDDEN_SYS.test(path.dirname(path.resolve(t)))) return { ok: false, filePath: t, dirPath: path.dirname(t), source: 'CUSTOM_OVERRIDE', errorCode: 'FORBIDDEN_SYSTEM_DATA_DIR', errorMessage: 'Protected OS path' };
     return { ok: true, filePath: path.resolve(t), dirPath: path.dirname(path.resolve(t)), source: 'CUSTOM_OVERRIDE' };
   }
-  if (envObj.OMNIFLOW_DATA_DIR !== undefined) {
-    const t = String(envObj.OMNIFLOW_DATA_DIR).trim();
-    if (!t || t.includes('\0')) return { ok: false, filePath: '', dirPath: '', source: 'OMNIFLOW_DATA_DIR', errorCode: 'INVALID_DATA_DIR', errorMessage: 'Empty OMNIFLOW_DATA_DIR' };
+  const envDataDir = envObj.OMNIFLOW_DATA_DIR || envObj.DATA_DIR;
+  if (envDataDir !== undefined) {
+    const t = String(envDataDir).trim();
+    if (!t || t.includes('\0')) return { ok: false, filePath: '', dirPath: '', source: 'OMNIFLOW_DATA_DIR', errorCode: 'INVALID_DATA_DIR', errorMessage: 'Empty DATA_DIR' };
     if (FORBIDDEN_SYS.test(t) || FORBIDDEN_SYS.test(path.resolve(t))) return { ok: false, filePath: t + '/db_state.json', dirPath: t, source: 'OMNIFLOW_DATA_DIR', errorCode: 'FORBIDDEN_SYSTEM_DATA_DIR', errorMessage: 'Protected OS path' };
     const dir = path.resolve(t); const chk = verifyDirectoryWritable(dir);
     if (!chk.ok) return { ok: false, filePath: path.join(dir, 'db_state.json'), dirPath: dir, source: 'OMNIFLOW_DATA_DIR', errorCode: chk.errorCode, errorMessage: chk.errorMessage };

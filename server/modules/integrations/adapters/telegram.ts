@@ -1,47 +1,75 @@
 /**
  * @file server/modules/integrations/adapters/telegram.ts
  * Telegram Bot API Official Channel Adapter (100% Free / Zero-Cost First)
+ * Strict State Separation: DISABLED (default), CONFIGURED, CONNECTED, SIMULATED, FAILED
  */
 
 import crypto from 'crypto';
 import { ChannelType, UnifiedMessage, UUID } from '../../../core/types.ts';
-import { ChannelAdapter, WebhookVerificationResult } from '../contracts.ts';
-
-export interface TelegramAdapterConfig {
-  botToken?: string;
-  webhookSecretToken?: string;
-  sandboxMode?: boolean;
-}
+import {
+  ChannelAdapter,
+  WebhookVerificationResult,
+  TelegramAdapterConfig,
+  AdapterOperationalState,
+  AdapterHealthStatus,
+  MessageDeliveryStatus,
+} from '../contracts.ts';
 
 export class TelegramChannelAdapter implements ChannelAdapter {
   public channelType: ChannelType = 'telegram';
   public name = 'Telegram Bot API (Official Free Tier)';
   private config: TelegramAdapterConfig;
+  private state: AdapterOperationalState = 'DISABLED';
 
   constructor(config: TelegramAdapterConfig = {}) {
+    const botToken = config.botToken || process.env.TELEGRAM_BOT_TOKEN;
+    const webhookSecretToken = config.webhookSecretToken || process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN;
+    const allowSimulation = config.allowSimulation ?? (process.env.NODE_ENV === 'test');
+
     this.config = {
-      sandboxMode: config.sandboxMode ?? true,
-      botToken: config.botToken,
-      webhookSecretToken: config.webhookSecretToken,
+      botToken,
+      webhookSecretToken,
+      allowSimulation,
     };
+
+    if (this.config.botToken) {
+      this.state = 'CONFIGURED';
+    } else if (this.config.allowSimulation) {
+      this.state = 'SIMULATED';
+    } else {
+      this.state = 'DISABLED';
+    }
+  }
+
+  public getState(): AdapterOperationalState {
+    return this.state;
   }
 
   public async verifyWebhook(
     headers: Record<string, string>,
     rawBody: string | Buffer
   ): Promise<WebhookVerificationResult> {
+    if (this.state === 'DISABLED') {
+      return {
+        isValid: false,
+        rawPayload: null,
+        senderIdentifier: '',
+        error: 'Telegram adapter is DISABLED: Bot token not configured',
+      };
+    }
+
     const secretHeader = headers['x-telegram-bot-api-secret-token'];
-    
-    // In sandbox or test mode without configured secret, allow verification
-    if (this.config.sandboxMode || !this.config.webhookSecretToken) {
+
+    if (this.state === 'SIMULATED') {
       try {
         const parsed = typeof rawBody === 'string' ? JSON.parse(rawBody) : JSON.parse(rawBody.toString('utf-8'));
-        const sender = parsed?.message?.from?.username || String(parsed?.message?.from?.id || 'unknown_telegram_user');
+        const sender = parsed?.message?.from?.username || String(parsed?.message?.from?.id || 'sim_telegram_user');
         return {
           isValid: true,
           rawPayload: parsed,
           senderIdentifier: sender,
           signatureHeader: secretHeader,
+          isSimulated: true,
         };
       } catch (err: any) {
         return {
@@ -53,7 +81,15 @@ export class TelegramChannelAdapter implements ChannelAdapter {
       }
     }
 
-    // Verify secret token constant-time
+    if (!this.config.webhookSecretToken) {
+      return {
+        isValid: false,
+        rawPayload: null,
+        senderIdentifier: '',
+        error: 'Missing webhook secret token for Telegram signature verification',
+      };
+    }
+
     const expected = this.config.webhookSecretToken;
     const provided = secretHeader || '';
     const isValid =
@@ -93,6 +129,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
     const text = msg?.text || msg?.caption || '[وسائط غير نصية]';
     const senderId = String(msg?.from?.id || 'tg_unknown');
     const senderName = [msg?.from?.first_name, msg?.from?.last_name].filter(Boolean).join(' ') || msg?.from?.username || senderId;
+    const isSim = this.state === 'SIMULATED';
 
     return {
       id: crypto.randomUUID(),
@@ -108,28 +145,35 @@ export class TelegramChannelAdapter implements ChannelAdapter {
         name: senderName,
         type: 'customer',
       },
-      status: 'delivered',
-      createdAt: msg?.date ? new Date(msg.date * 1000).toISOString() : new Date().toISOString(),
+      status: isSim ? 'simulated' : 'delivered',
+      createdAt: msg?.date
+        ? new Date(msg.date * 1000).toISOString()
+        : new Date().toISOString(),
       metadata: {
         telegramMessageId: msg?.message_id,
         chatId: msg?.chat?.id,
-        username: msg?.from?.username,
+        isSimulated: isSim,
       },
     };
   }
 
   public async dispatchOutboundMessage(
     message: UnifiedMessage
-  ): Promise<{ externalMessageId: string; status: 'sent' | 'delivered' | 'failed' }> {
-    // If running in sandbox or without token, simulate successful dispatch with $0 cost
-    if (this.config.sandboxMode || !this.config.botToken) {
+  ): Promise<{ externalMessageId: string; status: MessageDeliveryStatus }> {
+    if (this.state === 'DISABLED') {
       return {
-        externalMessageId: `tg-mock-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
-        status: 'delivered',
+        externalMessageId: '',
+        status: 'disabled',
       };
     }
 
-    // Live dispatch via Telegram Bot API sendMessage
+    if (this.state === 'SIMULATED') {
+      return {
+        externalMessageId: `sim-tg-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+        status: 'simulated',
+      };
+    }
+
     try {
       const chatId = (message.metadata?.chatId as string) || message.conversationId?.replace('conv-tg-', '');
       const res = await fetch(`https://api.telegram.org/bot${this.config.botToken}/sendMessage`, {
@@ -141,10 +185,11 @@ export class TelegramChannelAdapter implements ChannelAdapter {
         }),
       });
       const data = await res.json();
-      if (data.ok) {
+      if (data?.ok) {
+        this.state = 'CONNECTED';
         return {
           externalMessageId: String(data.result?.message_id),
-          status: 'delivered',
+          status: 'sent',
         };
       }
       return {
@@ -152,6 +197,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
         status: 'failed',
       };
     } catch {
+      this.state = 'FAILED';
       return {
         externalMessageId: '',
         status: 'failed',
@@ -159,29 +205,46 @@ export class TelegramChannelAdapter implements ChannelAdapter {
     }
   }
 
-  public async fetchHealthStatus(): Promise<{ isHealthy: boolean; latencyMs: number; details?: string }> {
+  public async fetchHealthStatus(): Promise<AdapterHealthStatus> {
     const start = Date.now();
-    if (this.config.sandboxMode || !this.config.botToken) {
+
+    if (this.state === 'DISABLED') {
       return {
+        state: 'DISABLED',
+        isHealthy: false,
+        latencyMs: 0,
+        details: 'Telegram Bot API adapter disabled (no bot token configured).',
+      };
+    }
+
+    if (this.state === 'SIMULATED') {
+      return {
+        state: 'SIMULATED',
         isHealthy: true,
         latencyMs: Date.now() - start,
-        details: 'Telegram Bot API Adapter active in local zero-cost mode',
+        details: 'Telegram Bot API adapter active in SIMULATED mode ($0.00, local test).',
+        isSimulated: true,
       };
     }
 
     try {
       const res = await fetch(`https://api.telegram.org/bot${this.config.botToken}/getMe`);
       const data = await res.json();
+      const healthy = Boolean(data?.ok);
+      this.state = healthy ? 'CONNECTED' : 'FAILED';
       return {
-        isHealthy: data.ok === true,
+        state: this.state,
+        isHealthy: healthy,
         latencyMs: Date.now() - start,
-        details: data.ok ? `Connected to @${data.result?.username}` : 'Telegram API rejected token',
+        details: data?.ok ? `Connected to Telegram Bot @${data.result?.username}` : 'Telegram API authorization failed',
       };
     } catch (err: any) {
+      this.state = 'FAILED';
       return {
+        state: 'FAILED',
         isHealthy: false,
         latencyMs: Date.now() - start,
-        details: `Connection failed: ${err.message}`,
+        details: `Telegram API error: ${err.message}`,
       };
     }
   }

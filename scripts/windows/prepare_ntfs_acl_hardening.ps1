@@ -60,10 +60,10 @@ Write-Host "[Pre-flight] Current User SID : $currentSid" -ForegroundColor White
 Write-Host "[Pre-flight] Administrator    : $isAdmin" -ForegroundColor White
 Write-Host "[Pre-flight] Execution Mode   : $(if ($TestMode) { 'TEST MODE' } else { 'OPERATIONAL MODE' })" -ForegroundColor White
 
-# Mutating operations (-Apply, -Rollback, and operational -CaptureBaseline) strictly require elevated Administrator
-if ($Apply -or $Rollback -or (-not $TestMode -and $CaptureBaseline)) {
+# Mutating operations (-Apply, -Rollback, and operational -CaptureBaseline) strictly require elevated Administrator in operational mode
+if (-not $TestMode -and ($Apply -or $Rollback -or $CaptureBaseline)) {
     if (-not $isAdmin) {
-        Write-Error "SECURITY ABORT: Modifying operations (-Apply, -Rollback, and operational -CaptureBaseline) require elevated Administrator privileges."
+        Write-Error "SECURITY ABORT: Modifying operations (-Apply, -Rollback, and operational -CaptureBaseline) require elevated Administrator privileges in operational mode."
         exit 1
     }
 }
@@ -202,25 +202,38 @@ $RollbackPath = if ($RollbackFile) {
 # --------------------------------------------------------------------------
 if ($Rollback) {
     Write-Host "`n[Rollback] Executing Rollback from Saved Baseline: $RollbackPath" -ForegroundColor Yellow
+    Write-Host "  [Scope Notice] This rollback algorithm restores DACL (Discretionary Access Control Lists) only." -ForegroundColor Gray
+    Write-Host "  Owner, Group, and SACL (Auditing) are not modified or restored." -ForegroundColor Gray
+    
     if (-not (Test-Path $RollbackPath)) {
         Write-Error "ROLLBACK ABORT: Rollback baseline file not found: $RollbackPath"
         exit 1
     }
-    $rawJson = Get-Content -Path $RollbackPath -Raw
-    $rollbackData = ConvertFrom-Json -InputObject $rawJson
+    
+    try {
+        $rawJson = Get-Content -Path $RollbackPath -Raw -ErrorAction Stop
+        $parsedBaseline = ConvertFrom-Json -InputObject $rawJson -ErrorAction Stop
+    } catch {
+        Write-Error "ROLLBACK ABORT: Rollback baseline JSON is invalid or corrupted: $_"
+        exit 1
+    }
 
-    if (-not $rollbackData -or $rollbackData.Count -eq 0) {
+    # Extract entries (support both enveloped format and flat array)
+    $rollbackEntries = if ($parsedBaseline.Entries) { $parsedBaseline.Entries } else { $parsedBaseline }
+
+    if (-not $rollbackEntries -or ($rollbackEntries -is [Array] -and $rollbackEntries.Count -eq 0)) {
         Write-Error "ROLLBACK ABORT: Rollback baseline is empty or corrupted."
         exit 1
     }
 
-    # 1. Validate baseline integrity and scope before applying rollback
-    foreach ($entry in $rollbackData) {
+    # 1. Validate baseline integrity, schema, and scope before any modifications
+    $baselinePathMap = @{}
+    foreach ($entry in $rollbackEntries) {
         if (-not $entry.Path -or -not $entry.SDDL) {
             Write-Error "ROLLBACK ABORT: Malformed baseline entry detected (missing Path or SDDL)."
             exit 1
         }
-        $normEntry = [System.IO.Path]::GetFullPath($entry.Path)
+        $normEntry = [System.IO.Path]::GetFullPath($entry.Path).TrimEnd('\')
         $isEntryAllowed = $false
         foreach ($d in $TargetDirectories) {
             $normD = [System.IO.Path]::GetFullPath($d).TrimEnd('\')
@@ -234,26 +247,34 @@ if ($Rollback) {
             Write-Error "ROLLBACK ABORT: Baseline entry path '$($entry.Path)' is outside authorized target directories ($($TargetDirectories -join ', ')). Halting to prevent unauthorized ACL alteration."
             exit 1
         }
-        if (-not (Test-Path $entry.Path)) {
-            Write-Error "ROLLBACK ABORT: Baseline target path missing on disk: $($entry.Path)"
+        
+        # Test that SDDL is valid before modifying anything
+        try {
+            $testSec = if ($entry.IsContainer) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
+            $testSec.SetSecurityDescriptorSddlForm($entry.SDDL, [System.Security.AccessControl.AccessControlSections]::Access)
+        } catch {
+            Write-Error "ROLLBACK ABORT: Invalid SDDL detected for entry '$($entry.Path)': $_"
             exit 1
         }
+        $baselinePathMap[$normEntry] = $entry
     }
 
-    # 2. Reset inheritance on target directories (without error-masking /c)
-    foreach ($d in $TargetDirectories) {
-        Write-Host "  Resetting inheritance on target root: $d" -ForegroundColor White
-        & icacls "$d" /reset /t
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "ROLLBACK FAILED: icacls /reset returned exit code $LASTEXITCODE for $d"
-            exit 1
-        }
-    }
+    # 2. Sort baseline entries top-down (containers first, shortest path to longest)
+    # This ensures parent directory DACLs and inheritance protection flags are restored before children
+    $sortedEntries = @($rollbackEntries) | Sort-Object -Property @{Expression = { if ($_.IsContainer) { 0 } else { 1 } }}, @{Expression = { $_.Path.Length }}
 
-    # 3. Re-apply baseline DACL to each item (DACL-only via AccessControlSections::Access)
-    foreach ($entry in $rollbackData) {
+    # 3. Re-apply baseline DACL directly to each baseline entry (without recursive /reset /t)
+    $restoredCount = 0
+    $skippedMissingCount = 0
+    foreach ($entry in $sortedEntries) {
         $path = $entry.Path
         $sddl = $entry.SDDL
+        if (-not (Test-Path $path)) {
+            Write-Host "  [Notice] Baseline item no longer exists on disk, skipping: $path" -ForegroundColor DarkGray
+            $skippedMissingCount++
+            continue
+        }
+
         Write-Host "  Restoring baseline DACL: $path" -ForegroundColor White
         try {
             if ($entry.IsContainer) {
@@ -265,12 +286,35 @@ if ($Rollback) {
                 $sec.SetSecurityDescriptorSddlForm($sddl, [System.Security.AccessControl.AccessControlSections]::Access)
                 [System.IO.File]::SetAccessControl($path, $sec)
             }
+            $restoredCount++
         } catch {
             Write-Error "ROLLBACK FAILED: Error restoring ACL on $($path) - $_"
             exit 1
         }
     }
-    Write-Host "✅ Rollback completed successfully." -ForegroundColor Green
+
+    # 4. Handle new files/directories created AFTER baseline capture
+    # These items were not in the baseline. Reset them to inherit cleanly from their restored parent directory.
+    $newItemsResetCount = 0
+    foreach ($d in $TargetDirectories) {
+        if (Test-Path $d) {
+            $currentDiskItems = Get-ChildItem -Path $d -Recurse -Force
+            foreach ($item in $currentDiskItems) {
+                $normItem = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
+                if (-not $baselinePathMap.ContainsKey($normItem)) {
+                    Write-Host "  [New Item] Resetting un-baselined item to inherit from parent: $($item.FullName)" -ForegroundColor Cyan
+                    & icacls "$($item.FullName)" /reset
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warning "Failed to reset inheritance on new item: $($item.FullName)"
+                    } else {
+                        $newItemsResetCount++
+                    }
+                }
+            }
+        }
+    }
+
+    Write-Host "`n✅ Rollback completed successfully ($restoredCount restored, $skippedMissingCount missing skipped, $newItemsResetCount post-baseline items reset to parent)." -ForegroundColor Green
     exit 0
 }
 
@@ -302,8 +346,37 @@ if ($CaptureBaseline) {
     if (-not (Test-Path $rollbackDir)) {
         New-Item -ItemType Directory -Path $rollbackDir -Force | Out-Null
     }
-    $baselineEntries | ConvertTo-Json -Depth 5 | Set-Content -Path $RollbackPath -Encoding UTF8
-    Write-Host "  -> Baseline captured for $($baselineEntries.Count) items and saved to: $RollbackPath" -ForegroundColor Green
+
+    # Construct complete baseline metadata envelope
+    $baselineEnvelope = [PSCustomObject]@{
+        SchemaVersion = "1.1.0-dacl-only"
+        CapturedAt = [DateTimeOffset]::UtcNow.ToString("o")
+        TargetDirectories = $TargetDirectories
+        OwnerSid = $ownerSid
+        Scope = if ($TestMode) { "Test" } else { "Operational" }
+        EntryCount = $baselineEntries.Count
+        Entries = $baselineEntries
+    }
+
+    # Atomic write to temporary file first, then verify and swap
+    $tmpRollbackPath = "$RollbackPath.tmp.$([Guid]::NewGuid().ToString('N'))"
+    try {
+        $baselineEnvelope | ConvertTo-Json -Depth 6 | Set-Content -Path $tmpRollbackPath -Encoding UTF8 -ErrorAction Stop
+        # Verification read
+        $verifyRead = Get-Content -Path $tmpRollbackPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if (-not $verifyRead.Entries -or $verifyRead.Entries.Count -ne $baselineEntries.Count) {
+            throw "Verification of written baseline failed (entry count mismatch)."
+        }
+        Move-Item -Path $tmpRollbackPath -Destination $RollbackPath -Force -ErrorAction Stop
+    } catch {
+        if (Test-Path $tmpRollbackPath) {
+            Remove-Item -Path $tmpRollbackPath -Force -ErrorAction SilentlyContinue
+        }
+        Write-Error "BASELINE CAPTURE FAILED: Unable to atomically write baseline file: $_"
+        exit 1
+    }
+
+    Write-Host "  -> Baseline captured for $($baselineEntries.Count) items and safely saved to: $RollbackPath" -ForegroundColor Green
     exit 0
 }
 
@@ -332,7 +405,7 @@ if ($AuditOnly -or (-not $Apply -and -not $Rollback) -or $PSCmdlet.MyInvocation.
         }
     }
     Write-Host "`n[Plan] Hardening actions to be executed when -Apply is passed:" -ForegroundColor Cyan
-    Write-Host "  1. Verify pre-captured baseline exists at $RollbackPath (or capture if absent)" -ForegroundColor White
+    Write-Host "  1. Verify pre-captured baseline exists at $RollbackPath (REFUSES execution if missing)" -ForegroundColor White
     Write-Host "  2. Break inheritance on target root folders (/inheritance:r)" -ForegroundColor White
     Write-Host "  3. Grant FullControl to Owner SID: $ownerSid" -ForegroundColor White
     Write-Host "  4. Grant FullControl to Administrators: $ADMIN_SID" -ForegroundColor White
@@ -348,31 +421,56 @@ if ($AuditOnly -or (-not $Apply -and -not $Rollback) -or $PSCmdlet.MyInvocation.
 # --------------------------------------------------------------------------
 Write-Host "`n[Apply] APPLYING LEAST-PRIVILEGE DACL..." -ForegroundColor Yellow
 
-# Baseline Safety Check: Ensure a baseline exists before mutating files
+# Baseline Invariant Check: -Apply MUST REFUSE execution when baseline is absent
 if (-not (Test-Path $RollbackPath)) {
-    Write-Host "  Baseline not found at $RollbackPath. Automatically capturing pre-hardening baseline..." -ForegroundColor Cyan
-    $baselineEntries = @()
+    Write-Error "APPLY ABORT: Baseline file not found at '$RollbackPath'. -Apply strictly refuses execution when a validated baseline is absent. You MUST explicitly capture a baseline using -CaptureBaseline first."
+    exit 1
+}
+
+# Load and validate baseline integrity before ANY disk mutation
+try {
+    $rawJson = Get-Content -Path $RollbackPath -Raw -ErrorAction Stop
+    $parsedBaseline = ConvertFrom-Json -InputObject $rawJson -ErrorAction Stop
+} catch {
+    Write-Error "APPLY ABORT: Baseline file at '$RollbackPath' is corrupted or invalid JSON: $_"
+    exit 1
+}
+
+$baselineEntries = if ($parsedBaseline.Entries) { $parsedBaseline.Entries } else { $parsedBaseline }
+if (-not $baselineEntries -or ($baselineEntries -is [Array] -and $baselineEntries.Count -eq 0)) {
+    Write-Error "APPLY ABORT: Baseline at '$RollbackPath' contains no entries or is invalid."
+    exit 1
+}
+
+# Validate every baseline entry scope and SDDL syntax before proceeding
+foreach ($entry in $baselineEntries) {
+    if (-not $entry.Path -or -not $entry.SDDL) {
+        Write-Error "APPLY ABORT: Malformed baseline entry detected (missing Path or SDDL)."
+        exit 1
+    }
+    $normEntry = [System.IO.Path]::GetFullPath($entry.Path).TrimEnd('\')
+    $isEntryAllowed = $false
     foreach ($d in $TargetDirectories) {
-        $items = @(Get-Item -Path $d -Force) + (Get-ChildItem -Path $d -Recurse -Force)
-        foreach ($item in $items) {
-            $sec = (Get-Item -Path $item.FullName -Force).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
-            $baselineEntries += [PSCustomObject]@{
-                Path = $item.FullName
-                IsContainer = $item.PSIsContainer
-                SDDL = $sec.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
-                AreAccessRulesProtected = $sec.AreAccessRulesProtected
-            }
+        $normD = [System.IO.Path]::GetFullPath($d).TrimEnd('\')
+        if ($normEntry.Equals($normD, [System.StringComparison]::OrdinalIgnoreCase) -or 
+            $normEntry.StartsWith($normD + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $isEntryAllowed = $true
+            break
         }
     }
-    $rollbackDir = Split-Path $RollbackPath -Parent
-    if (-not (Test-Path $rollbackDir)) {
-        New-Item -ItemType Directory -Path $rollbackDir -Force | Out-Null
+    if (-not $isEntryAllowed) {
+        Write-Error "APPLY ABORT: Baseline entry path '$($entry.Path)' is outside authorized target directories ($($TargetDirectories -join ', ')). Halting before any mutation."
+        exit 1
     }
-    $baselineEntries | ConvertTo-Json -Depth 5 | Set-Content -Path $RollbackPath -Encoding UTF8
-    Write-Host "  -> Pre-hardening baseline captured for $($baselineEntries.Count) items: $RollbackPath" -ForegroundColor Green
-} else {
-    Write-Host "  -> Pre-existing baseline preserved: $RollbackPath" -ForegroundColor Green
+    try {
+        $testSec = if ($entry.IsContainer) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
+        $testSec.SetSecurityDescriptorSddlForm($entry.SDDL, [System.Security.AccessControl.AccessControlSections]::Access)
+    } catch {
+        Write-Error "APPLY ABORT: Invalid or unparseable SDDL in baseline entry for '$($entry.Path)': $_"
+        exit 1
+    }
 }
+Write-Host "  -> Pre-existing baseline verified ($($baselineEntries.Count) entries): $RollbackPath" -ForegroundColor Green
 
 # Resolve Account Names from SIDs (with fallback to SID literal *S-1-...)
 try {

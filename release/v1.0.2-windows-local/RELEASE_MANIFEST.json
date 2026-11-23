@@ -1,17 +1,17 @@
 {
   "releaseVersion": "1.0.2",
   "releaseTag": "v1.0.2-windows-local",
-  "buildTimestamp": "2026-11-21T01:05:26.417Z",
+  "buildTimestamp": "2026-11-23T22:48:44.423Z",
   "targetPlatform": "Windows 10 / Windows 11 / Windows Server 2019/2022",
   "runtimeRequirements": {
-    "node": ">=18.0.0",
+    "node": ">=22.0.0",
     "architecture": "x64",
     "storageEngine": "Local Atomic JSON + NTFS ACL Hardening",
     "networkBinding": "127.0.0.1 (Strict Loopback / Zero Cloud Exposure)"
   },
-  "totalFiles": 19,
-  "totalSizeBytes": 2878510,
-  "totalSizeMB": 2.75,
+  "totalFiles": 22,
+  "totalSizeBytes": 7273129,
+  "totalSizeMB": 6.94,
   "fileInventory": {
     ".env.example": {
       "sizeBytes": 2024,
@@ -29,9 +29,9 @@
       "sizeBytes": 46265,
       "sha256": "a40d0e54aefcb7304e89d5a9c387b7ed64161c9f2f6801dda337679fdc392b68"
     },
-    "dist/assets/index-D0zDauSy.js": {
-      "sizeBytes": 701863,
-      "sha256": "6aa979bb89bd32d5f47ec33dc68192bbd554b4ffdbfec890942201066c572acf"
+    "dist/assets/index-CvdhVAZG.js": {
+      "sizeBytes": 702198,
+      "sha256": "b0556493cb4af93e91c042fe4bb50368f068e8d81b08192506ffca7d9680b9ca"
     },
     "dist/assets/index-yCmVQW8k.css": {
       "sizeBytes": 95065,
@@ -55,7 +55,7 @@
     },
     "dist/index.html": {
       "sizeBytes": 2370,
-      "sha256": "8bac1730af041a1dd5a0d6b85c63446973f5b73057b5cefb248022b31fb639c9"
+      "sha256": "a064b4b633c64d63e59754d60c17bcb04f3601a6e9a935b03adcca34220b5d88"
     },
     "dist/manifest.webmanifest": {
       "sizeBytes": 1992,
@@ -67,31 +67,44 @@
     },
     "dist/sw.js": {
       "sizeBytes": 1988,
-      "sha256": "cb4d24f4e18b00934ded65cd83a033f1dd0ad67291983997897ea1c07a465ba4"
+      "sha256": "b75e1ff245bb7a6a86e92325b72321243f231d0abb365b3c41377485ec4344d2"
     },
     "dist/workbox-c121765f.js": {
       "sizeBytes": 22270,
       "sha256": "209c89a1434f9012dac6de78f07f9f78278b911a5d7622f1c1e5369bb74e1d9e"
     },
     "dist-server/server.cjs": {
-      "sizeBytes": 697587,
-      "sha256": "48b79a3ae099df412499664ceeac688712dbe5c489ce35b2dab502f917efb2e4"
+      "sizeBytes": 5059343,
+      "sha256": "d012c309bfd7636efed1158358f932265de97299bf00402c15e038f30247cab9"
     },
     "package.json": {
-      "sizeBytes": 1967,
-      "sha256": "29458805ecc891e8e8880b2551c76b686cefd0f5c916d0f9e8ae1bf63df56c3d"
+      "sizeBytes": 2491,
+      "sha256": "b21cb0b9b27a097400c87dd4f69eff926cd35821346a183c2b3ec1756d6d7e2e"
+    },
+    "prepare_ntfs_acl_hardening.ps1": {
+      "sizeBytes": 28036,
+      "sha256": "b9ec4fc785642e29b3decba1b2d6537318b9f561686881dc9a3da40705b88006"
+    },
+    "setup-keys.bat": {
+      "sizeBytes": 1644,
+      "sha256": "4b1c144562550d276316f062f6b2c69264449c7a430831d29b0f116fa721eb0b"
+    },
+    "setup-keys.ps1": {
+      "sizeBytes": 1522,
+      "sha256": "81558a91bbdc2fea03117e7b872099110a500920eda82ce05a1acf6b8ccd73fb"
     },
     "start-omniflow.bat": {
-      "sizeBytes": 499,
-      "sha256": "117a11984ea2d5b08b868d3d90cfecfdb7b3fe0f0312eca79e96520d6c7b1e5c"
+      "sizeBytes": 848,
+      "sha256": "839c6e168507dc7bbfe639daabab6bde8ec3ec361ce401c381376d344d5e2542"
     },
     "start-omniflow.ps1": {
-      "sizeBytes": 687,
-      "sha256": "daec45028aeb6cec04b97327fc64fddedd278023365f9c3aff6aea3ff223f843"
+      "sizeBytes": 1140,
+      "sha256": "2f522f301689a4587b021da216118b9813c4f631c70fd7ab5836db86fdcd2598"
     }
   },
   "securityCheck": {
     "zeroExternalCost": true,
+    "standaloneBundle": true,
     "egyptianLegalCompliance": [
       "Law 151/2020 (Data Privacy)",
       "Law 10/2003 (Telecom Regulation)"

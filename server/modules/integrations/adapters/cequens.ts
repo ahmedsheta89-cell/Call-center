@@ -1,47 +1,76 @@
 /**
  * @file server/modules/integrations/adapters/cequens.ts
  * CEQUENS Egyptian CPaaS Omnichannel & SMS Adapter (Egypt Market Focus)
+ * Strict State Separation: DISABLED (default), CONFIGURED, CONNECTED, SIMULATED, FAILED
  */
 
 import crypto from 'crypto';
 import { ChannelType, UnifiedMessage, UUID } from '../../../core/types.ts';
-import { ChannelAdapter, WebhookVerificationResult } from '../contracts.ts';
-
-export interface CequensAdapterConfig {
-  apiKey?: string;
-  senderName?: string;
-  webhookSecret?: string;
-  sandboxMode?: boolean;
-}
+import {
+  ChannelAdapter,
+  WebhookVerificationResult,
+  AdapterOperationalState,
+  AdapterHealthStatus,
+  CequensAdapterConfig,
+  MessageDeliveryStatus,
+} from '../contracts.ts';
 
 export class CequensChannelAdapter implements ChannelAdapter {
   public channelType: ChannelType = 'sms';
   public name = 'CEQUENS CPaaS Egypt (SMS & Omnichannel)';
   private config: CequensAdapterConfig;
+  private state: AdapterOperationalState = 'DISABLED';
 
   constructor(config: CequensAdapterConfig = {}) {
+    const apiKey = config.apiKey || process.env.CEQUENS_API_KEY;
+    const webhookSecret = config.webhookSecret || process.env.CEQUENS_WEBHOOK_SECRET;
+    const allowSimulation = config.allowSimulation ?? (process.env.NODE_ENV === 'test');
+
     this.config = {
-      sandboxMode: config.sandboxMode ?? true,
-      senderName: config.senderName || 'OmniFlow',
-      ...config,
+      apiKey,
+      webhookSecret,
+      senderName: config.senderName || process.env.CEQUENS_SENDER_NAME || 'OmniFlow',
+      allowSimulation,
     };
+
+    if (this.config.apiKey) {
+      this.state = 'CONFIGURED';
+    } else if (this.config.allowSimulation) {
+      this.state = 'SIMULATED';
+    } else {
+      this.state = 'DISABLED';
+    }
+  }
+
+  public getState(): AdapterOperationalState {
+    return this.state;
   }
 
   public async verifyWebhook(
     headers: Record<string, string>,
     rawBody: string | Buffer
   ): Promise<WebhookVerificationResult> {
+    if (this.state === 'DISABLED') {
+      return {
+        isValid: false,
+        rawPayload: null,
+        senderIdentifier: '',
+        error: 'CEQUENS adapter is DISABLED: No API key or webhook secret configured',
+      };
+    }
+
     const authHeader = headers['authorization'] || headers['Authorization'];
 
-    if (this.config.sandboxMode || !this.config.webhookSecret) {
+    if (this.state === 'SIMULATED') {
       try {
         const parsed = typeof rawBody === 'string' ? JSON.parse(rawBody) : JSON.parse(rawBody.toString('utf-8'));
-        const sender = parsed?.sender || parsed?.from || parsed?.mobileNumber || 'cequens_client';
+        const sender = parsed?.sender || parsed?.from || parsed?.mobileNumber || 'cequens_sim_client';
         return {
           isValid: true,
           rawPayload: parsed,
           senderIdentifier: sender,
           signatureHeader: authHeader,
+          isSimulated: true,
         };
       } catch (err: any) {
         return {
@@ -53,7 +82,16 @@ export class CequensChannelAdapter implements ChannelAdapter {
       }
     }
 
-    // Verify bearer token or API key header
+    // Live mode verification with webhook secret
+    if (!this.config.webhookSecret) {
+      return {
+        isValid: false,
+        rawPayload: null,
+        senderIdentifier: '',
+        error: 'Missing webhook secret for CEQUENS signature verification',
+      };
+    }
+
     const expected = `Bearer ${this.config.webhookSecret}`;
     const provided = authHeader || '';
     const isValid =
@@ -91,6 +129,7 @@ export class CequensChannelAdapter implements ChannelAdapter {
   public async normalizeInboundMessage(payload: any, organizationId: UUID): Promise<UnifiedMessage> {
     const sender = payload?.sender || payload?.from || payload?.mobileNumber || '201000000000';
     const text = payload?.messageText || payload?.body || payload?.text || '[رسالة نصية واردة]';
+    const isSim = this.state === 'SIMULATED';
 
     return {
       id: crypto.randomUUID(),
@@ -106,23 +145,31 @@ export class CequensChannelAdapter implements ChannelAdapter {
         name: `عميل الرسائل (${sender})`,
         type: 'customer',
       },
-      status: 'delivered',
+      status: isSim ? 'simulated' : 'delivered',
       createdAt: payload?.timestamp || new Date().toISOString(),
       metadata: {
         cequensMessageId: payload?.messageId || payload?.id,
         networkOperator: payload?.operator || 'Vodafone / Orange / WE / e&',
         countryCode: 'EG',
+        isSimulated: isSim,
       },
     };
   }
 
   public async dispatchOutboundMessage(
     message: UnifiedMessage
-  ): Promise<{ externalMessageId: string; status: 'sent' | 'delivered' | 'failed' }> {
-    if (this.config.sandboxMode || !this.config.apiKey) {
+  ): Promise<{ externalMessageId: string; status: MessageDeliveryStatus }> {
+    if (this.state === 'DISABLED') {
       return {
-        externalMessageId: `ceq-msg-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
-        status: 'delivered',
+        externalMessageId: '',
+        status: 'disabled',
+      };
+    }
+
+    if (this.state === 'SIMULATED') {
+      return {
+        externalMessageId: `sim-ceq-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+        status: 'simulated',
       };
     }
 
@@ -142,6 +189,7 @@ export class CequensChannelAdapter implements ChannelAdapter {
       });
       const data = await res.json();
       if (data?.data?.messageId || data?.success) {
+        this.state = 'CONNECTED';
         return {
           externalMessageId: data?.data?.messageId || `ceq-${Date.now()}`,
           status: 'sent',
@@ -149,17 +197,30 @@ export class CequensChannelAdapter implements ChannelAdapter {
       }
       return { externalMessageId: '', status: 'failed' };
     } catch {
+      this.state = 'FAILED';
       return { externalMessageId: '', status: 'failed' };
     }
   }
 
-  public async fetchHealthStatus(): Promise<{ isHealthy: boolean; latencyMs: number; details?: string }> {
+  public async fetchHealthStatus(): Promise<AdapterHealthStatus> {
     const start = Date.now();
-    if (this.config.sandboxMode || !this.config.apiKey) {
+
+    if (this.state === 'DISABLED') {
       return {
+        state: 'DISABLED',
+        isHealthy: false,
+        latencyMs: 0,
+        details: 'CEQUENS Egyptian CPaaS adapter disabled (no API credentials configured).',
+      };
+    }
+
+    if (this.state === 'SIMULATED') {
+      return {
+        state: 'SIMULATED',
         isHealthy: true,
         latencyMs: Date.now() - start,
-        details: 'CEQUENS Egyptian CPaaS Adapter active in sandbox simulation mode ($0.00)',
+        details: 'CEQUENS Egyptian CPaaS adapter active in isolated SIMULATED mode ($0.00, no live SMS dispatch).',
+        isSimulated: true,
       };
     }
 
@@ -168,16 +229,21 @@ export class CequensChannelAdapter implements ChannelAdapter {
         headers: { Authorization: `Bearer ${this.config.apiKey}` },
       });
       const data = await res.json();
+      const healthy = res.status === 200;
+      this.state = healthy ? 'CONNECTED' : 'FAILED';
       return {
-        isHealthy: res.status === 200,
+        state: this.state,
+        isHealthy: healthy,
         latencyMs: Date.now() - start,
-        details: data?.balance !== undefined ? `Account active, balance: ${data.balance}` : 'API reachable',
+        details: data?.balance !== undefined ? `Connected to CEQUENS Egypt API, balance: ${data.balance}` : 'API reachable',
       };
     } catch (err: any) {
+      this.state = 'FAILED';
       return {
+        state: 'FAILED',
         isHealthy: false,
         latencyMs: Date.now() - start,
-        details: `Connection failed: ${err.message}`,
+        details: `CEQUENS Egypt connection failed: ${err.message}`,
       };
     }
   }
