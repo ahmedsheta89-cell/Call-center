@@ -1,9 +1,9 @@
 /**
  * @file server/modules/integrations/adapters/sipTelephony.ts
  * SIP Telephony & Egypt NTRA / Law 10 & Law 151 Compliant Voice Engine
- * Strict State Separation: DISABLED (default), CONFIGURED, CONNECTED, SIMULATED, FAILED
- * Never reports CONNECTED solely from credentials; verifies TCP SIP endpoint reachability.
- * Never marks calls connected until explicit provider call/session confirmation exists.
+ * Strict Lifecycle Separation: DISABLED -> CONFIGURED -> TCP_REACHABLE -> REGISTERED -> CONNECTED | FAILED | SIMULATED
+ * Never labels TCP reachability as SIP registration or CONNECTED.
+ * Never marks calls connected until explicit provider session confirmation exists.
  */
 
 import crypto from 'crypto';
@@ -32,7 +32,11 @@ function parseSipTarget(uri: string): { host: string; port: number } | null {
   }
 }
 
-async function probeTcpSocket(host: string, port: number, timeoutMs = 1500): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+async function probeTcpSocket(
+  host: string,
+  port: number,
+  timeoutMs = 1500
+): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
   const start = Date.now();
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port });
@@ -50,12 +54,136 @@ async function probeTcpSocket(host: string, port: number, timeoutMs = 1500): Pro
   });
 }
 
+function md5Hex(input: string): string {
+  return crypto.createHash('md5').update(input, 'utf8').digest('hex');
+}
+
+function parseDigestChallenge(headerValue: string): { realm: string; nonce: string } | null {
+  const realmMatch = /realm="([^"]+)"/i.exec(headerValue);
+  const nonceMatch = /nonce="([^"]+)"/i.exec(headerValue);
+  if (!realmMatch || !nonceMatch) return null;
+  return { realm: realmMatch[1], nonce: nonceMatch[1] };
+}
+
+/**
+ * Performs an RFC 3261 SIP REGISTER transaction over TCP (with Digest auth challenge-response).
+ * Distinguishes TCP_REACHABLE (non-SIP or unacknowledged) from REGISTERED (200 OK) and FAILED (401/403 rejected).
+ */
+async function performSipRegister(params: {
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  timeoutMs?: number;
+}): Promise<{ outcome: 'REGISTERED' | 'AUTH_REJECTED' | 'TCP_ONLY'; statusCode?: number; details: string; latencyMs: number }> {
+  const { host, port, username, password, timeoutMs = 2000 } = params;
+  const start = Date.now();
+
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    let buffer = '';
+    let sentAuth = false;
+    const callId = crypto.randomUUID();
+    const branchBase = `z9hG4bK-${crypto.randomBytes(6).toString('hex')}`;
+    const tag = crypto.randomBytes(4).toString('hex');
+
+    const finish = (
+      outcome: 'REGISTERED' | 'AUTH_REJECTED' | 'TCP_ONLY',
+      details: string,
+      statusCode?: number
+    ) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ outcome, statusCode, details, latencyMs: Date.now() - start });
+    };
+
+    const buildRegister = (cseq: number, authHeader?: string) => {
+      const uri = `sip:${host}:${port}`;
+      const lines = [
+        `REGISTER ${uri} SIP/2.0`,
+        `Via: SIP/2.0/TCP 127.0.0.1:5060;branch=${branchBase}-${cseq};rport`,
+        `Max-Forwards: 70`,
+        `From: <sip:${username}@${host}>;tag=${tag}`,
+        `To: <sip:${username}@${host}>`,
+        `Call-ID: ${callId}@omniflow.local`,
+        `CSeq: ${cseq} REGISTER`,
+        `Contact: <sip:${username}@127.0.0.1:5060;transport=tcp>`,
+        `Expires: 60`,
+      ];
+      if (authHeader) lines.push(authHeader);
+      lines.push(`Content-Length: 0`, ``, ``);
+      return lines.join('\r\n');
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => {
+      socket.write(buildRegister(1));
+    });
+
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      if (!buffer.includes('\r\n\r\n') && !buffer.includes('\n\n')) return;
+
+      const statusMatch = /^SIP\/2\.0\s+(\d{3})\s+([^\r\n]*)/i.exec(buffer);
+      if (!statusMatch) {
+        finish('TCP_ONLY', `TCP socket at ${host}:${port} responded with non-SIP data; not registered.`);
+        return;
+      }
+
+      const code = parseInt(statusMatch[1], 10);
+      const reason = statusMatch[2] || '';
+
+      if (code === 200) {
+        finish('REGISTERED', `SIP REGISTER 200 OK verified for ${username}@${host}:${port}`, 200);
+        return;
+      }
+
+      if ((code === 401 || code === 407) && !sentAuth) {
+        const authChallengeLine = buffer
+          .split(/\r?\n/)
+          .find((l) => /^(?:WWW-Authenticate|Proxy-Authenticate):/i.test(l));
+        const challenge = authChallengeLine ? parseDigestChallenge(authChallengeLine) : null;
+
+        if (!password) {
+          finish('AUTH_REJECTED', `SIP REGISTER rejected (${code} ${reason}): missing SIP password.`, code);
+          return;
+        }
+        if (!challenge) {
+          finish('AUTH_REJECTED', `SIP REGISTER rejected (${code} ${reason}): unsupported auth challenge.`, code);
+          return;
+        }
+
+        sentAuth = true;
+        buffer = '';
+        const uri = `sip:${host}:${port}`;
+        const ha1 = md5Hex(`${username}:${challenge.realm}:${password}`);
+        const ha2 = md5Hex(`REGISTER:${uri}`);
+        const digestResp = md5Hex(`${ha1}:${challenge.nonce}:${ha2}`);
+        const headerName = code === 407 ? 'Proxy-Authorization' : 'Authorization';
+        const authHeader = `${headerName}: Digest username="${username}", realm="${challenge.realm}", nonce="${challenge.nonce}", uri="${uri}", response="${digestResp}", algorithm=MD5`;
+        socket.write(buildRegister(2, authHeader));
+        return;
+      }
+
+      finish('AUTH_REJECTED', `SIP REGISTER rejected by PBX (${code} ${reason}).`, code);
+    });
+
+    socket.once('timeout', () => {
+      finish('TCP_ONLY', `TCP socket at ${host}:${port} reachable, but SIP REGISTER timed out after ${timeoutMs}ms.`);
+    });
+    socket.once('error', (err) => {
+      finish('TCP_ONLY', `TCP socket connected then closed (${err.message}); SIP REGISTER unconfirmed.`);
+    });
+  });
+}
+
 export class SipTelephonyAdapter implements TelephonyAdapter {
   public name = 'SIP Egypt Enterprise Telephony (Law 10/2003 & 151/2020 Compliant)';
   private config: SipTelephonyConfig;
   private state: AdapterOperationalState = 'DISABLED';
 
-  // Track live call sessions in memory
   private activeSessions: Map<UUID, CallSession> = new Map();
 
   constructor(config: SipTelephonyConfig = {}) {
@@ -69,6 +197,7 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       sipUsername,
       sipPassword,
       defaultCallerId: config.defaultCallerId || process.env.SIP_DEFAULT_CALLER_ID || '+20220000000',
+      webhookSecret: config.webhookSecret || process.env.SIP_WEBHOOK_SECRET,
       mandatoryRecordingDisclosure: config.mandatoryRecordingDisclosure ?? true,
       legalComplianceNotice:
         config.legalComplianceNotice ||
@@ -76,11 +205,10 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       allowSimulation,
     };
 
-    // Never transition to CONNECTED solely from credentials; stay at CONFIGURED until proven.
-    if (this.config.sipServerUri && this.config.sipUsername) {
-      this.state = 'CONFIGURED';
-    } else if (this.config.allowSimulation) {
+    if (this.config.allowSimulation) {
       this.state = 'SIMULATED';
+    } else if (this.config.sipServerUri && this.config.sipUsername) {
+      this.state = 'CONFIGURED';
     } else {
       this.state = 'DISABLED';
     }
@@ -110,7 +238,6 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       };
     }
 
-    // CONFIGURED / CONNECTED / FAILED: Genuine socket reachability probe required to report CONNECTED
     const target = parseSipTarget(this.config.sipServerUri || '');
     if (!target) {
       this.state = 'FAILED';
@@ -122,23 +249,57 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       };
     }
 
-    const probe = await probeTcpSocket(target.host, target.port, 1500);
-    if (probe.ok) {
-      this.state = 'CONNECTED';
+    // Step 1: Verify TCP socket reachability
+    const tcpProbe = await probeTcpSocket(target.host, target.port, 1500);
+    if (!tcpProbe.ok) {
+      this.state = 'FAILED';
       return {
-        state: 'CONNECTED',
-        isHealthy: true,
-        latencyMs: probe.latencyMs,
-        details: `Verified live SIP gateway reachability at ${target.host}:${target.port} as ${this.config.sipUsername}`,
+        state: 'FAILED',
+        isHealthy: false,
+        latencyMs: tcpProbe.latencyMs,
+        details: `SIP gateway ${target.host}:${target.port} unreachable (${tcpProbe.error || 'connection failed'}).`,
       };
     }
 
-    this.state = 'FAILED';
+    // Socket is reachable — never label TCP_REACHABLE as REGISTERED or CONNECTED
+    this.state = 'TCP_REACHABLE';
+
+    // Step 2: Attempt real RFC 3261 SIP REGISTER
+    const regResult = await performSipRegister({
+      host: target.host,
+      port: target.port,
+      username: this.config.sipUsername || '',
+      password: this.config.sipPassword,
+      timeoutMs: 2000,
+    });
+
+    if (regResult.outcome === 'REGISTERED') {
+      this.state = 'REGISTERED';
+      return {
+        state: 'REGISTERED',
+        isHealthy: true,
+        latencyMs: regResult.latencyMs,
+        details: regResult.details,
+      };
+    }
+
+    if (regResult.outcome === 'AUTH_REJECTED') {
+      this.state = 'FAILED';
+      return {
+        state: 'FAILED',
+        isHealthy: false,
+        latencyMs: regResult.latencyMs,
+        details: regResult.details,
+      };
+    }
+
+    // TCP reachable, but SIP REGISTER was not acknowledged -> remain strictly TCP_REACHABLE
+    this.state = 'TCP_REACHABLE';
     return {
-      state: 'FAILED',
+      state: 'TCP_REACHABLE',
       isHealthy: false,
-      latencyMs: probe.latencyMs,
-      details: `SIP gateway ${target.host}:${target.port} unreachable (${probe.error || 'connection failed'}). Remaining disconnected.`,
+      latencyMs: tcpProbe.latencyMs,
+      details: regResult.details,
     };
   }
 
@@ -160,7 +321,6 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     );
 
     const isSim = this.state === 'SIMULATED';
-    // Do NOT mark a SIP call connected until a real provider call/session confirmation exists
     const session: CallSession = {
       id: callId,
       organizationId: params.organizationId,
@@ -196,12 +356,15 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     if (this.state === 'DISABLED') {
       throw new Error('SIP Telephony Adapter is DISABLED: Cannot confirm session.');
     }
+    if (call.status !== 'ringing') {
+      throw new Error(`Invalid call state transition: cannot confirm call from status '${call.status}'`);
+    }
     call.status = 'in_progress';
     call.disposition = this.state === 'SIMULATED' ? 'simulated_confirmed' : 'provider_confirmed';
-    call.transcript =
-      (call.transcript || '') +
-      `\n[تأكيد المزود]: تم تأكيد اتصال الجلسة الصوتية فعلياً (${providerSessionId || 'sip-session-ack'}).`;
-    db.calls.set(callId, call);
+    call.transcript = `${call.transcript || ''}\n[تأكيد الجلسة]: ${
+      this.state === 'SIMULATED' ? 'تم تأكيد جلسة المحاكاة محلياً' : `تم تأكيد الجلسة من مزود SIP (${providerSessionId || 'ack'})`
+    }.`;
+    db.calls.set(call.id, call);
     db.schedulePersist();
     return call;
   }
@@ -212,42 +375,36 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     calleeNumber: string;
   }): Promise<CallSession> {
     if (this.state === 'DISABLED') {
-      throw new Error('SIP Telephony Adapter is DISABLED: No SIP credentials configured.');
+      throw new Error('SIP Telephony Adapter is DISABLED: Cannot accept inbound call.');
     }
-
     const callId: UUID = crypto.randomUUID();
     const customer = Array.from(db.customers.values()).find(
       (c) => c.phone === params.callerNumber && c.organizationId === params.organizationId
-    );
-    const availableAgent = Array.from(db.agents.values()).find(
-      (a) => a.organizationId === params.organizationId && a.status === 'online'
     );
     const isSim = this.state === 'SIMULATED';
 
     const session: CallSession = {
       id: callId,
       organizationId: params.organizationId,
-      customerId: customer?.id || 'cust-inbound-new',
-      customerName: customer?.name || `متصل جديد (${params.callerNumber})`,
-      agentId: availableAgent?.id || 'agent-queue-01',
+      customerId: customer?.id || 'cust-auto-unknown',
+      customerName: customer?.name || `متصل وارد (${params.callerNumber})`,
       direction: 'inbound',
       status: 'ringing',
       callerNumber: params.callerNumber,
-      calleeNumber: params.calleeNumber,
+      calleeNumber: params.calleeNumber || this.config.defaultCallerId || '+20220000000',
       durationSeconds: 0,
       startedAt: new Date().toISOString(),
-      disposition: isSim ? 'simulated_queued' : 'awaiting_provider_confirmation',
+      disposition: isSim ? 'simulated_ringing' : 'awaiting_provider_confirmation',
       transcript: this.config.mandatoryRecordingDisclosure
-        ? `[رسالة الترحيب الآلية والامتثال]: مرحباً بك في خدمة العملاء. يرجى العلم بأن هذه المكالمة قد تكون مسجلة لأغراض مراقبة الجودة والتدريب.\n`
-        : '',
+        ? `[تسجيل نظامي]: ${this.config.legalComplianceNotice}`
+        : undefined,
       aiSentiment: 'neutral',
-      aiSummary: isSim ? 'مكالمة هاتفية واردة محاكاة (SIMULATED).' : 'مكالمة هاتفية واردة عبر الـ IVR (بانتظار تأكيد الإجابة).',
+      aiSummary: isSim ? 'مكالمة واردة محاكاة' : 'مكالمة واردة عبر SIP (بانتظار رد الوكيل)',
     };
 
     this.activeSessions.set(callId, session);
     db.calls.set(callId, session);
     db.schedulePersist();
-
     return session;
   }
 
@@ -255,31 +412,24 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     const call = db.calls.get(callId) || this.activeSessions.get(callId);
     if (!call) throw new Error(`Call session ${callId} not found`);
     call.status = holdState ? 'hold' : 'in_progress';
-    call.transcript = (call.transcript || '') + `\n[إجراء]: ${holdState ? 'وضع المكالمة قيد الانتظار (Hold)' : 'استئناف المكالمة (Resume)'}.`;
-    db.calls.set(callId, call);
+    db.calls.set(call.id, call);
     db.schedulePersist();
   }
 
   public async toggleMute(callId: UUID, muteState: boolean): Promise<void> {
     const call = db.calls.get(callId) || this.activeSessions.get(callId);
     if (!call) throw new Error(`Call session ${callId} not found`);
-    call.transcript = (call.transcript || '') + `\n[إجراء]: ${muteState ? 'كتم الميكروفون (Muted)' : 'إلغاء كتم الميكروفون (Unmuted)'}.`;
-    db.calls.set(callId, call);
+    call.transcript = `${call.transcript || ''}\n[تحكم]: ${muteState ? 'تم كتم الميكروفون' : 'تم إلغاء كتم الميكروفون'}`;
+    db.calls.set(call.id, call);
     db.schedulePersist();
   }
 
   public async transferCall(callId: UUID, targetAgentId: UUID, isWarm: boolean): Promise<void> {
     const call = db.calls.get(callId) || this.activeSessions.get(callId);
     if (!call) throw new Error(`Call session ${callId} not found`);
-    const targetAgent = db.agents.get(targetAgentId);
-    const targetUser = targetAgent ? db.users.get(targetAgent.userId) : undefined;
-    const targetName = targetUser?.fullName || 'الموظف المحول إليه';
-
     call.agentId = targetAgentId;
-    call.transcript =
-      (call.transcript || '') +
-      `\n[تحويل]: تم تحويل المكالمة (${isWarm ? 'تحويل دافئ مع إحاطة' : 'تحويل مباشر'}) إلى ${targetName}.`;
-    db.calls.set(callId, call);
+    call.transcript = `${call.transcript || ''}\n[تحويل ${isWarm ? 'دافئ' : 'مباشر'}]: تم تحويل المكالمة للوكيل ${targetAgentId}`;
+    db.calls.set(call.id, call);
     db.schedulePersist();
   }
 
@@ -290,36 +440,24 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
   ): Promise<void> {
     const call = db.calls.get(callId) || this.activeSessions.get(callId);
     if (!call) throw new Error(`Call session ${callId} not found`);
-    const supervisor = db.users.get(supervisorId);
-    const supName = supervisor?.fullName || 'المشرف المسؤول';
-
-    const modeLabel =
-      mode === 'whisper'
-        ? 'توجيه همسي للموظف فقط (Whisper)'
-        : mode === 'barge'
-        ? 'اقتحام وانضمام ثلاثي للمكالمة (Barge-in)'
-        : 'استماع صامت للمراقبة (Silent Monitoring)';
-
-    call.transcript = (call.transcript || '') + `\n[إشراف]: انضم ${supName} بنمط: ${modeLabel}.`;
-    db.calls.set(callId, call);
+    call.transcript = `${call.transcript || ''}\n[إشراف ${mode.toUpperCase()}]: تدخل المشرف ${supervisorId}`;
+    db.calls.set(call.id, call);
     db.schedulePersist();
   }
 
   public async terminateCall(callId: UUID, disposition: string): Promise<CallSession> {
     const call = db.calls.get(callId) || this.activeSessions.get(callId);
     if (!call) throw new Error(`Call session ${callId} not found`);
-
-    const elapsed = Math.max(1, Math.round((Date.now() - new Date(call.startedAt).getTime()) / 1000));
-    call.durationSeconds = call.durationSeconds > 0 ? call.durationSeconds : elapsed;
     call.status = 'completed';
     call.disposition = disposition || 'completed_normal';
-    call.endedAt = call.endedAt || new Date().toISOString();
-    call.transcript = (call.transcript || '') + `\n[إنهاء]: انتهت المكالمة بنجاح، التصنيف: ${call.disposition}.`;
-
-    this.activeSessions.delete(callId);
-    db.calls.set(callId, call);
+    call.endedAt = new Date().toISOString();
+    call.durationSeconds = Math.max(
+      1,
+      Math.round((new Date(call.endedAt).getTime() - new Date(call.startedAt).getTime()) / 1000)
+    );
+    db.calls.set(call.id, call);
+    this.activeSessions.delete(call.id);
     db.schedulePersist();
-
     return call;
   }
 }

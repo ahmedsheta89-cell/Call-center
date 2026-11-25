@@ -31,8 +31,8 @@ interface ChannelIntegration {
   type: string;
   name: string;
   badge: string;
-  status: 'online' | 'configured' | 'simulated' | 'degraded' | 'disabled' | 'failed' | 'offline';
-  adapterState?: 'DISABLED' | 'CONFIGURED' | 'CONNECTED' | 'SIMULATED' | 'FAILED';
+  status: 'online' | 'registered' | 'tcp_reachable' | 'configured' | 'simulated' | 'degraded' | 'disabled' | 'failed' | 'offline';
+  adapterState?: 'DISABLED' | 'CONFIGURED' | 'TCP_REACHABLE' | 'REGISTERED' | 'CONNECTED' | 'SIMULATED' | 'FAILED';
   accountInfo: Record<string, any>;
   metrics: Record<string, any>;
 }
@@ -252,9 +252,9 @@ export const ChannelIntegrationsView: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <span
                       className={`w-2.5 h-2.5 rounded-full ${
-                        chan.status === 'online'
+                        chan.status === 'online' || chan.status === 'registered'
                           ? 'bg-emerald-400 animate-pulse'
-                          : chan.status === 'configured' || chan.status === 'simulated'
+                          : chan.status === 'tcp_reachable' || chan.status === 'configured' || chan.status === 'simulated'
                           ? 'bg-amber-400'
                           : chan.status === 'degraded' || chan.status === 'failed'
                           ? 'bg-rose-400'
@@ -265,8 +265,10 @@ export const ChannelIntegrationsView: React.FC = () => {
                   </div>
                   <span
                     className={`text-[10px] px-1.5 py-0.2 rounded font-medium ${
-                      chan.status === 'online'
+                      chan.status === 'online' || chan.status === 'registered'
                         ? 'bg-emerald-500/20 text-emerald-300'
+                        : chan.status === 'tcp_reachable'
+                        ? 'bg-cyan-500/20 text-cyan-300'
                         : chan.status === 'configured'
                         ? 'bg-sky-500/20 text-sky-300'
                         : chan.status === 'simulated'
@@ -277,7 +279,11 @@ export const ChannelIntegrationsView: React.FC = () => {
                     }`}
                   >
                     {chan.status === 'online'
-                      ? 'متصل ومؤكد'
+                      ? 'متصل ومؤكد (CONNECTED)'
+                      : chan.status === 'registered'
+                      ? 'مسجل SIP (REGISTERED)'
+                      : chan.status === 'tcp_reachable'
+                      ? 'منفذ متاح فقط (TCP_REACHABLE)'
                       : chan.status === 'configured'
                       ? 'مهيأ (CONFIGURED)'
                       : chan.status === 'simulated'
@@ -715,6 +721,82 @@ export const ChannelIntegrationsView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* 5. Egypt Integration Truthfulness Matrix */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3" data-testid="egypt-integration-matrix">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-emerald-400" />
+              <span>مصفوفة تكاملات السوق المصري وحالة الجاهزية (Egypt Integration Matrix)</span>
+            </h3>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              تصنيف شفاف يفصل بين الكود المنفذ، المحاكاة المحلية ($0.00)، التحقق في بيئة الاختبار، والتفعيل الحي مع المزود.
+            </p>
+          </div>
+          <span className="text-[10px] px-2.5 py-1 rounded-lg bg-amber-500/15 text-amber-300 border border-amber-500/30 font-medium">
+            تصنيف التشغيل الحالي: LOCAL_PILOT (بدون تفعيل مدفوع حي)
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-right text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-slate-800 text-slate-400">
+                <th className="py-2 px-3">القناة / المزود</th>
+                <th className="py-2 px-3">كود منفذ</th>
+                <th className="py-2 px-3">محاكاة محلية</th>
+                <th className="py-2 px-3">بيئة اختبار (Sandbox)</th>
+                <th className="py-2 px-3">تفعيل حي مع المزود</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/70 text-slate-200">
+              <tr>
+                <td className="py-2 px-3 font-medium">WebChat المحلي ($0.00)</td>
+                <td className="py-2 px-3 text-emerald-400">نعم</td>
+                <td className="py-2 px-3 text-slate-400">غير مطلوب</td>
+                <td className="py-2 px-3 text-emerald-400">تم التحقق</td>
+                <td className="py-2 px-3 text-emerald-400">نشط محلياً (CONNECTED)</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">WhatsApp Cloud API (Meta)</td>
+                <td className="py-2 px-3 text-emerald-400">نعم (HMAC + Graph v21)</td>
+                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
+                <td className="py-2 px-3 text-emerald-400">تم التحقق (Webhook + Replay)</td>
+                <td className="py-2 px-3 text-slate-400">بانتظار اعتمادات Meta الحية</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">CEQUENS Egypt SMS / CPaaS</td>
+                <td className="py-2 px-3 text-emerald-400">نعم (Bearer + REST)</td>
+                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
+                <td className="py-2 px-3 text-emerald-400">تم التحقق (Webhook Auth)</td>
+                <td className="py-2 px-3 text-slate-400">بانتظار مفتاح CEQUENS الحي</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">SIP Egypt Telephony (NTRA / Law 151)</td>
+                <td className="py-2 px-3 text-emerald-400">نعم (REGISTER + HMAC Callback)</td>
+                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
+                <td className="py-2 px-3 text-emerald-400">تم التحقق (TCP vs REGISTER)</td>
+                <td className="py-2 px-3 text-slate-400">بانتظار ترانك SIP مرخص</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">Email SMTP Bridge (Nodemailer)</td>
+                <td className="py-2 px-3 text-emerald-400">نعم (TLS/STARTTLS + Auth)</td>
+                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
+                <td className="py-2 px-3 text-emerald-400">تم التحقق (SMTP Transaction)</td>
+                <td className="py-2 px-3 text-slate-400">بانتظار بيانات SMTP الحية</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">Telegram Bot API</td>
+                <td className="py-2 px-3 text-emerald-400">نعم (Secret-Token)</td>
+                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
+                <td className="py-2 px-3 text-emerald-400">تم التحقق (Webhook Auth)</td>
+                <td className="py-2 px-3 text-slate-400">بانتظار Bot Token الحي</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 };

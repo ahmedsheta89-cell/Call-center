@@ -55,4 +55,15 @@
   1. سرعة فائقة (زمن استجابة أقل من 5 مللي ثانية).
   2. تكلفة صفرية مضمونة (0.00 USD).
   3. حماية تامة للبيانات والخصوصية وعدم خروج أي بايت خارج الجهاز.
-* الترقية إلى Local LLM عبر Ollama (مثل نموذج Qwen 2.5 Coder 1.5B/3B الملائم لمعالج i7-4790) موثقة كخطوة تالية اختيارية تتطلب تثبيت Ollama مسبقاً.
+## 3. مصفوفة تكاملات السوق المصري وحالة الجاهزية (Egypt Integration Matrix)
+
+| القناة / المزود | كود منفذ | محاكاة محلية | بيئة اختبار (Provider Sandbox) | تفعيل حي مع المزود (Live Provider) |
+| :--- | :---: | :---: | :---: | :---: |
+| **WebChat المحلي** | نعم | غير مطلوب | تم التحقق | نشط محلياً (`CONNECTED`) |
+| **WhatsApp Cloud API (Meta)** | نعم (`X-Hub-Signature-256` + Graph v21) | `SIMULATED` | تم التحقق (Unauthenticated Webhook + Replay) | غير مفعل حياً — يتطلب اعتمادات Meta |
+| **CEQUENS Egypt SMS** | نعم (`Bearer` + REST) | `SIMULATED` | تم التحقق (Unauthenticated Webhook) | غير مفعل حياً — يتطلب مفتاح CEQUENS |
+| **SIP Egypt Telephony (NTRA / Law 151)** | نعم (`REGISTER` + Digest + Signed Callback) | `SIMULATED` | تم التحقق (`TCP_REACHABLE` vs `REGISTERED`) | غير مفعل حياً — يتطلب SIP Trunk مرخص |
+| **Email SMTP Bridge (Nodemailer)** | نعم (TLS/STARTTLS + Auth + Idempotency) | `SIMULATED` | تم التحقق (Actual SMTP Transaction) | غير مفعل حياً — يتطلب بيانات SMTP |
+| **Telegram Bot API** | نعم (`X-Telegram-Bot-Api-Secret-Token`) | `SIMULATED` | تم التحقق (Unauthenticated Webhook) | غير مفعل حياً — يتطلب Bot Token |
+
+**التصنيف الحالي للإصدار:** `LOCAL_PILOT` (جميع البوابات والأمان والاختبارات المعزولة مثبتة؛ التفعيل الخارجي الحي معطل افتراضياً بأمان `DISABLED` لحين توفير اعتمادات المزودين المملوكة للعميل).

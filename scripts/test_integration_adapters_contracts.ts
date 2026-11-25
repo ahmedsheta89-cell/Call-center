@@ -169,8 +169,8 @@ async function runTests() {
     assert(liveSipAdapter.getState() === 'CONFIGURED', 'Live SIP starts as CONFIGURED prior to health probe');
     const liveHealth = await liveSipAdapter.fetchHealthStatus();
     assert(
-      liveHealth.state === 'CONNECTED' && liveHealth.isHealthy,
-      `Genuine SIP TCP probe verified connectivity -> state=CONNECTED (got ${liveHealth.state})`,
+      liveHealth.state === 'TCP_REACHABLE' && !liveHealth.isHealthy,
+      `Raw TCP listener without SIP REGISTER reports TCP_REACHABLE (never REGISTERED/CONNECTED) [got ${liveHealth.state}]`,
       liveHealth
     );
 
@@ -301,15 +301,25 @@ async function runTests() {
       simDialJson
     );
 
-    const confirmRes = await fetch(`${baseUrl}/calls/${simDialJson.data.id}/confirm`, {
+    const forgedConfirmRes = await fetch(`${baseUrl}/calls/${simDialJson.data.id}/confirm`, {
       method: 'POST',
       headers: authHeaders,
-      body: JSON.stringify({ simulate: true, providerSessionId: 'sim-ack-1' }),
+      body: JSON.stringify({ providerSessionId: 'forged-user-ack' }),
+    });
+    assert(
+      forgedConfirmRes.status === 403,
+      `POST /calls/:id/confirm rejects user-forged confirmation -> HTTP 403 (got ${forgedConfirmRes.status})`
+    );
+
+    const confirmRes = await fetch(`${baseUrl}/calls/${simDialJson.data.id}/simulate-answer`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({}),
     });
     const confirmJson: any = await confirmRes.json();
     assert(
       confirmRes.status === 200 && confirmJson.data?.status === 'in_progress' && confirmJson.data?.disposition === 'simulated_confirmed',
-      'POST /calls/:id/confirm marks call in_progress after session confirmation',
+      'POST /calls/:id/simulate-answer marks simulated call in_progress with simulated_confirmed',
       confirmJson
     );
 
@@ -361,9 +371,11 @@ async function runTests() {
     const rawWebhookPayload = JSON.stringify({
       entry: [
         {
+          id: 'WABA-TEST-100',
           changes: [
             {
               value: {
+                metadata: { phone_number_id: '100200300400' },
                 contacts: [{ wa_id: '201055566677', profile: { name: 'سارة علي' } }],
                 messages: [{ id: 'wamid.test.1', from: '201055566677', text: { body: 'تأكيد استلام الرسالة' } }],
               },

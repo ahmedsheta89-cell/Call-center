@@ -6,7 +6,14 @@
 
 import { ChannelType, UnifiedMessage, UUID, CallSession } from '../../core/types.ts';
 
-export type AdapterOperationalState = 'DISABLED' | 'CONFIGURED' | 'CONNECTED' | 'SIMULATED' | 'FAILED';
+export type AdapterOperationalState =
+  | 'DISABLED'
+  | 'CONFIGURED'
+  | 'TCP_REACHABLE'
+  | 'REGISTERED'
+  | 'CONNECTED'
+  | 'SIMULATED'
+  | 'FAILED';
 export type MessageDeliveryStatus = 'sent' | 'delivered' | 'failed' | 'simulated' | 'disabled';
 
 export interface WebhookVerificationResult {
@@ -78,6 +85,8 @@ export interface EmailAdapterConfig {
   smtpPort?: number;
   smtpUser?: string;
   smtpPass?: string;
+  fromAddress?: string;
+  tlsRejectUnauthorized?: boolean;
   webhookSecret?: string;
   allowSimulation?: boolean;
 }
@@ -87,6 +96,7 @@ export interface SipTelephonyConfig {
   sipUsername?: string;
   sipPassword?: string;
   defaultCallerId?: string;
+  webhookSecret?: string;
   mandatoryRecordingDisclosure?: boolean;
   legalComplianceNotice?: string;
   allowSimulation?: boolean;

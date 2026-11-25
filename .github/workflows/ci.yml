@@ -47,6 +47,9 @@ jobs:
       - name: Run Omnichannel & Telephony Adapter Contract + Authenticated API Wiring Suite
         run: npm run test:adapters
 
+      - name: Run External Webhook Auth, Real SMTP & SIP Lifecycle Security Suite
+        run: npm run test:external-security
+
       - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
         run: npm run test:audit
 

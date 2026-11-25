@@ -100,6 +100,8 @@ export class IntegrationRegistry {
         smtpPort: cfg.smtpPort ? Number(cfg.smtpPort) : undefined,
         smtpUser: cfg.smtpUser || cfg.user,
         smtpPass: cfg.smtpPass || cfg.smtpPassword || cfg.password,
+        fromAddress: cfg.fromAddress || cfg.from,
+        tlsRejectUnauthorized: cfg.tlsRejectUnauthorized,
         webhookSecret: cfg.webhookSecret,
         allowSimulation,
       });
@@ -125,6 +127,7 @@ export class IntegrationRegistry {
       sipUsername: cfg.sipUsername || cfg.username,
       sipPassword: cfg.sipPassword || cfg.password,
       defaultCallerId: cfg.defaultCallerId,
+      webhookSecret: cfg.webhookSecret,
       allowSimulation,
     });
   }

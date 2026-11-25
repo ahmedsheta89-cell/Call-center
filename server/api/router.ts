@@ -30,6 +30,7 @@ import {
 import type { Permission } from '../core/rbac.ts';
 import {
   authenticateApiRequest,
+  isExplicitProviderWebhookPath,
   currentActor,
   issueSessionToken,
   revokeSessionToken,
@@ -147,7 +148,11 @@ apiRouter.use(authenticateApiRequest);
 // Organization context is derived exclusively from the verified session. Any request body attempting
 // to pass an empty/invalid/unregistered organizationId (400) or a cross-tenant organizationId (403) is rejected.
 apiRouter.use((req: Request, res: Response, next) => {
-  if (req.path === '/system/restore' || req.path.startsWith('/auth/')) {
+  if (
+    req.path === '/system/restore' ||
+    req.path.startsWith('/auth/') ||
+    isExplicitProviderWebhookPath(req.path)
+  ) {
     next();
     return;
   }
@@ -1487,7 +1492,7 @@ apiRouter.post('/calls/dial', async (req: Request, res: Response) => {
   });
 });
 
-// Explicit Provider Call/Session Confirmation (never mark a SIP call connected without confirmation)
+// User-initiated /calls/:id/confirm is strictly forbidden — call connection requires a cryptographically signed provider callback
 apiRouter.post('/calls/:id/confirm', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'call.make');
   const orgId = currentActor.organizationId;
@@ -1497,40 +1502,225 @@ apiRouter.post('/calls/:id/confirm', async (req: Request, res: Response) => {
     return;
   }
 
-  const voiceConfig = db.getChannelConfig(orgId, 'chan-voice');
-  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(
-    voiceConfig,
-    req.body?.simulate === true || String(call.disposition || '').startsWith('simulated')
-  );
-  if (sipAdapter.getState() === 'DISABLED') {
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'call.forged_confirm_rejected',
+    entityType: 'call',
+    entityId: call.id,
+    afterState: { reason: 'PROVIDER_CONFIRMATION_REQUIRED' },
+  });
+
+  res.status(403).json({
+    success: false,
+    error: {
+      code: 'PROVIDER_CONFIRMATION_REQUIRED',
+      message: 'Forbidden: Call connection cannot be confirmed by a user session; a cryptographically signed provider callback (/api/v1/webhooks/sip/call-confirm) is required.',
+    },
+  });
+});
+
+// Explicit Simulation-only answer transition (never marks a call as provider_confirmed)
+apiRouter.post('/calls/:id/simulate-answer', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'call.make');
+  const orgId = currentActor.organizationId;
+  const call = db.calls.get(req.params.id);
+  if (!call || call.organizationId !== orgId) {
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
+    return;
+  }
+  if (!String(call.disposition || '').startsWith('simulated')) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'SIMULATED_CALL_REQUIRED',
+        message: 'Only explicitly simulated calls may use /simulate-answer.',
+      },
+    });
+    return;
+  }
+  if (call.status !== 'ringing') {
     res.status(409).json({
       success: false,
-      error: { code: 'ADAPTER_DISABLED', message: 'SIP Telephony adapter is DISABLED; cannot confirm call session.' },
+      error: {
+        code: 'INVALID_CALL_STATE_TRANSITION',
+        message: `Cannot answer simulated call from status '${call.status}'.`,
+      },
     });
     return;
   }
 
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(db.getChannelConfig(orgId, 'chan-voice'), true);
   const confirmedCall = sipAdapter.confirmCallConnected
-    ? await sipAdapter.confirmCallConnected(call.id, req.body?.providerSessionId)
+    ? await sipAdapter.confirmCallConnected(call.id, `sim-ack-${Date.now()}`)
     : call;
 
-  EventBus.publish('call:event', { action: 'confirm', call: confirmedCall });
+  EventBus.publish('call:event', { action: 'simulate_answer', call: confirmedCall });
   await AuditLogger.log({
     organizationId: orgId,
     actorId: currentActor.userId,
-    actorType: 'system',
-    action: 'call.provider_confirmed',
+    actorType: 'user',
+    action: 'call.simulated_answer',
     entityType: 'call',
     entityId: confirmedCall.id,
-    afterState: {
-      status: confirmedCall.status,
-      disposition: confirmedCall.disposition,
-      providerSessionId: req.body?.providerSessionId || 'sip-session-ack',
-    },
+    afterState: { status: confirmedCall.status, disposition: confirmedCall.disposition },
   });
 
   res.json({ success: true, data: confirmedCall });
 });
+
+// Provider-Originated Cryptographically Authenticated SIP Call Confirmation Callback
+apiRouter.post(
+  ['/webhooks/sip/call-confirm', '/integrations/voice/call-confirm', '/integrations/sip/call-confirm'],
+  async (req: Request, res: Response) => {
+    const rawBodyBuf: Buffer | string | undefined = (req as any).rawBody;
+    if (!rawBodyBuf || (typeof rawBodyBuf === 'string' ? rawBodyBuf.length === 0 : rawBodyBuf.byteLength === 0)) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'MALFORMED_RAW_BODY', message: 'Provider callback must include a non-empty raw JSON body.' },
+      });
+      return;
+    }
+
+    let payload: any;
+    try {
+      const rawStr = typeof rawBodyBuf === 'string' ? rawBodyBuf : rawBodyBuf.toString('utf-8');
+      payload = JSON.parse(rawStr);
+    } catch {
+      res.status(400).json({
+        success: false,
+        error: { code: 'MALFORMED_WEBHOOK_PAYLOAD', message: 'Malformed JSON in SIP confirmation callback.' },
+      });
+      return;
+    }
+
+    const callId = typeof payload?.callId === 'string' ? payload.callId.trim() : '';
+    const providerSessionId = typeof payload?.providerSessionId === 'string' ? payload.providerSessionId.trim() : '';
+    if (!callId || !providerSessionId || providerSessionId.length < 4) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_PROVIDER_PAYLOAD', message: 'Valid callId and providerSessionId are required.' },
+      });
+      return;
+    }
+
+    const call = db.calls.get(callId);
+    if (!call) {
+      res.status(404).json({ success: false, error: { code: 'CALL_NOT_FOUND', message: 'Call session not found.' } });
+      return;
+    }
+
+    const orgId = call.organizationId;
+    if ('organizationId' in payload && payload.organizationId !== orgId) {
+      res.status(403).json({
+        success: false,
+        error: { code: 'TENANT_SPOOFING_REJECTED', message: 'organizationId does not match call tenant.' },
+      });
+      return;
+    }
+
+    if (String(call.disposition || '').startsWith('simulated')) {
+      res.status(409).json({
+        success: false,
+        error: {
+          code: 'SIMULATED_CALL_CANNOT_BE_PROVIDER_CONFIRMED',
+          message: 'Simulated calls cannot be promoted to provider_confirmed.',
+        },
+      });
+      return;
+    }
+
+    const voiceConfig = db.getChannelConfig(orgId, 'chan-voice') || db.getChannelConfig(orgId, 'chan-sip');
+    const webhookSecret = typeof voiceConfig?.webhookSecret === 'string' ? voiceConfig.webhookSecret : '';
+    if (!webhookSecret) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'PROVIDER_WEBHOOK_SECRET_UNCONFIGURED',
+          message: 'SIP webhookSecret is not configured for this tenant.',
+        },
+      });
+      return;
+    }
+
+    const sigHeader = String(req.headers['x-sip-signature'] || req.headers['x-webhook-signature'] || '');
+    const expectedHex = crypto.createHmac('sha256', webhookSecret).update(rawBodyBuf).digest('hex');
+    const expectedSig = `sha256=${expectedHex}`;
+    if (!safeEqualStrings(sigHeader, expectedSig)) {
+      await AuditLogger.log({
+        organizationId: orgId,
+        actorId: 'sip-provider-webhook',
+        actorType: 'system',
+        action: 'call.provider_confirm_signature_rejected',
+        entityType: 'call',
+        entityId: call.id,
+        afterState: { callId: call.id },
+      });
+      res.status(401).json({
+        success: false,
+        error: { code: 'INVALID_PROVIDER_SIGNATURE', message: 'Invalid or missing SIP provider HMAC-SHA256 signature.' },
+      });
+      return;
+    }
+
+    const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
+    const eventId = typeof payload?.eventId === 'string' ? payload.eventId.trim() : '';
+    const replayKeys = [
+      `${orgId}:sip_confirm:sha256:${rawDigest}`,
+      `${orgId}:sip_confirm:call:${call.id}:${providerSessionId}`,
+    ];
+    if (eventId) replayKeys.push(`${orgId}:sip_confirm:evt:${eventId}`);
+    if (!checkAndRecordWebhookReplay(replayKeys)) {
+      res.status(409).json({
+        success: false,
+        error: { code: 'REPLAYED_PROVIDER_CALLBACK', message: 'Replayed SIP provider confirmation rejected.' },
+      });
+      return;
+    }
+
+    if (call.status !== 'ringing') {
+      res.status(409).json({
+        success: false,
+        error: {
+          code: 'INVALID_CALL_STATE_TRANSITION',
+          message: `Call '${call.id}' is in status '${call.status}' and cannot transition to in_progress.`,
+        },
+      });
+      return;
+    }
+
+    const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceConfig, false);
+    if (sipAdapter.getState() === 'DISABLED') {
+      res.status(409).json({
+        success: false,
+        error: { code: 'ADAPTER_DISABLED', message: 'SIP Telephony adapter is DISABLED.' },
+      });
+      return;
+    }
+
+    const confirmedCall = sipAdapter.confirmCallConnected
+      ? await sipAdapter.confirmCallConnected(call.id, providerSessionId)
+      : call;
+
+    EventBus.publish('call:event', { action: 'confirm', call: confirmedCall });
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'sip-provider-webhook',
+      actorType: 'system',
+      action: 'call.provider_confirmed',
+      entityType: 'call',
+      entityId: confirmedCall.id,
+      afterState: {
+        status: confirmedCall.status,
+        disposition: confirmedCall.disposition,
+        providerSessionId,
+      },
+    });
+
+    res.json({ success: true, data: confirmedCall });
+  }
+);
 
 apiRouter.post('/calls/:id/end', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'call.make');
@@ -2552,15 +2742,23 @@ apiRouter.post('/ai/summarize', async (req: Request, res: Response) => {
 // 12. Omnichannel Integrations & Adapter Registry Wiring
 // ----------------------------------------------------
 function mapAdapterStateToUiStatus(
-  state: 'DISABLED' | 'CONFIGURED' | 'CONNECTED' | 'SIMULATED' | 'FAILED',
+  state: 'DISABLED' | 'CONFIGURED' | 'TCP_REACHABLE' | 'REGISTERED' | 'CONNECTED' | 'SIMULATED' | 'FAILED',
   storedConfig?: Record<string, any>
 ): { status: string; adapterState: string } {
   if (state === 'CONNECTED') {
     return { status: 'online', adapterState: 'CONNECTED' };
   }
+  if (state === 'REGISTERED') {
+    return { status: 'registered', adapterState: 'REGISTERED' };
+  }
+  if (state === 'TCP_REACHABLE') {
+    return { status: 'tcp_reachable', adapterState: 'TCP_REACHABLE' };
+  }
   if (state === 'CONFIGURED') {
     const lastProven = storedConfig?.lastHealthState;
     if (lastProven === 'CONNECTED') return { status: 'online', adapterState: 'CONNECTED' };
+    if (lastProven === 'REGISTERED') return { status: 'registered', adapterState: 'REGISTERED' };
+    if (lastProven === 'TCP_REACHABLE') return { status: 'tcp_reachable', adapterState: 'TCP_REACHABLE' };
     if (lastProven === 'FAILED') return { status: 'degraded', adapterState: 'FAILED' };
     return { status: 'configured', adapterState: 'CONFIGURED' };
   }
@@ -2568,7 +2766,7 @@ function mapAdapterStateToUiStatus(
     return { status: 'simulated', adapterState: 'SIMULATED' };
   }
   if (state === 'FAILED') {
-    return { status: 'degraded', adapterState: 'FAILED' };
+    return { status: 'failed', adapterState: 'FAILED' };
   }
   return { status: 'disabled', adapterState: 'DISABLED' };
 }
@@ -2641,7 +2839,16 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
       id: 'chan-voice',
       type: 'voice',
       name: sipAdapter.name,
-      badge: voiceStateInfo.adapterState === 'CONNECTED' ? 'SIP Connected (Verified)' : voiceStateInfo.adapterState === 'CONFIGURED' ? 'SIP Configured (Unverified Reachability)' : 'غير مفعّل (يتطلب بوابة SIP)',
+      badge:
+        voiceStateInfo.adapterState === 'CONNECTED'
+          ? 'SIP Connected (Verified Session)'
+          : voiceStateInfo.adapterState === 'REGISTERED'
+          ? 'SIP Registered (Authenticated PBX)'
+          : voiceStateInfo.adapterState === 'TCP_REACHABLE'
+          ? 'منفذ TCP متاح (غير مسجل SIP)'
+          : voiceStateInfo.adapterState === 'CONFIGURED'
+          ? 'SIP Configured (Unverified Reachability)'
+          : 'غير مفعّل (يتطلب بوابة SIP)',
       status: voiceStateInfo.status,
       adapterState: voiceStateInfo.adapterState,
       accountInfo: { ...(voiceStored || {}) },
@@ -2756,22 +2963,13 @@ apiRouter.post('/integrations/channels/:id/test-connection', async (req: Request
     ? await IntegrationRegistry.resolveTelephonyAdapterForTenant(storedConfig, allowSimulation).fetchHealthStatus()
     : await IntegrationRegistry.resolveChannelAdapterForTenant(channelId, storedConfig, allowSimulation).fetchHealthStatus();
 
-  const uiStatus =
-    health.state === 'CONNECTED'
-      ? 'online'
-      : health.state === 'SIMULATED'
-      ? 'simulated'
-      : health.state === 'CONFIGURED'
-      ? 'configured'
-      : health.state === 'FAILED'
-      ? 'failed'
-      : 'disabled';
+  const uiStatus = mapAdapterStateToUiStatus(health.state).status;
 
   if (storedConfig) {
     db.setChannelConfig(orgId, channelId, {
       lastHealthState: health.state,
       lastLatencyMs: health.latencyMs,
-      verified: health.state === 'CONNECTED',
+      verified: health.state === 'CONNECTED' || health.state === 'REGISTERED',
     });
   }
 
@@ -2804,52 +3002,290 @@ apiRouter.post('/integrations/channels/:id/test-connection', async (req: Request
   });
 });
 
-// Meta / Provider Webhook Verification Endpoint (hub.challenge) — Fail-closed on unconfigured/mismatched verifyToken
+// Bounded replay protection cache for external provider webhooks (10,000 entries max, 24h TTL)
+const processedWebhookEvents = new Map<string, number>();
+const WEBHOOK_REPLAY_TTL_MS = 24 * 60 * 60 * 1000;
+
+function checkAndRecordWebhookReplay(keys: string[]): boolean {
+  const now = Date.now();
+  for (const key of keys) {
+    const prev = processedWebhookEvents.get(key);
+    if (prev !== undefined && now - prev < WEBHOOK_REPLAY_TTL_MS) {
+      return false;
+    }
+  }
+  if (processedWebhookEvents.size >= 10000) {
+    const oldestKey = processedWebhookEvents.keys().next().value;
+    if (oldestKey) processedWebhookEvents.delete(oldestKey);
+  }
+  for (const key of keys) {
+    processedWebhookEvents.set(key, now);
+  }
+  return true;
+}
+
+function safeEqualStrings(a: string, b: string): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+function getChannelConfigAliases(channelType: string): string[] {
+  const norm = channelType.replace(/^chan-/, '').toLowerCase();
+  if (norm === 'cequens' || norm === 'sms') return ['chan-cequens', 'chan-sms', 'cequens', 'sms'];
+  if (norm === 'voice' || norm === 'sip') return ['chan-voice', 'chan-sip', 'voice', 'sip'];
+  return [`chan-${norm}`, norm];
+}
+
+function findAllChannelConfigsForType(channelType: string) {
+  const aliases = new Set(getChannelConfigAliases(channelType));
+  return Array.from(db.channelConfigs.values()).filter(
+    (rec) => aliases.has(rec.channelId) && db.organizations.has(rec.organizationId)
+  );
+}
+
+// Meta / Provider Webhook Verification Endpoint (hub.challenge) — Works without user session, enforces tenant-specific verifyToken
 apiRouter.get(['/integrations/:channel/webhook', '/webhooks/:channel'], (req: Request, res: Response) => {
   const mode = req.query['hub.mode'];
   const token = typeof req.query['hub.verify_token'] === 'string' ? req.query['hub.verify_token'] : '';
   const challenge = req.query['hub.challenge'];
   const channelParam = req.params.channel;
-  const orgId = currentActor.organizationId;
-  const storedConfig = db.getChannelConfig(orgId, `chan-${channelParam}`) || db.getChannelConfig(orgId, channelParam);
-  const expectedToken =
-    (typeof storedConfig?.verifyToken === 'string' && storedConfig.verifyToken) ||
-    process.env.WHATSAPP_VERIFY_TOKEN ||
-    process.env.WEBHOOK_VERIFY_TOKEN ||
-    '';
+  const requestedPhoneNumberId =
+    typeof req.query['phone_number_id'] === 'string' ? req.query['phone_number_id'] : '';
+  const requestedWabaId = typeof req.query['waba_id'] === 'string' ? req.query['waba_id'] : '';
 
   if (mode === 'subscribe') {
-    if (
-      expectedToken &&
-      token &&
-      token.length === expectedToken.length &&
-      crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expectedToken))
-    ) {
+    if (!token) {
+      res.status(403).send('Forbidden: Verify token unconfigured or mismatched');
+      return;
+    }
+
+    const candidates = findAllChannelConfigsForType(channelParam);
+    const matched = candidates.find((rec) => {
+      const cfg = rec.config || {};
+      if (requestedPhoneNumberId && cfg.phoneNumberId !== requestedPhoneNumberId) return false;
+      if (requestedWabaId && cfg.wabaId !== requestedWabaId) return false;
+      const expected = typeof cfg.verifyToken === 'string' ? cfg.verifyToken : '';
+      return safeEqualStrings(token, expected);
+    });
+
+    if (matched) {
       res.status(200).send(challenge || 'VERIFIED');
       return;
     }
+
+    const envToken = process.env.WHATSAPP_VERIFY_TOKEN || process.env.WEBHOOK_VERIFY_TOKEN || '';
+    if (envToken && safeEqualStrings(token, envToken)) {
+      res.status(200).send(challenge || 'VERIFIED');
+      return;
+    }
+
     res.status(403).send('Forbidden: Verify token unconfigured or mismatched');
     return;
   }
 
+  if (currentActor.userId === 'unauthenticated') {
+    res.status(401).json({
+      success: false,
+      error: { code: 'AUTH_TOKEN_REQUIRED', message: 'Authentication required for webhook status inspection.' },
+    });
+    return;
+  }
+
+  const orgId = currentActor.organizationId;
+  const storedConfig = db.getChannelConfig(orgId, `chan-${channelParam}`) || db.getChannelConfig(orgId, channelParam);
   const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelParam, storedConfig, false);
   res.status(200).json({ status: adapter.getState().toLowerCase(), adapterState: adapter.getState(), channel: channelParam });
 });
 
-// Universal Inbound Webhook Processor wired through IntegrationRegistry cryptographic verifyWebhook & normalizeInboundMessage
+// Universal Inbound Webhook Processor — Supports unauthenticated provider callbacks via server-controlled tenant mapping & rawBody signature verification
 const handleIncomingWebhook = async (req: Request, res: Response) => {
   const channelType = (req.params.channel || 'whatsapp') as UnifiedMessage['channel'];
-  const orgId = currentActor.organizationId;
-  const storedConfig =
-    db.getChannelConfig(orgId, `chan-${channelType}`) || db.getChannelConfig(orgId, channelType);
+  const rawBodyBuf: Buffer | string | undefined = (req as any).rawBody;
+  if (!rawBodyBuf || (typeof rawBodyBuf === 'string' ? rawBodyBuf.length === 0 : rawBodyBuf.byteLength === 0)) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MALFORMED_RAW_BODY', message: 'Webhook request must include a valid non-empty raw JSON body.' },
+    });
+    return;
+  }
 
-  const allowSim = req.query.simulate === 'true' || (req.body && req.body.simulate === true);
+  let parsedPayload: any;
+  try {
+    const rawStr = typeof rawBodyBuf === 'string' ? rawBodyBuf : rawBodyBuf.toString('utf-8');
+    parsedPayload = JSON.parse(rawStr);
+  } catch {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MALFORMED_WEBHOOK_PAYLOAD', message: 'Malformed JSON in webhook request body.' },
+    });
+    return;
+  }
+
+  if (!parsedPayload || typeof parsedPayload !== 'object' || Array.isArray(parsedPayload)) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MALFORMED_WEBHOOK_PAYLOAD', message: 'Webhook JSON payload must be an object.' },
+    });
+    return;
+  }
+
+  const normalizedHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (typeof v === 'string') normalizedHeaders[k.toLowerCase()] = v;
+    else if (Array.isArray(v) && v[0]) normalizedHeaders[k.toLowerCase()] = v[0];
+  }
+
+  const candidates = findAllChannelConfigsForType(channelType);
+  if (candidates.length === 0) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: `Webhook rejected: adapter '${channelType}' is DISABLED (no configured tenant credentials).`,
+      },
+    });
+    return;
+  }
+
+  let matchedRecord: (typeof candidates)[number] | undefined;
+  const normChannel = String(channelType).toLowerCase();
+
+  if (normChannel === 'whatsapp' || normChannel === 'messenger') {
+    const entry = parsedPayload?.entry?.[0];
+    const changeVal = entry?.changes?.[0]?.value;
+    const phoneNumberId = changeVal?.metadata?.phone_number_id || parsedPayload?.phoneNumberId;
+    const wabaId = entry?.id || parsedPayload?.wabaId;
+    const pageId = entry?.id || parsedPayload?.pageId;
+
+    if (!phoneNumberId && !wabaId && !pageId) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'UNKNOWN_TENANT_MAPPING',
+          message: 'Webhook rejected: missing Meta account/phone_number_id mapping identifier.',
+        },
+      });
+      return;
+    }
+
+    matchedRecord = candidates.find((rec) => {
+      const cfg = rec.config || {};
+      if (phoneNumberId && cfg.phoneNumberId === phoneNumberId) return true;
+      if (wabaId && cfg.wabaId === wabaId) return true;
+      if (pageId && cfg.pageId === pageId) return true;
+      return false;
+    });
+  } else if (normChannel === 'cequens' || normChannel === 'sms') {
+    const senderName = parsedPayload?.senderName || parsedPayload?.sender_name || parsedPayload?.accountId;
+    if (senderName) {
+      matchedRecord = candidates.find((rec) => {
+        const cfg = rec.config || {};
+        return cfg.senderName === senderName || cfg.accountId === senderName;
+      });
+    } else {
+      const authHeader = normalizedHeaders['authorization'] || '';
+      matchedRecord = candidates.find((rec) => {
+        const secret = rec.config?.webhookSecret || '';
+        return secret ? safeEqualStrings(authHeader, `Bearer ${secret}`) : false;
+      });
+      if (!matchedRecord) {
+        res.status(401).json({
+          success: false,
+          error: {
+            code: 'WEBHOOK_VERIFICATION_FAILED',
+            message: 'Invalid or missing CEQUENS webhook authorization or senderName mapping.',
+          },
+        });
+        return;
+      }
+    }
+  } else if (normChannel === 'telegram') {
+    const botId = parsedPayload?.bot_id || parsedPayload?.botId;
+    const secretHeader = normalizedHeaders['x-telegram-bot-api-secret-token'] || '';
+    const botFiltered = botId
+      ? candidates.filter((rec) => String(rec.config?.botToken || '').split(':')[0] === String(botId))
+      : candidates;
+    if (botId && botFiltered.length === 0) {
+      res.status(403).json({
+        success: false,
+        error: { code: 'UNKNOWN_TENANT_MAPPING', message: 'Webhook rejected: unknown Telegram bot_id mapping.' },
+      });
+      return;
+    }
+    matchedRecord = botFiltered.find((rec) => {
+      const expected = rec.config?.webhookSecretToken || rec.config?.webhookSecret || '';
+      return safeEqualStrings(secretHeader, expected);
+    });
+    if (!matchedRecord) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'WEBHOOK_VERIFICATION_FAILED',
+          message: 'Invalid or missing X-Telegram-Bot-Api-Secret-Token.',
+        },
+      });
+      return;
+    }
+  } else if (normChannel === 'email') {
+    const recipient = parsedPayload?.to || parsedPayload?.recipient;
+    matchedRecord = recipient
+      ? candidates.find((rec) => {
+          const cfg = rec.config || {};
+          return cfg.smtpUser === recipient || cfg.fromAddress === recipient;
+        })
+      : undefined;
+    if (!matchedRecord && !recipient) {
+      const authHeader = normalizedHeaders['authorization'] || normalizedHeaders['x-email-webhook-secret'] || '';
+      matchedRecord = candidates.find((rec) => {
+        const expected = rec.config?.webhookSecret || '';
+        return safeEqualStrings(authHeader, expected);
+      });
+    }
+  }
+
+  if (!matchedRecord) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'UNKNOWN_TENANT_MAPPING',
+        message: `Webhook rejected: no server-verified tenant mapping found for channel '${channelType}'.`,
+      },
+    });
+    return;
+  }
+
+  const orgId = matchedRecord.organizationId;
+
+  // Reject any attempt to spoof organizationId in the webhook payload
+  if ('organizationId' in parsedPayload && parsedPayload.organizationId !== orgId) {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.tenant_spoofing_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { spoofedOrgId: parsedPayload.organizationId, resolvedOrgId: orgId },
+    });
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'TENANT_SPOOFING_REJECTED',
+        message: 'Spoofed organizationId in webhook payload does not match server-controlled provider mapping.',
+      },
+    });
+    return;
+  }
+
+  const storedConfig = matchedRecord.config;
+  const isAuthenticatedSession = currentActor.userId !== 'unauthenticated' && currentActor.organizationId === orgId;
+  const allowSim = isAuthenticatedSession && (req.query.simulate === 'true' || parsedPayload.simulate === true);
   const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelType, storedConfig, allowSim);
 
   if (adapter.getState() === 'DISABLED') {
     await AuditLogger.log({
       organizationId: orgId,
-      actorId: currentActor.userId,
+      actorId: 'external-webhook',
       actorType: 'system',
       action: 'webhook.rejected_disabled',
       entityType: 'channel',
@@ -2866,19 +3302,12 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
     return;
   }
 
-  const normalizedHeaders: Record<string, string> = {};
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (typeof v === 'string') normalizedHeaders[k.toLowerCase()] = v;
-    else if (Array.isArray(v) && v[0]) normalizedHeaders[k.toLowerCase()] = v[0];
-  }
-
-  const rawBody: string | Buffer = (req as any).rawBody || JSON.stringify(req.body || {});
-  const verification = await adapter.verifyWebhook(normalizedHeaders, rawBody);
+  const verification = await adapter.verifyWebhook(normalizedHeaders, rawBodyBuf);
 
   if (!verification.isValid) {
     await AuditLogger.log({
       organizationId: orgId,
-      actorId: currentActor.userId,
+      actorId: 'external-webhook',
       actorType: 'system',
       action: 'webhook.signature_rejected',
       entityType: 'channel',
@@ -2890,6 +3319,38 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
       error: {
         code: 'WEBHOOK_VERIFICATION_FAILED',
         message: verification.error || 'Webhook signature/secret verification failed.',
+      },
+    });
+    return;
+  }
+
+  // Replay protection: reject duplicate provider event IDs or replayed raw payloads
+  const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
+  const providerEventId =
+    parsedPayload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.id ||
+    parsedPayload?.update_id ||
+    parsedPayload?.messageId ||
+    parsedPayload?.id ||
+    '';
+  const replayKeys = [`${orgId}:${channelType}:sha256:${rawDigest}`];
+  if (providerEventId) {
+    replayKeys.push(`${orgId}:${channelType}:evt:${String(providerEventId)}`);
+  }
+  if (!checkAndRecordWebhookReplay(replayKeys)) {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.replay_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { providerEventId: providerEventId || null, rawDigest },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'REPLAYED_WEBHOOK_EVENT',
+        message: 'Duplicate or replayed webhook event rejected.',
       },
     });
     return;

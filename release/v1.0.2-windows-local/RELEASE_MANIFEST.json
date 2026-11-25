@@ -1,7 +1,7 @@
 {
   "releaseVersion": "1.0.2",
   "releaseTag": "v1.0.2-windows-local",
-  "buildTimestamp": "2026-11-25T03:10:28.969Z",
+  "buildTimestamp": "2026-11-25T03:50:07.537Z",
   "targetPlatform": "Windows 10 / Windows 11 / Windows Server 2019/2022",
   "runtimeRequirements": {
     "node": ">=22.0.0",
@@ -10,8 +10,8 @@
     "networkBinding": "127.0.0.1 (Strict Loopback / Zero Cloud Exposure)"
   },
   "totalFiles": 22,
-  "totalSizeBytes": 7315090,
-  "totalSizeMB": 6.98,
+  "totalSizeBytes": 7847995,
+  "totalSizeMB": 7.48,
   "fileInventory": {
     ".env.example": {
       "sizeBytes": 2024,
@@ -29,13 +29,13 @@
       "sizeBytes": 46265,
       "sha256": "a40d0e54aefcb7304e89d5a9c387b7ed64161c9f2f6801dda337679fdc392b68"
     },
-    "dist/assets/index-0g97N6FJ.css": {
-      "sizeBytes": 95422,
-      "sha256": "f1d9b3a6a4f7e832151392f46fb9544ec195675f920d0e6aa5c8c2858675491e"
+    "dist/assets/index-Dprxxzqv.js": {
+      "sizeBytes": 707697,
+      "sha256": "72613485cde65cbab424f45cfbd98b1dc4e260f32e841383a006532385fffacd"
     },
-    "dist/assets/index-BedkQ6mf.js": {
-      "sizeBytes": 702828,
-      "sha256": "008fbcc7a4e40be5572c5812c2889931f6d8d923f934d80ac15e8a640cc20393"
+    "dist/assets/index-tYOgJX6i.css": {
+      "sizeBytes": 95606,
+      "sha256": "fe26110d8eb361e141f2a139a4e0f4b2a95ab841baf501481f00edc8d71839b0"
     },
     "dist/assets/vendor-firebase-CE1IJy2A.js": {
       "sizeBytes": 674207,
@@ -55,7 +55,7 @@
     },
     "dist/index.html": {
       "sizeBytes": 2370,
-      "sha256": "b9dcb36d51d8e958e23a02930f256af998cb1becfee6c7f3d96b1a67831f70cb"
+      "sha256": "1f7d82828472eb9f57b54f5eb511c4d29de4e720883cc853d72bfb563c446fa4"
     },
     "dist/manifest.webmanifest": {
       "sizeBytes": 1992,
@@ -67,19 +67,19 @@
     },
     "dist/sw.js": {
       "sizeBytes": 1988,
-      "sha256": "ca6092a964a6b9fee8b3055b8315e8cdd6610c2855101c6a451e7df8f2795c2c"
+      "sha256": "f88aeab038ac3659e6c73bb6b75dbbc040b7472bdd3972ccf32a534f01e0723b"
     },
     "dist/workbox-c121765f.js": {
       "sizeBytes": 22270,
       "sha256": "209c89a1434f9012dac6de78f07f9f78278b911a5d7622f1c1e5369bb74e1d9e"
     },
     "dist-server/server.cjs": {
-      "sizeBytes": 5085476,
-      "sha256": "ed1140b7fe5e7ed4c7a157a31a794839af3779da3e8f366094547945cdc65c79"
+      "sizeBytes": 5613178,
+      "sha256": "34462bddc8622755f1f5ff39c66c92c7154d6970bb10fcbaccd4fa638fe3f9ba"
     },
     "package.json": {
-      "sizeBytes": 2614,
-      "sha256": "bbf87d2d3bf668e8f7fc6d66d5f239966e664c17e962b07a51dc2d3155a1979e"
+      "sizeBytes": 2764,
+      "sha256": "03b02ebfe20b40407e240e8605961145a634e0f407daf3adc6e9b3afb5a52b5f"
     },
     "prepare_ntfs_acl_hardening.ps1": {
       "sizeBytes": 30695,
