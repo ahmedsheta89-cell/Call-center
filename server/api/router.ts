@@ -57,6 +57,11 @@ import { EventBus } from '../core/events.ts';
 import { ensurePwaIconsGenerated, PWA_ICON_TMP_DIR } from '../core/pwaAssets.ts';
 import { initializeIntegrationAdapters } from '../modules/integrations/init.ts';
 import { IntegrationRegistry } from '../modules/integrations/registry.ts';
+import {
+  reserveDurableIdempotencyKeys,
+  commitDurableIdempotencyKeys,
+  releaseDurableIdempotencyKeys,
+} from '../core/durableIdempotency.ts';
 
 // Initialize integration adapters subsystem
 initializeIntegrationAdapters();
@@ -1448,6 +1453,28 @@ apiRouter.post('/calls/dial', async (req: Request, res: Response) => {
     return;
   }
 
+  if (adapterState !== 'SIMULATED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'agent',
+      action: 'call.dial_rejected_not_implemented',
+      entityType: 'call',
+      entityId: 'chan-voice',
+      afterState: { adapterState, phoneNumber: targetNumber },
+    });
+    res.status(501).json({
+      success: false,
+      adapterState,
+      error: {
+        code: 'LIVE_SIP_INVITE_NOT_IMPLEMENTED',
+        message:
+          'إجراء المكالمات الصوتية الحية عبر SIP INVITE/SDP/RTP غير مفعّل بعد بدون بوابة وسائط PBX حية (NOT_IMPLEMENTED). استخدم المحاكاة المحلية (simulate=true) للتجربة الآمنة.',
+      },
+    });
+    return;
+  }
+
   const session = await sipAdapter.initiateOutboundCall({
     organizationId: orgId,
     from: voiceConfig?.defaultCallerId || '+20220000000',
@@ -1664,17 +1691,13 @@ apiRouter.post(
       return;
     }
 
-    const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
-    const eventId = typeof payload?.eventId === 'string' ? payload.eventId.trim() : '';
-    const replayKeys = [
-      `${orgId}:sip_confirm:sha256:${rawDigest}`,
-      `${orgId}:sip_confirm:call:${call.id}:${providerSessionId}`,
-    ];
-    if (eventId) replayKeys.push(`${orgId}:sip_confirm:evt:${eventId}`);
-    if (!checkAndRecordWebhookReplay(replayKeys)) {
+    if (!call.providerTransactionId || call.disposition !== 'awaiting_provider_confirmation') {
       res.status(409).json({
         success: false,
-        error: { code: 'REPLAYED_PROVIDER_CALLBACK', message: 'Replayed SIP provider confirmation rejected.' },
+        error: {
+          code: 'NO_PENDING_PROVIDER_TRANSACTION',
+          message: 'Call does not have an active persisted pending SIP provider transaction.',
+        },
       });
       return;
     }
@@ -1690,35 +1713,85 @@ apiRouter.post(
       return;
     }
 
-    const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceConfig, false);
-    if (sipAdapter.getState() === 'DISABLED') {
+    const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
+    const eventId = typeof payload?.eventId === 'string' ? payload.eventId.trim() : '';
+    const accountId = String(voiceConfig?.sipUsername || 'default');
+    const replayKeys = [
+      `sip_confirm:${orgId}:${accountId}:sha256:${rawDigest}`,
+      `sip_confirm:${orgId}:${accountId}:call:${call.id}:${providerSessionId}`,
+    ];
+    if (eventId) replayKeys.push(`sip_confirm:${orgId}:${accountId}:evt:${eventId}`);
+
+    const reserve = reserveDurableIdempotencyKeys(replayKeys);
+    if (!reserve.ok) {
+      if (reserve.reason === 'STORAGE_UNTRUSTED') {
+        res.status(503).json({
+          success: false,
+          error: { code: 'IDEMPOTENCY_STORAGE_UNTRUSTED', message: reserve.message },
+        });
+        return;
+      }
       res.status(409).json({
         success: false,
-        error: { code: 'ADAPTER_DISABLED', message: 'SIP Telephony adapter is DISABLED.' },
+        error: { code: 'REPLAYED_PROVIDER_CALLBACK', message: 'Replayed SIP provider confirmation rejected.' },
       });
       return;
     }
 
-    const confirmedCall = sipAdapter.confirmCallConnected
-      ? await sipAdapter.confirmCallConnected(call.id, providerSessionId)
-      : call;
+    const prevStatus = call.status;
+    const prevDisposition = call.disposition;
+    const prevTranscript = call.transcript;
+    const prevProviderSessionId = call.providerSessionId;
 
-    EventBus.publish('call:event', { action: 'confirm', call: confirmedCall });
-    await AuditLogger.log({
-      organizationId: orgId,
-      actorId: 'sip-provider-webhook',
-      actorType: 'system',
-      action: 'call.provider_confirmed',
-      entityType: 'call',
-      entityId: confirmedCall.id,
-      afterState: {
-        status: confirmedCall.status,
-        disposition: confirmedCall.disposition,
-        providerSessionId,
-      },
-    });
+    try {
+      const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceConfig, false);
+      if (sipAdapter.getState() === 'DISABLED') {
+        releaseDurableIdempotencyKeys(replayKeys);
+        res.status(409).json({
+          success: false,
+          error: { code: 'ADAPTER_DISABLED', message: 'SIP Telephony adapter is DISABLED.' },
+        });
+        return;
+      }
 
-    res.json({ success: true, data: confirmedCall });
+      const confirmedCall = sipAdapter.confirmCallConnected
+        ? await sipAdapter.confirmCallConnected(call.id, providerSessionId)
+        : call;
+
+      const persisted = db.saveToDisk();
+      if (!persisted) {
+        throw new Error('Failed to persist confirmed call state to disk.');
+      }
+      commitDurableIdempotencyKeys(replayKeys, { metadata: { callId: call.id, providerSessionId } });
+
+      EventBus.publish('call:event', { action: 'confirm', call: confirmedCall });
+      await AuditLogger.log({
+        organizationId: orgId,
+        actorId: 'sip-provider-webhook',
+        actorType: 'system',
+        action: 'call.provider_confirmed',
+        entityType: 'call',
+        entityId: confirmedCall.id,
+        afterState: {
+          status: confirmedCall.status,
+          disposition: confirmedCall.disposition,
+          providerSessionId,
+        },
+      });
+
+      res.json({ success: true, data: confirmedCall });
+    } catch (err: any) {
+      call.status = prevStatus;
+      call.disposition = prevDisposition;
+      call.transcript = prevTranscript;
+      call.providerSessionId = prevProviderSessionId;
+      db.calls.set(call.id, call);
+      releaseDurableIdempotencyKeys(replayKeys);
+      res.status(503).json({
+        success: false,
+        error: { code: 'PERSISTENCE_FAILED', message: err?.message || 'Failed to persist confirmation.' },
+      });
+    }
   }
 );
 
@@ -1771,14 +1844,25 @@ apiRouter.post('/calls/:id/control', async (req: Request, res: Response) => {
   }
 
   const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(db.getChannelConfig(orgId, 'chan-voice'), true);
-  if (action === 'hold') await sipAdapter.toggleHold(call.id, true);
-  else if (action === 'unhold') await sipAdapter.toggleHold(call.id, false);
-  else if (action === 'mute') await sipAdapter.toggleMute(call.id, true);
-  else if (action === 'unmute') await sipAdapter.toggleMute(call.id, false);
-  else if (action === 'whisper' || action === 'barge') {
-    await sipAdapter.bargeOrWhisperCall(call.id, currentActor.userId, action);
-  } else if (action === 'hangup') {
-    await sipAdapter.terminateCall(call.id, 'completed_by_operator');
+  try {
+    if (action === 'hold') await sipAdapter.toggleHold(call.id, true);
+    else if (action === 'unhold') await sipAdapter.toggleHold(call.id, false);
+    else if (action === 'mute') await sipAdapter.toggleMute(call.id, true);
+    else if (action === 'unmute') await sipAdapter.toggleMute(call.id, false);
+    else if (action === 'whisper' || action === 'barge') {
+      await sipAdapter.bargeOrWhisperCall(call.id, currentActor.userId, action);
+    } else if (action === 'hangup') {
+      await sipAdapter.terminateCall(call.id, 'completed_by_operator');
+    }
+  } catch (err: any) {
+    if (String(err?.message || '').includes('INVALID_CALL_STATE_TRANSITION')) {
+      res.status(409).json({
+        success: false,
+        error: { code: 'INVALID_CALL_STATE_TRANSITION', message: err.message },
+      });
+      return;
+    }
+    throw err;
   }
 
   const updatedCall = db.calls.get(call.id) || call;
@@ -3002,31 +3086,67 @@ apiRouter.post('/integrations/channels/:id/test-connection', async (req: Request
   });
 });
 
-// Bounded replay protection cache for external provider webhooks (10,000 entries max, 24h TTL)
-const processedWebhookEvents = new Map<string, number>();
-const WEBHOOK_REPLAY_TTL_MS = 24 * 60 * 60 * 1000;
+function resolveWebhookAccountKey(channelType: string, cfg: Record<string, any>): string {
+  const norm = String(channelType).toLowerCase();
+  if (norm === 'whatsapp' || norm === 'messenger') {
+    return String(cfg.phoneNumberId || cfg.wabaId || cfg.pageId || 'default');
+  }
+  if (norm === 'cequens' || norm === 'sms') {
+    return String(cfg.senderName || cfg.accountId || 'default');
+  }
+  if (norm === 'telegram') {
+    return String(cfg.botToken ? String(cfg.botToken).split(':')[0] : 'default');
+  }
+  if (norm === 'email') {
+    return String(cfg.smtpUser || cfg.fromAddress || 'default');
+  }
+  return 'default';
+}
 
-function checkAndRecordWebhookReplay(keys: string[]): boolean {
-  const now = Date.now();
-  for (const key of keys) {
-    const prev = processedWebhookEvents.get(key);
-    if (prev !== undefined && now - prev < WEBHOOK_REPLAY_TTL_MS) {
-      return false;
+function extractWebhookBatchItems(channelType: string, parsedPayload: any): Array<{ eventId: string; itemPayload: any }> {
+  const norm = String(channelType).toLowerCase();
+  if ((norm === 'whatsapp' || norm === 'messenger') && Array.isArray(parsedPayload?.entry)) {
+    const items: Array<{ eventId: string; itemPayload: any }> = [];
+    for (const entry of parsedPayload.entry) {
+      if (Array.isArray(entry?.changes)) {
+        for (const change of entry.changes) {
+          const val = change?.value;
+          if (Array.isArray(val?.messages) && val.messages.length > 0) {
+            for (const m of val.messages) {
+              items.push({
+                eventId: String(m?.id || ''),
+                itemPayload: {
+                  entry: [
+                    {
+                      id: entry.id,
+                      changes: [{ value: { ...val, messages: [m] } }],
+                    },
+                  ],
+                },
+              });
+            }
+          }
+        }
+      }
     }
+    if (items.length > 0) return items;
   }
-  if (processedWebhookEvents.size >= 10000) {
-    const oldestKey = processedWebhookEvents.keys().next().value;
-    if (oldestKey) processedWebhookEvents.delete(oldestKey);
-  }
-  for (const key of keys) {
-    processedWebhookEvents.set(key, now);
-  }
-  return true;
+
+  const singleId =
+    parsedPayload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.id ||
+    parsedPayload?.update_id ||
+    parsedPayload?.messageId ||
+    parsedPayload?.id ||
+    '';
+  return [{ eventId: singleId ? String(singleId) : '', itemPayload: parsedPayload }];
 }
 
 function safeEqualStrings(a: string, b: string): boolean {
-  if (!a || !b || a.length !== b.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 function getChannelConfigAliases(channelType: string): string[] {
@@ -3083,7 +3203,11 @@ apiRouter.get(['/integrations/:channel/webhook', '/webhooks/:channel'], (req: Re
     return;
   }
 
-  if (currentActor.userId === 'unauthenticated') {
+  if (
+    currentActor.userId === 'anonymous' ||
+    currentActor.userId === 'unauthenticated' ||
+    currentActor.organizationId === 'unauthenticated'
+  ) {
     res.status(401).json({
       success: false,
       error: { code: 'AUTH_TOKEN_REQUIRED', message: 'Authentication required for webhook status inspection.' },
@@ -3278,7 +3402,10 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
   }
 
   const storedConfig = matchedRecord.config;
-  const isAuthenticatedSession = currentActor.userId !== 'unauthenticated' && currentActor.organizationId === orgId;
+  const isAuthenticatedSession =
+    currentActor.userId !== 'anonymous' &&
+    currentActor.userId !== 'unauthenticated' &&
+    currentActor.organizationId === orgId;
   const allowSim = isAuthenticatedSession && (req.query.simulate === 'true' || parsedPayload.simulate === true);
   const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelType, storedConfig, allowSim);
 
@@ -3324,19 +3451,21 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
     return;
   }
 
-  // Replay protection: reject duplicate provider event IDs or replayed raw payloads
+  // Durable, tenant- and account-namespaced replay protection with batch deduplication
+  const accountKey = resolveWebhookAccountKey(channelType, storedConfig || {});
   const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
-  const providerEventId =
-    parsedPayload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.id ||
-    parsedPayload?.update_id ||
-    parsedPayload?.messageId ||
-    parsedPayload?.id ||
-    '';
-  const replayKeys = [`${orgId}:${channelType}:sha256:${rawDigest}`];
-  if (providerEventId) {
-    replayKeys.push(`${orgId}:${channelType}:evt:${String(providerEventId)}`);
-  }
-  if (!checkAndRecordWebhookReplay(replayKeys)) {
+  const rawDigestKey = `wh:${orgId}:${channelType}:${accountKey}:sha256:${rawDigest}`;
+
+  // First check raw payload digest (exact duplicate payload replay)
+  const rawReserve = reserveDurableIdempotencyKeys([rawDigestKey]);
+  if (!rawReserve.ok) {
+    if (rawReserve.reason === 'STORAGE_UNTRUSTED') {
+      res.status(503).json({
+        success: false,
+        error: { code: 'IDEMPOTENCY_STORAGE_UNTRUSTED', message: rawReserve.message },
+      });
+      return;
+    }
     await AuditLogger.log({
       organizationId: orgId,
       actorId: 'external-webhook',
@@ -3344,7 +3473,7 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
       action: 'webhook.replay_rejected',
       entityType: 'channel',
       entityId: channelType,
-      afterState: { providerEventId: providerEventId || null, rawDigest },
+      afterState: { rawDigest, reason: rawReserve.reason },
     });
     res.status(409).json({
       success: false,
@@ -3356,117 +3485,230 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
     return;
   }
 
-  const normalizedMsg = await adapter.normalizeInboundMessage(verification.rawPayload, orgId);
-  const phone = verification.senderIdentifier || normalizedMsg.customerId;
-  const text = normalizedMsg.body;
-  const name = normalizedMsg.sender?.name || 'عميل عبر Webhook';
+  const batchItems = extractWebhookBatchItems(channelType, verification.rawPayload);
+  const acceptedItems: Array<{ eventId: string; itemPayload: any; keys: string[] }> = [];
+  const skippedDuplicateIds: string[] = [];
 
-  let customer = Array.from(db.customers.values()).find(
-    (c) => c.organizationId === orgId && (c.phone === phone || c.id === normalizedMsg.customerId)
-  );
-
-  if (!customer) {
-    const custId = normalizedMsg.customerId || `cust-wh-${Date.now().toString(36)}`;
-    customer = {
-      id: custId,
-      organizationId: orgId,
-      name,
-      phone,
-      email: `${custId.replace(/[^a-zA-Z0-9_-]/g, '_')}@omniflow.local`,
-      customerTier: 'standard',
-      lifetimeValue: 0,
-      tags: [`webhook_${channelType}`],
-      customFields: { source: 'webhook', channel: channelType, adapterState: adapter.getState() },
-      createdAt: normalizedMsg.createdAt,
-      updatedAt: normalizedMsg.createdAt,
-    };
-    db.customers.set(custId, customer);
+  for (const item of batchItems) {
+    if (!item.eventId) {
+      acceptedItems.push({ ...item, keys: [] });
+      continue;
+    }
+    const evtKey = `wh:${orgId}:${channelType}:${accountKey}:evt:${item.eventId}`;
+    const itemRes = reserveDurableIdempotencyKeys([evtKey]);
+    if (!itemRes.ok) {
+      if (itemRes.reason === 'STORAGE_UNTRUSTED') {
+        releaseDurableIdempotencyKeys([rawDigestKey, ...acceptedItems.flatMap((a) => a.keys)]);
+        res.status(503).json({
+          success: false,
+          error: { code: 'IDEMPOTENCY_STORAGE_UNTRUSTED', message: itemRes.message },
+        });
+        return;
+      }
+      skippedDuplicateIds.push(item.eventId);
+      continue;
+    }
+    acceptedItems.push({ ...item, keys: [evtKey] });
   }
 
-  let conv = Array.from(db.conversations.values()).find(
-    (c) => c.organizationId === orgId && c.customerId === customer!.id && c.status === 'open'
-  );
-
-  const now = new Date().toISOString();
-  if (!conv) {
-    const convId = normalizedMsg.conversationId || `conv-wh-${Date.now().toString(36)}`;
-    conv = {
-      id: convId,
+  if (acceptedItems.length === 0) {
+    releaseDurableIdempotencyKeys([rawDigestKey]);
+    await AuditLogger.log({
       organizationId: orgId,
-      customerId: customer.id,
-      channel: normalizedMsg.channel,
-      status: 'open',
-      priority: customer.customerTier === 'vip' ? 'urgent' : 'medium',
-      sentiment: 'neutral',
-      intent: 'general_inquiry',
-      lastMessageAt: now,
-      createdAt: now,
-      updatedAt: now,
-    };
-    db.conversations.set(convId, conv);
-  } else {
-    conv.lastMessageAt = now;
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.replay_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { skippedDuplicateIds, rawDigest },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'REPLAYED_WEBHOOK_EVENT',
+        message: 'All events in webhook payload are duplicates or replayed.',
+      },
+    });
+    return;
   }
 
-  const msg: UnifiedMessage = {
-    ...normalizedMsg,
-    conversationId: conv.id,
-    customerId: customer.id,
-    metadata: {
-      ...(normalizedMsg.metadata || {}),
-      webhook: true,
-      adapterState: adapter.getState(),
-      receivedAt: now,
-    },
-  };
-  db.messages.set(msg.id, msg);
+  const allReservedKeys = [rawDigestKey, ...acceptedItems.flatMap((a) => a.keys)];
+  const processedResults: Array<{ messageId: string; conversationId: string; customerId: string; messageStatus: string }> = [];
+  const createdCustomerIds: string[] = [];
+  const createdConvIds: string[] = [];
+  const prevConvSnapshots: Array<{ id: string; lastMessageAt: string; intent: any; sentiment: any }> = [];
+  const createdMsgIds: string[] = [];
+  const pendingEvents: Array<{ conv: Conversation; msg: UnifiedMessage; phone: string; text: string }> = [];
 
   try {
-    const aiResult = await AIGateway.execute({
-      organizationId: orgId,
-      task: 'sentiment_intent_analysis',
-      input: text,
-      privacy: 'confidential',
-      forceLocal: true,
+    for (const item of acceptedItems) {
+      const normalizedMsg = await adapter.normalizeInboundMessage(item.itemPayload, orgId);
+      const phone = normalizedMsg.sender?.id?.replace(/^cust-[^-]+-/, '') || verification.senderIdentifier || normalizedMsg.customerId;
+      const text = normalizedMsg.body;
+      const name = normalizedMsg.sender?.name || 'عميل عبر Webhook';
+
+      let customer = Array.from(db.customers.values()).find(
+        (c) => c.organizationId === orgId && (c.phone === phone || c.id === `${orgId}::${normalizedMsg.customerId}`)
+      );
+
+      if (!customer) {
+        const baseCustId = normalizedMsg.customerId || `cust-wh-${Date.now().toString(36)}`;
+        // Tenant-namespace deterministic IDs so another tenant can never overwrite an existing record
+        const custId = db.customers.has(baseCustId) ? `${orgId}::${baseCustId}` : baseCustId;
+        customer = {
+          id: custId,
+          organizationId: orgId,
+          name,
+          phone,
+          email: `${custId.replace(/[^a-zA-Z0-9_-]/g, '_')}@omniflow.local`,
+          customerTier: 'standard',
+          lifetimeValue: 0,
+          tags: [`webhook_${channelType}`],
+          customFields: { source: 'webhook', channel: channelType, adapterState: adapter.getState() },
+          createdAt: normalizedMsg.createdAt,
+          updatedAt: normalizedMsg.createdAt,
+        };
+        db.customers.set(custId, customer);
+        createdCustomerIds.push(custId);
+      }
+
+      let conv = Array.from(db.conversations.values()).find(
+        (c) => c.organizationId === orgId && c.customerId === customer!.id && c.status === 'open'
+      );
+
+      const now = new Date().toISOString();
+      if (!conv) {
+        const baseConvId = normalizedMsg.conversationId || `conv-wh-${Date.now().toString(36)}`;
+        const convId = db.conversations.has(baseConvId) ? `${orgId}::${baseConvId}` : baseConvId;
+        conv = {
+          id: convId,
+          organizationId: orgId,
+          customerId: customer.id,
+          channel: normalizedMsg.channel,
+          status: 'open',
+          priority: customer.customerTier === 'vip' ? 'urgent' : 'medium',
+          sentiment: 'neutral',
+          intent: 'general_inquiry',
+          lastMessageAt: now,
+          createdAt: now,
+          updatedAt: now,
+        };
+        db.conversations.set(convId, conv);
+        createdConvIds.push(convId);
+      } else {
+        prevConvSnapshots.push({
+          id: conv.id,
+          lastMessageAt: conv.lastMessageAt,
+          intent: conv.intent,
+          sentiment: conv.sentiment,
+        });
+        conv.lastMessageAt = now;
+      }
+
+      const msg: UnifiedMessage = {
+        ...normalizedMsg,
+        conversationId: conv.id,
+        customerId: customer.id,
+        metadata: {
+          ...(normalizedMsg.metadata || {}),
+          webhook: true,
+          adapterState: adapter.getState(),
+          receivedAt: now,
+        },
+      };
+      db.messages.set(msg.id, msg);
+      createdMsgIds.push(msg.id);
+
+      try {
+        const aiResult = await AIGateway.execute({
+          organizationId: orgId,
+          task: 'sentiment_intent_analysis',
+          input: text,
+          privacy: 'confidential',
+          forceLocal: true,
+        });
+        const parsed = JSON.parse(aiResult.content);
+        if (parsed.intent) conv.intent = parsed.intent;
+        if (parsed.sentiment) conv.sentiment = parsed.sentiment;
+      } catch {
+        // fallback
+      }
+
+      pendingEvents.push({ conv, msg, phone, text });
+      processedResults.push({
+        messageId: msg.id,
+        conversationId: conv.id,
+        customerId: customer.id,
+        messageStatus: msg.status,
+      });
+    }
+
+    const persisted = db.saveToDisk();
+    if (!persisted) {
+      throw new Error('Failed to persist webhook messages to durable storage.');
+    }
+    commitDurableIdempotencyKeys(allReservedKeys, {
+      metadata: { channel: channelType, processedCount: processedResults.length },
     });
-    const parsed = JSON.parse(aiResult.content);
-    if (parsed.intent) conv.intent = parsed.intent;
-    if (parsed.sentiment) conv.sentiment = parsed.sentiment;
-  } catch {
-    // fallback
+
+    // Publish SSE & audit events only after durable persistence succeeds
+    for (const evt of pendingEvents) {
+      EventBus.publish('message:new', { conversationId: evt.conv.id, message: evt.msg });
+      EventBus.publish('conversation:updated', evt.conv);
+      await AuditLogger.log({
+        organizationId: orgId,
+        actorId: evt.msg.customerId,
+        actorType: 'system',
+        action: 'webhook.inbound_processed',
+        entityType: 'message',
+        entityId: evt.msg.id,
+        afterState: {
+          channel: channelType,
+          adapterState: adapter.getState(),
+          status: evt.msg.status,
+          phone: evt.phone,
+          textSnippet: evt.text.slice(0, 30),
+        },
+      });
+    }
+
+    const first = processedResults[0];
+    res.status(200).json({
+      success: true,
+      data: {
+        messageId: first.messageId,
+        conversationId: first.conversationId,
+        customerId: first.customerId,
+        adapterState: adapter.getState(),
+        messageStatus: first.messageStatus,
+        processedCount: processedResults.length,
+        skippedDuplicates: skippedDuplicateIds,
+        processedMessages: processedResults,
+        status: 'received_and_broadcasted',
+      },
+    });
+  } catch (err: any) {
+    // Rollback in-memory mutations if durable persistence failed
+    for (const mid of createdMsgIds) db.messages.delete(mid);
+    for (const cid of createdConvIds) db.conversations.delete(cid);
+    for (const snap of prevConvSnapshots) {
+      const c = db.conversations.get(snap.id);
+      if (c) {
+        c.lastMessageAt = snap.lastMessageAt;
+        c.intent = snap.intent;
+        c.sentiment = snap.sentiment;
+      }
+    }
+    for (const cuid of createdCustomerIds) db.customers.delete(cuid);
+    releaseDurableIdempotencyKeys(allReservedKeys);
+    res.status(503).json({
+      success: false,
+      error: {
+        code: 'WEBHOOK_PERSISTENCE_FAILED',
+        message: err?.message || 'Failed to persist inbound webhook event; replay key not committed.',
+      },
+    });
   }
-
-  db.schedulePersist();
-  EventBus.publish('message:new', { conversationId: conv.id, message: msg });
-  EventBus.publish('conversation:updated', conv);
-
-  await AuditLogger.log({
-    organizationId: orgId,
-    actorId: customer.id,
-    actorType: 'system',
-    action: 'webhook.inbound_processed',
-    entityType: 'message',
-    entityId: msg.id,
-    afterState: {
-      channel: channelType,
-      adapterState: adapter.getState(),
-      status: msg.status,
-      phone,
-      textSnippet: text.slice(0, 30),
-    },
-  });
-
-  res.status(200).json({
-    success: true,
-    data: {
-      messageId: msg.id,
-      conversationId: conv.id,
-      customerId: customer.id,
-      adapterState: adapter.getState(),
-      messageStatus: msg.status,
-      status: 'received_and_broadcasted',
-    },
-  });
 };
 
 apiRouter.post('/integrations/:channel/webhook', handleIncomingWebhook);

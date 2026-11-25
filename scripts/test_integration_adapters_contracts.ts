@@ -174,28 +174,45 @@ async function runTests() {
       liveHealth
     );
 
-    const call = await liveSipAdapter.initiateOutboundCall({
+    let liveDialBlocked = false;
+    try {
+      await liveSipAdapter.initiateOutboundCall({
+        organizationId: testOrgId,
+        from: '+20220000000',
+        to: '01019876543',
+        agentId: 'ag-test-1',
+      });
+    } catch (err: any) {
+      liveDialBlocked = String(err?.message || '').includes('LIVE_SIP_INVITE_NOT_IMPLEMENTED');
+    }
+    assert(
+      liveDialBlocked,
+      'Non-simulated liveSipAdapter.initiateOutboundCall() fails closed with LIVE_SIP_INVITE_NOT_IMPLEMENTED'
+    );
+
+    const simSipAdapter = new SipTelephonyAdapter({ allowSimulation: true });
+    const call = await simSipAdapter.initiateOutboundCall({
       organizationId: testOrgId,
       from: '+20220000000',
       to: '01019876543',
       agentId: 'ag-test-1',
     });
     assert(
-      call.status === 'ringing' && call.disposition === 'awaiting_provider_confirmation',
-      `Outbound SIP call starts in ringing/awaiting_provider_confirmation (NEVER marked connected prematurely) [status=${call.status}, disp=${call.disposition}]`
+      call.status === 'ringing' && call.disposition === 'simulated_ringing',
+      `Simulated outbound SIP call starts in ringing/simulated_ringing [status=${call.status}, disp=${call.disposition}]`
     );
 
-    const confirmed = await liveSipAdapter.confirmCallConnected(call.id, 'sip-callid-9988');
+    const confirmed = await simSipAdapter.confirmCallConnected(call.id, 'sim-ack-local');
     assert(
-      confirmed.status === 'in_progress' && confirmed.disposition === 'provider_confirmed',
-      `Explicit provider session confirmation transitions SIP call to in_progress/provider_confirmed`,
+      confirmed.status === 'in_progress' && confirmed.disposition === 'simulated_confirmed',
+      `Simulated call confirmation transitions to in_progress/simulated_confirmed (never provider_confirmed)`,
       confirmed
     );
 
-    await liveSipAdapter.toggleHold(call.id, true);
+    await simSipAdapter.toggleHold(call.id, true);
     assert(call.status === 'hold', 'Call hold toggled cleanly');
-    await liveSipAdapter.toggleHold(call.id, false);
-    await liveSipAdapter.terminateCall(call.id, 'resolved_inquiry');
+    await simSipAdapter.toggleHold(call.id, false);
+    await simSipAdapter.terminateCall(call.id, 'resolved_inquiry');
     assert(call.status === 'completed', 'Call terminated cleanly');
   } finally {
     liveSipServer.close();

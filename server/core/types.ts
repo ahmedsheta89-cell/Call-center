@@ -193,6 +193,8 @@ export interface CallSession {
   recordingUrl?: string;
   transcript?: string;
   disposition?: string;
+  providerTransactionId?: string;
+  providerSessionId?: string;
   aiSummary?: string;
   aiSentiment?: 'positive' | 'neutral' | 'negative';
   startedAt: string;

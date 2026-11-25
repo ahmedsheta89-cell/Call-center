@@ -55,15 +55,20 @@
   1. سرعة فائقة (زمن استجابة أقل من 5 مللي ثانية).
   2. تكلفة صفرية مضمونة (0.00 USD).
   3. حماية تامة للبيانات والخصوصية وعدم خروج أي بايت خارج الجهاز.
-## 3. مصفوفة تكاملات السوق المصري وحالة الجاهزية (Egypt Integration Matrix)
+## 3. مصفوفة قدرات وتكاملات السوق المصري (Egypt Integration Capability Matrix)
 
-| القناة / المزود | كود منفذ | محاكاة محلية | بيئة اختبار (Provider Sandbox) | تفعيل حي مع المزود (Live Provider) |
-| :--- | :---: | :---: | :---: | :---: |
-| **WebChat المحلي** | نعم | غير مطلوب | تم التحقق | نشط محلياً (`CONNECTED`) |
-| **WhatsApp Cloud API (Meta)** | نعم (`X-Hub-Signature-256` + Graph v21) | `SIMULATED` | تم التحقق (Unauthenticated Webhook + Replay) | غير مفعل حياً — يتطلب اعتمادات Meta |
-| **CEQUENS Egypt SMS** | نعم (`Bearer` + REST) | `SIMULATED` | تم التحقق (Unauthenticated Webhook) | غير مفعل حياً — يتطلب مفتاح CEQUENS |
-| **SIP Egypt Telephony (NTRA / Law 151)** | نعم (`REGISTER` + Digest + Signed Callback) | `SIMULATED` | تم التحقق (`TCP_REACHABLE` vs `REGISTERED`) | غير مفعل حياً — يتطلب SIP Trunk مرخص |
-| **Email SMTP Bridge (Nodemailer)** | نعم (TLS/STARTTLS + Auth + Idempotency) | `SIMULATED` | تم التحقق (Actual SMTP Transaction) | غير مفعل حياً — يتطلب بيانات SMTP |
-| **Telegram Bot API** | نعم (`X-Telegram-Bot-Api-Secret-Token`) | `SIMULATED` | تم التحقق (Unauthenticated Webhook) | غير مفعل حياً — يتطلب Bot Token |
+التصنيفات المعتمدة حصرياً:
+`IMPLEMENTED` | `LOCAL_PROTOCOL_FIXTURE_TESTED` | `PROVIDER_SANDBOX_VERIFIED` | `LIVE_PROVIDER_VERIFIED` | `SIMULATED` | `CONFIGURED` | `DISABLED` | `NOT_IMPLEMENTED`
 
-**التصنيف الحالي للإصدار:** `LOCAL_PILOT` (جميع البوابات والأمان والاختبارات المعزولة مثبتة؛ التفعيل الخارجي الحي معطل افتراضياً بأمان `DISABLED` لحين توفير اعتمادات المزودين المملوكة للعميل).
+| القناة / القدرة | الحالة البرمجية والتشغيلية | نطاق التحقق الفعلي | القيود والحالة الحية |
+| :--- | :---: | :---: | :--- |
+| **WebChat المحلي ($0.00)** | `IMPLEMENTED` | `IMPLEMENTED` (محلي) | نشط محلياً عبر الخادم دون تكاليف أو وسطاء خارجيين. |
+| **WhatsApp Cloud API (Webhooks + Graph v21)** | `IMPLEMENTED` (معطل افتراضياً `DISABLED` بدون مفاتيح) | `LOCAL_PROTOCOL_FIXTURE_TESTED` / `SIMULATED` | تم التحقق عبر اختبارات محلية موقعة (`X-Hub-Signature-256`) وReplay دائم؛ **ليس** `PROVIDER_SANDBOX_VERIFIED` ولا `LIVE_PROVIDER_VERIFIED`. |
+| **CEQUENS Egypt SMS (Webhooks + REST)** | `IMPLEMENTED` (`DISABLED` بدون مفاتيح) | `LOCAL_PROTOCOL_FIXTURE_TESTED` / `SIMULATED` | تم التحقق عبر اختبارات محلية (`Bearer` + `senderName`)؛ **ليس** `PROVIDER_SANDBOX_VERIFIED` ولا `LIVE_PROVIDER_VERIFIED`. |
+| **Telegram Bot API (Webhooks + REST)** | `IMPLEMENTED` (`DISABLED` بدون مفاتيح) | `LOCAL_PROTOCOL_FIXTURE_TESTED` / `SIMULATED` | تم التحقق عبر اختبارات محلية (`X-Telegram-Bot-Api-Secret-Token`)؛ **ليس** `PROVIDER_SANDBOX_VERIFIED` ولا `LIVE_PROVIDER_VERIFIED`. |
+| **Email SMTP Bridge (Nodemailer TLS/STARTTLS)** | `IMPLEMENTED` (`DISABLED` بدون بيانات) | `LOCAL_PROTOCOL_FIXTURE_TESTED` / `SIMULATED` | تم التحقق أمام خادم SMTP محلي معزول يدعم STARTTLS وAUTH؛ يميّز قبول الترحيل (`250 OK`) عن تأكيد الوصول لصندوق الوارد، ولا يساوي `PROVIDER_SANDBOX_VERIFIED` أو `LIVE_PROVIDER_VERIFIED`. |
+| **SIP REGISTER (RFC 3261 + Digest MD5)** | `IMPLEMENTED` (`DISABLED` بدون بيانات) | `LOCAL_PROTOCOL_FIXTURE_TESTED` | تم التحقق أمام محاكي PBX محلي؛ يفصل `TCP_REACHABLE` عن `REGISTERED`؛ ولا يعني دعم المكالمات الصادرة أو الوسائط الحية. |
+| **SIP Outbound INVITE / SDP / RTP Media** | `NOT_IMPLEMENTED` (يرفض بـ `501` حياً) | `SIMULATED` فقط | المكالمات الحية مغلقة بأمان (`NOT_IMPLEMENTED`)؛ المكالمات المحلية متاحة عبر `SIMULATED` فقط. |
+| **SIP Provider Call Confirmation Callback** | `IMPLEMENTED` | `LOCAL_PROTOCOL_FIXTURE_TESTED` | يقبل تأكيد `provider_confirmed` فقط عبر Webhook موقّع بـ HMAC يطابق معاملة مزود معلّقة مسجلة في القرص؛ `SIMULATED` معزول تماماً. |
+
+**التصنيف الحالي للإصدار:** `LOCAL_PROVIDER_PROTOCOL_TESTED` (مع `LOCAL_SIMULATED_PILOT` للتشغيل المحلي). لا يُدّعى `PROVIDER_SANDBOX_VERIFIED` أو `LIVE_EXTERNAL_CHANNELS_QUALIFIED` أو `PRODUCTION_QUALIFIED` بدون اعتمادات واختبارات حية مع المزودين.

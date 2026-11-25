@@ -1,7 +1,7 @@
 {
   "releaseVersion": "1.0.2",
   "releaseTag": "v1.0.2-windows-local",
-  "buildTimestamp": "2026-11-25T03:50:07.537Z",
+  "buildTimestamp": "2026-11-25T05:10:12.077Z",
   "targetPlatform": "Windows 10 / Windows 11 / Windows Server 2019/2022",
   "runtimeRequirements": {
     "node": ">=22.0.0",
@@ -10,8 +10,8 @@
     "networkBinding": "127.0.0.1 (Strict Loopback / Zero Cloud Exposure)"
   },
   "totalFiles": 22,
-  "totalSizeBytes": 7847995,
-  "totalSizeMB": 7.48,
+  "totalSizeBytes": 7868516,
+  "totalSizeMB": 7.5,
   "fileInventory": {
     ".env.example": {
       "sizeBytes": 2024,
@@ -29,9 +29,9 @@
       "sizeBytes": 46265,
       "sha256": "a40d0e54aefcb7304e89d5a9c387b7ed64161c9f2f6801dda337679fdc392b68"
     },
-    "dist/assets/index-Dprxxzqv.js": {
-      "sizeBytes": 707697,
-      "sha256": "72613485cde65cbab424f45cfbd98b1dc4e260f32e841383a006532385fffacd"
+    "dist/assets/index-CmgdZGBu.js": {
+      "sizeBytes": 708885,
+      "sha256": "a0d103e4c7723245b498a497faf1bbb2b11bc2be2a3b977b3a18059ea50bd012"
     },
     "dist/assets/index-tYOgJX6i.css": {
       "sizeBytes": 95606,
@@ -55,7 +55,7 @@
     },
     "dist/index.html": {
       "sizeBytes": 2370,
-      "sha256": "1f7d82828472eb9f57b54f5eb511c4d29de4e720883cc853d72bfb563c446fa4"
+      "sha256": "1bc216a6fea54a3d2a6c2b4385cb7a87c80e48354831df7a2b0ede6edb820c8f"
     },
     "dist/manifest.webmanifest": {
       "sizeBytes": 1992,
@@ -67,15 +67,15 @@
     },
     "dist/sw.js": {
       "sizeBytes": 1988,
-      "sha256": "f88aeab038ac3659e6c73bb6b75dbbc040b7472bdd3972ccf32a534f01e0723b"
+      "sha256": "2ec83e9a9a0c5bcaaaaeccd189f9570a9008e9126bece11cdf1126ed498cecc8"
     },
     "dist/workbox-c121765f.js": {
       "sizeBytes": 22270,
       "sha256": "209c89a1434f9012dac6de78f07f9f78278b911a5d7622f1c1e5369bb74e1d9e"
     },
     "dist-server/server.cjs": {
-      "sizeBytes": 5613178,
-      "sha256": "34462bddc8622755f1f5ff39c66c92c7154d6970bb10fcbaccd4fa638fe3f9ba"
+      "sizeBytes": 5632511,
+      "sha256": "d54578d799d2cd60f16f603deb4bdd403a69de6591bae5297acfb1509f02ec73"
     },
     "package.json": {
       "sizeBytes": 2764,

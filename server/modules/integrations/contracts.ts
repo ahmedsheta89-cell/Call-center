@@ -87,6 +87,7 @@ export interface EmailAdapterConfig {
   smtpPass?: string;
   fromAddress?: string;
   tlsRejectUnauthorized?: boolean;
+  allowInsecureTestOnly?: boolean;
   webhookSecret?: string;
   allowSimulation?: boolean;
 }

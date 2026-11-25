@@ -1,8 +1,15 @@
 /**
  * @file server/modules/integrations/adapters/emailBridge.ts
  * Email / SMTP / IMAP Bridge Adapter using Nodemailer
- * Strict State Separation: DISABLED (default), CONFIGURED, TCP_REACHABLE, CONNECTED, SIMULATED, FAILED
- * Never claims a message is 'sent' from a TCP probe alone; requires actual SMTP transaction & messageId capture.
+ *
+ * Security & Truthfulness Guarantees:
+ * - Strict State Separation: DISABLED (default), CONFIGURED, TCP_REACHABLE, CONNECTED, SIMULATED, FAILED
+ * - Mandatory TLS (implicit TLS on port 465 or strict STARTTLS on all other ports).
+ * - Never allows plaintext SMTP authentication unless explicit test-only `allowInsecureTestOnly` is set in NODE_ENV=test.
+ * - Durable, tenant/account-namespaced idempotency (survives cold restarts, prevents duplicate sends on retry/ambiguous response).
+ * - Never leaks SMTP passwords in error messages, logs, or diagnostics.
+ * - Distinguishes SMTP relay acceptance (`250 OK`) from confirmed inbox delivery.
+ * - Never labels a TCP probe alone as SMTP CONNECTED or SENT.
  */
 
 import crypto from 'crypto';
@@ -17,12 +24,15 @@ import {
   AdapterHealthStatus,
   MessageDeliveryStatus,
 } from '../contracts.ts';
+import {
+  reserveDurableIdempotencyKeys,
+  commitDurableIdempotencyKeys,
+  releaseDurableIdempotencyKeys,
+  lookupDurableIdempotencyKey,
+} from '../../../core/durableIdempotency.ts';
 
 const EMAIL_ADDRESS_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 const CRLF_RE = /[\r\n]/g;
-
-// Bounded idempotency cache to prevent duplicate SMTP sends on retries (max 5000 entries)
-const sentMessageIdempotencyCache = new Map<string, { externalMessageId: string; timestamp: number }>();
 
 function sanitizeHeaderValue(val: string): string {
   return String(val || '').replace(CRLF_RE, ' ').trim();
@@ -32,27 +42,54 @@ function isValidEmailAddress(addr: string): boolean {
   return EMAIL_ADDRESS_RE.test(addr.trim());
 }
 
-function classifySmtpError(err: any): { code: string; transient: boolean; message: string } {
-  const msg = String(err?.message || err || 'Unknown SMTP error');
+function redactPasswordFromError(msg: string, secret?: string): string {
+  if (!secret || secret.length < 2) return msg;
+  return msg.split(secret).join('[REDACTED_SECRET]');
+}
+
+function classifySmtpError(
+  err: any,
+  smtpPass?: string
+): { code: string; preDataTransient: boolean; ambiguousPostData: boolean; message: string } {
+  const rawMsg = String(err?.message || err || 'Unknown SMTP error');
+  const msg = redactPasswordFromError(rawMsg, smtpPass);
   const code = String(err?.code || '');
+  const command = String(err?.command || '').toUpperCase();
   const responseCode = Number(err?.responseCode || 0);
 
-  if (code === 'EAUTH' || responseCode === 535 || responseCode === 530 || /auth/i.test(msg)) {
-    return { code: 'AUTH_FAILED', transient: false, message: msg };
+  if (responseCode >= 500) {
+    return { code: 'SMTP_REJECTED', preDataTransient: false, ambiguousPostData: false, message: msg };
   }
-  if (code === 'ECONNREFUSED') {
-    return { code: 'CONNECTION_REFUSED', transient: true, message: msg };
+  if (code === 'EAUTH' || responseCode === 535 || responseCode === 530 || /auth/i.test(msg)) {
+    return { code: 'AUTH_FAILED', preDataTransient: false, ambiguousPostData: false, message: msg };
+  }
+  if (/TLS|STARTTLS|certificate|self[- ]signed|UNABLE_TO_VERIFY|CERT_|SSL/i.test(msg)) {
+    return { code: 'TLS_VERIFICATION_FAILED', preDataTransient: false, ambiguousPostData: false, message: msg };
+  }
+  // If DATA was already sent and the connection dropped or timed out before receiving final 250 OK,
+  // we MUST NOT blindly retry and duplicate the email!
+  if (
+    command === 'DATA' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ECONNECTION' ||
+    /unexpected socket close|socket close|connection closed/i.test(msg) ||
+    ((code === 'ETIMEDOUT' || code === 'ESOCKET') && command !== 'CONN')
+  ) {
+    return {
+      code: 'SMTP_RESPONSE_AMBIGUOUS',
+      preDataTransient: false,
+      ambiguousPostData: true,
+      message: msg,
+    };
+  }
+  if (code === 'ECONNREFUSED' || code === 'EAI_AGAIN') {
+    return { code: 'CONNECTION_REFUSED', preDataTransient: true, ambiguousPostData: false, message: msg };
   }
   if (code === 'ETIMEDOUT' || code === 'ESOCKET' || /timeout/i.test(msg)) {
-    return { code: 'TIMEOUT', transient: true, message: msg };
+    return { code: 'TIMEOUT', preDataTransient: false, ambiguousPostData: false, message: msg };
   }
-  if (code === 'ECONNRESET' || code === 'EAI_AGAIN' || (responseCode >= 400 && responseCode < 500)) {
-    return { code: 'TRANSIENT_SMTP_ERROR', transient: true, message: msg };
-  }
-  if (responseCode >= 500) {
-    return { code: 'SMTP_REJECTED', transient: false, message: msg };
-  }
-  return { code: 'SMTP_DELIVERY_ERROR', transient: false, message: msg };
+  return { code: 'SMTP_DELIVERY_ERROR', preDataTransient: false, ambiguousPostData: false, message: msg };
 }
 
 async function probeSmtpSocket(
@@ -90,6 +127,8 @@ export class EmailChannelAdapter implements ChannelAdapter {
     const smtpUser = config.smtpUser || process.env.SMTP_USER;
     const smtpPass = config.smtpPass || process.env.SMTP_PASS;
     const allowSimulation = config.allowSimulation ?? (process.env.NODE_ENV === 'test');
+    const allowInsecureTestOnly =
+      process.env.NODE_ENV === 'test' && config.allowInsecureTestOnly === true;
 
     this.config = {
       smtpHost,
@@ -98,6 +137,7 @@ export class EmailChannelAdapter implements ChannelAdapter {
       smtpPass,
       fromAddress: config.fromAddress || process.env.SMTP_FROM_ADDRESS || smtpUser,
       tlsRejectUnauthorized: config.tlsRejectUnauthorized ?? true,
+      allowInsecureTestOnly,
       webhookSecret: config.webhookSecret || process.env.EMAIL_WEBHOOK_SECRET,
       allowSimulation,
     };
@@ -118,11 +158,15 @@ export class EmailChannelAdapter implements ChannelAdapter {
   private createTransporter() {
     const port = this.config.smtpPort || 587;
     const secure = port === 465;
+    const allowInsecure = process.env.NODE_ENV === 'test' && this.config.allowInsecureTestOnly === true;
+
     return nodemailer.createTransport({
       host: this.config.smtpHost,
       port,
       secure,
-      requireTLS: !secure && port === 587,
+      // Mandatory STARTTLS on all non-465 ports unless explicit test-only override in NODE_ENV=test
+      requireTLS: !secure && !allowInsecure,
+      ignoreTLS: allowInsecure ? true : false,
       auth:
         this.config.smtpUser && this.config.smtpPass
           ? {
@@ -132,10 +176,11 @@ export class EmailChannelAdapter implements ChannelAdapter {
           : undefined,
       tls: {
         rejectUnauthorized: this.config.tlsRejectUnauthorized ?? true,
+        minVersion: 'TLSv1.2',
       },
-      connectionTimeout: 5000,
-      greetingTimeout: 5000,
-      socketTimeout: 10000,
+      connectionTimeout: 4000,
+      greetingTimeout: 4000,
+      socketTimeout: 4000,
     });
   }
 
@@ -183,9 +228,9 @@ export class EmailChannelAdapter implements ChannelAdapter {
 
     const authHeader = headers['authorization'] || headers['x-email-webhook-secret'] || '';
     const expected = this.config.webhookSecret;
-    const isValid =
-      authHeader.length === expected.length &&
-      crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
+    const bufA = Buffer.from(authHeader, 'utf8');
+    const bufB = Buffer.from(expected, 'utf8');
+    const isValid = bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
     if (!isValid) {
       return {
         isValid: false,
@@ -247,30 +292,25 @@ export class EmailChannelAdapter implements ChannelAdapter {
 
   public async dispatchOutboundMessage(
     message: UnifiedMessage
-  ): Promise<{ externalMessageId: string; status: MessageDeliveryStatus }> {
+  ): Promise<{ externalMessageId: string; status: MessageDeliveryStatus; relayAccepted?: boolean; inboxDeliveryConfirmed?: boolean }> {
     if (this.state === 'DISABLED') {
-      return {
-        externalMessageId: '',
-        status: 'disabled',
-      };
+      return { externalMessageId: '', status: 'disabled' };
     }
 
     if (this.state === 'SIMULATED') {
       return {
         externalMessageId: `<sim-out-${Date.now()}@omniflow.local>`,
         status: 'simulated',
+        relayAccepted: false,
+        inboxDeliveryConfirmed: false,
       };
     }
 
-    // Require explicit SMTP credentials before attempting live delivery
     if (!this.config.smtpHost || !this.config.smtpUser || !this.config.smtpPass) {
       this.lastErrorCode = 'MISSING_SMTP_CREDENTIALS';
       this.lastError = 'SMTP authentication credentials (smtpHost, smtpUser, smtpPass) are required.';
       this.state = 'CONFIGURED';
-      return {
-        externalMessageId: '',
-        status: 'failed',
-      };
+      return { externalMessageId: '', status: 'failed' };
     }
 
     const fromAddr = sanitizeHeaderValue(this.config.fromAddress || this.config.smtpUser || '');
@@ -281,30 +321,55 @@ export class EmailChannelAdapter implements ChannelAdapter {
     if (!isValidEmailAddress(fromAddr) || !isValidEmailAddress(toAddr)) {
       this.lastErrorCode = 'INVALID_ENVELOPE';
       this.lastError = `Invalid SMTP envelope addresses (from='${fromAddr}', to='${toAddr}').`;
-      return {
-        externalMessageId: '',
-        status: 'failed',
-      };
+      return { externalMessageId: '', status: 'failed' };
     }
 
-    // Idempotency guard against duplicate sends on retry
-    const idempotencyKey = String(message.metadata?.idempotencyKey || message.id);
-    const cached = sentMessageIdempotencyCache.get(idempotencyKey);
-    if (cached) {
-      return {
-        externalMessageId: cached.externalMessageId,
-        status: 'sent',
-      };
+    // Durable tenant/account/message namespaced idempotency
+    const orgId = message.organizationId || 'default-org';
+    const rawKey = String(message.metadata?.idempotencyKey || message.id);
+    const durableKey = `smtp:${orgId}:${this.config.smtpHost}:${this.config.smtpUser}:${rawKey}`;
+
+    try {
+      const existing = lookupDurableIdempotencyKey(durableKey);
+      if (existing) {
+        if (existing.metadata?.ambiguous === true) {
+          this.lastErrorCode = 'SMTP_RESPONSE_AMBIGUOUS_BLOCKED_RETRY';
+          this.lastError =
+            'Previous SMTP attempt transmitted DATA but lost server response; refusing automatic resend to prevent duplicate delivery.';
+          return { externalMessageId: '', status: 'failed', relayAccepted: false, inboxDeliveryConfirmed: false };
+        }
+        return {
+          externalMessageId: String(existing.metadata?.externalMessageId || ''),
+          status: 'sent',
+          relayAccepted: true,
+          inboxDeliveryConfirmed: false,
+        };
+      }
+    } catch (err: any) {
+      this.lastErrorCode = 'IDEMPOTENCY_STORAGE_UNTRUSTED';
+      this.lastError = redactPasswordFromError(err?.message || 'Idempotency storage unavailable', this.config.smtpPass);
+      return { externalMessageId: '', status: 'failed' };
+    }
+
+    const reserve = reserveDurableIdempotencyKeys([durableKey]);
+    if (!reserve.ok) {
+      this.lastErrorCode = reserve.reason;
+      this.lastError = reserve.message;
+      return { externalMessageId: '', status: 'failed' };
     }
 
     const subject = sanitizeHeaderValue(String(message.metadata?.subject || 'رسالة من مركز الاتصال OmniFlow OS'));
     const htmlBody = typeof message.metadata?.html === 'string' ? message.metadata.html : undefined;
-    const transporter = this.createTransporter();
-
     const maxAttempts = 2;
-    let lastClassified = { code: 'SMTP_DELIVERY_ERROR', transient: false, message: 'Unknown error' };
+    let lastClassified = {
+      code: 'SMTP_DELIVERY_ERROR',
+      preDataTransient: false,
+      ambiguousPostData: false,
+      message: 'Unknown error',
+    };
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const transporter = this.createTransporter();
       try {
         const info = await transporter.sendMail({
           from: fromAddr,
@@ -314,7 +379,7 @@ export class EmailChannelAdapter implements ChannelAdapter {
           html: htmlBody,
           headers: {
             'X-OmniFlow-Message-Id': sanitizeHeaderValue(message.id),
-            'X-OmniFlow-Idempotency-Key': sanitizeHeaderValue(idempotencyKey),
+            'X-OmniFlow-Idempotency-Key': sanitizeHeaderValue(rawKey),
           },
         });
 
@@ -323,13 +388,12 @@ export class EmailChannelAdapter implements ChannelAdapter {
           throw new Error('SMTP server accepted message without returning a provider messageId');
         }
 
-        if (sentMessageIdempotencyCache.size >= 5000) {
-          const oldest = sentMessageIdempotencyCache.keys().next().value;
-          if (oldest) sentMessageIdempotencyCache.delete(oldest);
-        }
-        sentMessageIdempotencyCache.set(idempotencyKey, {
-          externalMessageId: capturedMessageId,
-          timestamp: Date.now(),
+        commitDurableIdempotencyKeys([durableKey], {
+          metadata: {
+            externalMessageId: capturedMessageId,
+            relayAccepted: true,
+            ambiguous: false,
+          },
         });
 
         this.lastError = null;
@@ -338,10 +402,24 @@ export class EmailChannelAdapter implements ChannelAdapter {
         return {
           externalMessageId: capturedMessageId,
           status: 'sent',
+          relayAccepted: true,
+          inboxDeliveryConfirmed: false,
         };
       } catch (err: any) {
-        lastClassified = classifySmtpError(err);
-        if (!lastClassified.transient || attempt === maxAttempts) {
+        lastClassified = classifySmtpError(err, this.config.smtpPass);
+        if (lastClassified.ambiguousPostData) {
+          // Record ambiguous post-DATA state durably so retries do not duplicate an accepted message
+          try {
+            commitDurableIdempotencyKeys([durableKey], {
+              metadata: { ambiguous: true, errorCode: lastClassified.code },
+            });
+          } catch {
+            releaseDurableIdempotencyKeys([durableKey]);
+          }
+          break;
+        }
+        if (!lastClassified.preDataTransient || attempt === maxAttempts) {
+          releaseDurableIdempotencyKeys([durableKey]);
           break;
         }
       } finally {
@@ -355,6 +433,8 @@ export class EmailChannelAdapter implements ChannelAdapter {
     return {
       externalMessageId: '',
       status: 'failed',
+      relayAccepted: false,
+      inboxDeliveryConfirmed: false,
     };
   }
 
@@ -391,14 +471,14 @@ export class EmailChannelAdapter implements ChannelAdapter {
       };
     }
 
-    // TCP socket reachable — now verify explicit SMTP authentication if password is configured
+    // TCP probe succeeded, but TCP alone NEVER means CONNECTED or SENT
     if (!this.config.smtpPass) {
       this.state = 'TCP_REACHABLE';
       return {
         state: 'TCP_REACHABLE',
         isHealthy: false,
         latencyMs: probe.latencyMs,
-        details: `SMTP TCP socket reachable at ${host}:${port}, but SMTP password is missing (not authenticated).`,
+        details: `SMTP TCP socket reachable at ${host}:${port}, but SMTP password is missing (not authenticated or TLS verified).`,
       };
     }
 
@@ -416,7 +496,7 @@ export class EmailChannelAdapter implements ChannelAdapter {
         details: `Verified SMTP TLS & authentication for ${this.config.smtpUser}@${host}:${port}`,
       };
     } catch (err: any) {
-      const classified = classifySmtpError(err);
+      const classified = classifySmtpError(err, this.config.smtpPass);
       this.lastError = classified.message;
       this.lastErrorCode = classified.code;
       this.state = 'FAILED';
@@ -424,7 +504,7 @@ export class EmailChannelAdapter implements ChannelAdapter {
         state: 'FAILED',
         isHealthy: false,
         latencyMs: Date.now() - startVerify,
-        details: `SMTP TCP reachable at ${host}:${port}, but SMTP verification/auth failed (${classified.code}: ${classified.message}).`,
+        details: `SMTP TCP reachable at ${host}:${port}, but TLS/auth verification failed (${classified.code}: ${classified.message}).`,
       };
     } finally {
       transporter.close();

@@ -50,6 +50,12 @@ jobs:
       - name: Run External Webhook Auth, Real SMTP & SIP Lifecycle Security Suite
         run: npm run test:external-security
 
+      - name: Run Phase 2 Security & Auth Lockdown Suite
+        run: npm run test:security
+
+      - name: Run Workspace Isolation & Canary Verification Suite
+        run: npm run test:isolation
+
       - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
         run: npm run test:audit
 

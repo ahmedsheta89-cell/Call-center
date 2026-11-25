@@ -148,6 +148,7 @@ export const ChannelIntegrationsView: React.FC = () => {
           ...prev,
           [channelId]: d.data,
         }));
+        fetchChannels();
       }
     } catch {
       // test failed
@@ -181,11 +182,18 @@ export const ChannelIntegrationsView: React.FC = () => {
       });
       const d = await res.json();
       if (d.success) {
-        setSendSuccess(`تم إرسال النموذج بنجاح عبر Meta Cloud API بمعرّف رسالة: ${d.data.messageId}`);
+        const isSim = d.data?.status === 'simulated' || d.data?.adapterState === 'SIMULATED';
+        setSendSuccess(
+          isSim
+            ? `تمت محاكاة القالب محلياً (SIMULATED) بمعرّف: ${d.data.messageId}`
+            : `تم إرسال النموذج عبر Meta Cloud API بمعرّف رسالة: ${d.data.messageId}`
+        );
         setTimeout(() => {
           setSelectedTemplate(null);
           setSendSuccess(null);
         }, 3000);
+      } else {
+        setSendSuccess(`تعذر الإرسال (${d.error?.code || res.status}): ${d.error?.message || 'القناة غير مفعلة'}`);
       }
     } catch (err) {
       console.error(err);
@@ -665,9 +673,9 @@ export const ChannelIntegrationsView: React.FC = () => {
                 )}
                 {configChannel.type === 'voice' && (
                   <p className="text-[11px] text-slate-300 leading-relaxed">
-                    💡 <strong>للاتصال الصوتي الحقيقي (PSTN / رنين على الهواتف):</strong>
+                    💡 <strong>إعدادات بوابة SIP (تسجيل REGISTER فقط حالياً):</strong>
                     <br />
-                    يمكن إدخال بيانات <strong>Twilio Account SID</strong> و <strong>Auth Token</strong> و <strong>Twilio Phone Number</strong>، ليقوم السنترال السحابي بإجراء رنين واتصال هاتفي مباشر برقمك 01018108979.
+                    أدخل <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">sipServerUri</code> و <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">sipUsername</code> و <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">sipPassword</code> و <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">webhookSecret</code>. ملاحظة: إجراء المكالمات الحية (SIP INVITE/RTP) غير مفعل بعد (NOT_IMPLEMENTED) والمكالمات المحلية تعمل في وضع SIMULATED فقط.
                   </p>
                 )}
               </div>
@@ -731,11 +739,11 @@ export const ChannelIntegrationsView: React.FC = () => {
               <span>مصفوفة تكاملات السوق المصري وحالة الجاهزية (Egypt Integration Matrix)</span>
             </h3>
             <p className="text-[11px] text-slate-400 mt-0.5">
-              تصنيف شفاف يفصل بين الكود المنفذ، المحاكاة المحلية ($0.00)، التحقق في بيئة الاختبار، والتفعيل الحي مع المزود.
+              تصنيف صارم يميز بين IMPLEMENTED وLOCAL_PROTOCOL_FIXTURE_TESTED وSIMULATED وNOT_IMPLEMENTED، ولا يدّعي PROVIDER_SANDBOX_VERIFIED أو LIVE_PROVIDER_VERIFIED دون اختبار فعلي مع المزود.
             </p>
           </div>
           <span className="text-[10px] px-2.5 py-1 rounded-lg bg-amber-500/15 text-amber-300 border border-amber-500/30 font-medium">
-            تصنيف التشغيل الحالي: LOCAL_PILOT (بدون تفعيل مدفوع حي)
+            التصنيف الفعلي: LOCAL_PROVIDER_PROTOCOL_TESTED / LOCAL_SIMULATED_PILOT
           </span>
         </div>
 
@@ -743,55 +751,54 @@ export const ChannelIntegrationsView: React.FC = () => {
           <table className="w-full text-right text-xs border-collapse">
             <thead>
               <tr className="border-b border-slate-800 text-slate-400">
-                <th className="py-2 px-3">القناة / المزود</th>
-                <th className="py-2 px-3">كود منفذ</th>
-                <th className="py-2 px-3">محاكاة محلية</th>
-                <th className="py-2 px-3">بيئة اختبار (Sandbox)</th>
-                <th className="py-2 px-3">تفعيل حي مع المزود</th>
+                <th className="py-2 px-3">القناة / القدرة</th>
+                <th className="py-2 px-3">حالة التنفيذ</th>
+                <th className="py-2 px-3">مستوى التحقق</th>
+                <th className="py-2 px-3">ملاحظات الحقيقة والقيود</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/70 text-slate-200">
               <tr>
                 <td className="py-2 px-3 font-medium">WebChat المحلي ($0.00)</td>
-                <td className="py-2 px-3 text-emerald-400">نعم</td>
-                <td className="py-2 px-3 text-slate-400">غير مطلوب</td>
-                <td className="py-2 px-3 text-emerald-400">تم التحقق</td>
-                <td className="py-2 px-3 text-emerald-400">نشط محلياً (CONNECTED)</td>
+                <td className="py-2 px-3 text-emerald-400 font-mono">IMPLEMENTED</td>
+                <td className="py-2 px-3 text-emerald-400 font-mono">IMPLEMENTED</td>
+                <td className="py-2 px-3 text-slate-300">نشط محلياً عبر الخادم دون وسطاء خارجيين</td>
               </tr>
               <tr>
                 <td className="py-2 px-3 font-medium">WhatsApp Cloud API (Meta)</td>
-                <td className="py-2 px-3 text-emerald-400">نعم (HMAC + Graph v21)</td>
-                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
-                <td className="py-2 px-3 text-emerald-400">تم التحقق (Webhook + Replay)</td>
-                <td className="py-2 px-3 text-slate-400">بانتظار اعتمادات Meta الحية</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">اختبارات توقيع HMAC وReplay محلية؛ غير مختبر مع Meta الحي</td>
               </tr>
               <tr>
                 <td className="py-2 px-3 font-medium">CEQUENS Egypt SMS / CPaaS</td>
-                <td className="py-2 px-3 text-emerald-400">نعم (Bearer + REST)</td>
-                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
-                <td className="py-2 px-3 text-emerald-400">تم التحقق (Webhook Auth)</td>
-                <td className="py-2 px-3 text-slate-400">بانتظار مفتاح CEQUENS الحي</td>
-              </tr>
-              <tr>
-                <td className="py-2 px-3 font-medium">SIP Egypt Telephony (NTRA / Law 151)</td>
-                <td className="py-2 px-3 text-emerald-400">نعم (REGISTER + HMAC Callback)</td>
-                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
-                <td className="py-2 px-3 text-emerald-400">تم التحقق (TCP vs REGISTER)</td>
-                <td className="py-2 px-3 text-slate-400">بانتظار ترانك SIP مرخص</td>
-              </tr>
-              <tr>
-                <td className="py-2 px-3 font-medium">Email SMTP Bridge (Nodemailer)</td>
-                <td className="py-2 px-3 text-emerald-400">نعم (TLS/STARTTLS + Auth)</td>
-                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
-                <td className="py-2 px-3 text-emerald-400">تم التحقق (SMTP Transaction)</td>
-                <td className="py-2 px-3 text-slate-400">بانتظار بيانات SMTP الحية</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">اختبارات Bearer + Replay محلية؛ بانتظار مفتاح CEQUENS الحي</td>
               </tr>
               <tr>
                 <td className="py-2 px-3 font-medium">Telegram Bot API</td>
-                <td className="py-2 px-3 text-emerald-400">نعم (Secret-Token)</td>
-                <td className="py-2 px-3 text-amber-300">SIMULATED ($0.00)</td>
-                <td className="py-2 px-3 text-emerald-400">تم التحقق (Webhook Auth)</td>
-                <td className="py-2 px-3 text-slate-400">بانتظار Bot Token الحي</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">اختبارات Secret-Token محلية؛ بانتظار Bot Token الحي</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">Email SMTP Bridge (Nodemailer TLS)</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">تم اختباره أمام خادم STARTTLS محلي؛ قبول الترحيل لا يعني تأكيد صندوق الوارد</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">SIP REGISTER (RFC 3261 + Digest)</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">يفصل TCP_REACHABLE عن REGISTERED؛ لا يعني وجود مكالمات أو وسائط حية</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">SIP Outbound INVITE / SDP / RTP</td>
+                <td className="py-2 px-3 text-rose-300 font-mono">NOT_IMPLEMENTED</td>
+                <td className="py-2 px-3 text-amber-300 font-mono">SIMULATED</td>
+                <td className="py-2 px-3 text-slate-400">يرفض المكالمات الحية بـ HTTP 501؛ متاح فقط في وضع SIMULATED المحلي</td>
               </tr>
             </tbody>
           </table>

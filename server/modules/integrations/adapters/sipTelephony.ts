@@ -58,11 +58,19 @@ function md5Hex(input: string): string {
   return crypto.createHash('md5').update(input, 'utf8').digest('hex');
 }
 
-function parseDigestChallenge(headerValue: string): { realm: string; nonce: string } | null {
-  const realmMatch = /realm="([^"]+)"/i.exec(headerValue);
-  const nonceMatch = /nonce="([^"]+)"/i.exec(headerValue);
+function parseDigestChallenge(headerValue: string): { realm: string; nonce: string; qop?: string; opaque?: string } | null {
+  const sanitize = (v?: string) => (v ? v.replace(/[\r\n"]/g, '').trim() : '');
+  const realmMatch = /realm="([^"\r\n]+)"/i.exec(headerValue);
+  const nonceMatch = /nonce="([^"\r\n]+)"/i.exec(headerValue);
+  const qopMatch = /qop="([^"\r\n]+)"/i.exec(headerValue);
+  const opaqueMatch = /opaque="([^"\r\n]+)"/i.exec(headerValue);
   if (!realmMatch || !nonceMatch) return null;
-  return { realm: realmMatch[1], nonce: nonceMatch[1] };
+  return {
+    realm: sanitize(realmMatch[1]),
+    nonce: sanitize(nonceMatch[1]),
+    qop: qopMatch ? sanitize(qopMatch[1]) : undefined,
+    opaque: opaqueMatch ? sanitize(opaqueMatch[1]) : undefined,
+  };
 }
 
 /**
@@ -135,6 +143,13 @@ async function performSipRegister(params: {
       const code = parseInt(statusMatch[1], 10);
       const reason = statusMatch[2] || '';
 
+      // Ignore provisional 1xx responses (e.g., 100 Trying) and keep reading
+      if (code >= 100 && code < 200) {
+        const hdrEnd = buffer.indexOf('\r\n\r\n');
+        buffer = hdrEnd >= 0 ? buffer.slice(hdrEnd + 4) : '';
+        return;
+      }
+
       if (code === 200) {
         finish('REGISTERED', `SIP REGISTER 200 OK verified for ${username}@${host}:${port}`, 200);
         return;
@@ -157,12 +172,24 @@ async function performSipRegister(params: {
 
         sentAuth = true;
         buffer = '';
+        const safeUser = username.replace(/[\r\n"]/g, '');
         const uri = `sip:${host}:${port}`;
-        const ha1 = md5Hex(`${username}:${challenge.realm}:${password}`);
+        const ha1 = md5Hex(`${safeUser}:${challenge.realm}:${password}`);
         const ha2 = md5Hex(`REGISTER:${uri}`);
-        const digestResp = md5Hex(`${ha1}:${challenge.nonce}:${ha2}`);
+        const supportsQopAuth = challenge.qop && challenge.qop.split(',').map((s) => s.trim()).includes('auth');
+        const nc = '00000001';
+        const cnonce = crypto.randomBytes(8).toString('hex');
+        const digestResp = supportsQopAuth
+          ? md5Hex(`${ha1}:${challenge.nonce}:${nc}:${cnonce}:auth:${ha2}`)
+          : md5Hex(`${ha1}:${challenge.nonce}:${ha2}`);
         const headerName = code === 407 ? 'Proxy-Authorization' : 'Authorization';
-        const authHeader = `${headerName}: Digest username="${username}", realm="${challenge.realm}", nonce="${challenge.nonce}", uri="${uri}", response="${digestResp}", algorithm=MD5`;
+        let authHeader = `${headerName}: Digest username="${safeUser}", realm="${challenge.realm}", nonce="${challenge.nonce}", uri="${uri}", response="${digestResp}", algorithm=MD5`;
+        if (supportsQopAuth) {
+          authHeader += `, qop=auth, nc=${nc}, cnonce="${cnonce}"`;
+        }
+        if (challenge.opaque) {
+          authHeader += `, opaque="${challenge.opaque}"`;
+        }
         socket.write(buildRegister(2, authHeader));
         return;
       }
@@ -312,6 +339,11 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     if (this.state === 'DISABLED') {
       throw new Error('SIP Telephony Adapter is DISABLED: No SIP credentials configured.');
     }
+    if (this.state !== 'SIMULATED') {
+      throw new Error(
+        'LIVE_SIP_INVITE_NOT_IMPLEMENTED: Live SIP INVITE/SDP/RTP media calling is not implemented without a live PBX/WebRTC media gateway. Use simulate=true for local pilot testing.'
+      );
+    }
 
     const callId: UUID = crypto.randomUUID();
     const agent = db.agents.get(params.agentId);
@@ -320,7 +352,6 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       (c) => c.phone === params.to && c.organizationId === params.organizationId
     );
 
-    const isSim = this.state === 'SIMULATED';
     const session: CallSession = {
       id: callId,
       organizationId: params.organizationId,
@@ -333,14 +364,12 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       calleeNumber: params.to,
       durationSeconds: 0,
       startedAt: new Date().toISOString(),
-      disposition: isSim ? 'simulated_ringing' : 'awaiting_provider_confirmation',
+      disposition: 'simulated_ringing',
       transcript: this.config.mandatoryRecordingDisclosure
-        ? `[تسجيل نظامي]: ${this.config.legalComplianceNotice}\n[اتصال]: جاري طلب المكالمة بواسطة ${agentUser?.fullName || 'الموظف'} (بانتظار تأكيد المزود).`
-        : `[اتصال]: جاري طلب المكالمة بواسطة ${agentUser?.fullName || 'الموظف'} (بانتظار تأكيد المزود).`,
+        ? `[تسجيل نظامي]: ${this.config.legalComplianceNotice}\n[اتصال]: جاري طلب المكالمة المحاكاة بواسطة ${agentUser?.fullName || 'الموظف'} (SIMULATED).`
+        : `[اتصال]: جاري طلب المكالمة المحاكاة بواسطة ${agentUser?.fullName || 'الموظف'} (SIMULATED).`,
       aiSentiment: 'neutral',
-      aiSummary: isSim
-        ? 'طلب مكالمة هاتفية صادرة محاكاة (بانتظار تأكيد الجلسة - SIMULATED).'
-        : 'طلب مكالمة هاتفية صادرة عبر بوابة SIP Egypt (بانتظار تأكيد جلسة المزود).',
+      aiSummary: 'طلب مكالمة هاتفية صادرة محاكاة (بانتظار تأكيد الجلسة - SIMULATED).',
     };
 
     this.activeSessions.set(callId, session);
@@ -358,6 +387,15 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     }
     if (call.status !== 'ringing') {
       throw new Error(`Invalid call state transition: cannot confirm call from status '${call.status}'`);
+    }
+    if (this.state !== 'SIMULATED') {
+      if (!call.providerTransactionId || call.disposition !== 'awaiting_provider_confirmation') {
+        throw new Error('NO_PENDING_PROVIDER_TRANSACTION: Call has no pending live SIP provider transaction.');
+      }
+      if (!providerSessionId) {
+        throw new Error('INVALID_PROVIDER_SESSION_ID: providerSessionId is required.');
+      }
+      call.providerSessionId = providerSessionId;
     }
     call.status = 'in_progress';
     call.disposition = this.state === 'SIMULATED' ? 'simulated_confirmed' : 'provider_confirmed';
@@ -411,6 +449,12 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
   public async toggleHold(callId: UUID, holdState: boolean): Promise<void> {
     const call = db.calls.get(callId) || this.activeSessions.get(callId);
     if (!call) throw new Error(`Call session ${callId} not found`);
+    if (holdState && call.status !== 'in_progress') {
+      throw new Error(`INVALID_CALL_STATE_TRANSITION: Cannot place call on hold from status '${call.status}'.`);
+    }
+    if (!holdState && call.status !== 'hold') {
+      throw new Error(`INVALID_CALL_STATE_TRANSITION: Cannot unhold call from status '${call.status}'.`);
+    }
     call.status = holdState ? 'hold' : 'in_progress';
     db.calls.set(call.id, call);
     db.schedulePersist();
