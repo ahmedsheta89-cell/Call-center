@@ -41,6 +41,7 @@ export interface TelephonyAdapter {
   getState(): AdapterOperationalState;
   fetchHealthStatus(): Promise<AdapterHealthStatus>;
   initiateOutboundCall(params: { organizationId: UUID; from: string; to: string; agentId: UUID }): Promise<CallSession>;
+  confirmCallConnected?(callId: UUID, providerSessionId?: string): Promise<CallSession>;
   handleInboundCall(params: { organizationId: UUID; callerNumber: string; calleeNumber: string }): Promise<CallSession>;
   toggleHold(callId: UUID, holdState: boolean): Promise<void>;
   toggleMute(callId: UUID, muteState: boolean): Promise<void>;

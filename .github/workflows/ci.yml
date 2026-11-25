@@ -1,4 +1,4 @@
-name: Enterprise CI, Security Gate & Firestore Rules Verification Pipeline
+name: Enterprise CI, Security Gate, Packaging & Multi-OS Verification Pipeline
 
 on:
   push:
@@ -10,25 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  verify-build-and-audit:
-    name: TypeScript Lint, Build, Rate-Limit Cold-Restart, Playwright E2E, Clean Release & Firestore Verification
+  security-and-contracts:
+    name: TypeScript, Rate-Limit Checkpoint Integrity, Adapters & Security Audit
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
-      - name: Setup Java 21 Runtime (Temurin — Required by Firebase Firestore Emulator v1.22+)
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - name: Verify Java 21 Runtime Selection
-        run: |
-          which java
-          java -version
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
@@ -44,17 +33,45 @@ jobs:
       - name: Build Production Frontend & Backend Bundle
         run: npm run build
 
-      - name: Install Playwright Browsers & System Dependencies
-        run: npx playwright install --with-deps chromium
-
-      - name: Run Rate-Limiting Cold-Restart Anti-Rollback Suite
+      - name: Run Rate-Limit Cold-Restart & Checkpoint Crypto Integrity Suite
         run: npm run test:cold-restart
 
-      - name: Run Omnichannel & Telephony Adapter Contract Suite (State Separation & Crypto Validation)
+      - name: Run Deep Persistent Rate-Limiting & Fail-Secure Recovery Suites
+        run: |
+          npx tsx scripts/test_rate_limiting_deep.ts
+          npx tsx scripts/test_rate_limiting_failures.ts
+
+      - name: Run Disaster Recovery & Backup Integrity Suite
+        run: npm run test:dr
+
+      - name: Run Omnichannel & Telephony Adapter Contract + Authenticated API Wiring Suite
         run: npm run test:adapters
 
-      - name: Run Clean Isolated Release Installation Suite (Zero node_modules)
-        run: npm run test:release:clean
+      - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
+        run: npm run test:audit
+
+  firestore-rules-verification:
+    name: Firestore Rules AST, Red Team & Real JVM Emulator Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 Runtime (Temurin — Required by Firebase Firestore Emulator v1.22+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
 
       - name: Cache Firebase Emulators
         uses: actions/cache@v4
@@ -69,33 +86,22 @@ jobs:
       - name: Run Firestore Rules AST, Red Team & Real JVM Emulator Suite (@firebase/rules-unit-testing)
         run: npm run test:firestore
 
-      - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
-        run: npm run test:audit
+  operations-e2e:
+    name: Full End-to-End Operations Suite (Independent of Packaging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
-      - name: Run Playwright 9-Scenario Human User Journey & WCAG 2.2 AA Accessibility Suite
-        env:
-          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}/audit-artifacts
-        run: npm run test:e2e:browser
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - name: Package Standalone Windows Distribution Archive & Generate Manifest
-        run: npm run package:release
-
-      - name: Upload Playwright E2E Screenshots & Audit Results
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
         with:
-          name: playwright-e2e-artifacts
-          path: |
-            audit-artifacts/screenshots/
-            audit-artifacts/playwright_e2e_results.json
-          retention-days: 14
+          node-version: '22'
 
-      - name: Upload Standalone Release Distribution Package
-        uses: actions/upload-artifact@v4
-        with:
-          name: omniflow-release-package
-          path: release/v*.zip
-          retention-days: 14
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
 
       - name: Run End-to-End Operations Suite
         run: |
@@ -122,3 +128,115 @@ jobs:
             exit 1
           fi
           npx tsx scripts/test_all_operations.ts
+
+  playwright-e2e-and-a11y:
+    name: Playwright 9-Scenario User Journey & axe-core WCAG 2.2 AA
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build Production Bundle
+        run: npm run build
+
+      - name: Install Playwright Chromium & System Dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright 9-Scenario Human User Journey & WCAG 2.2 AA Accessibility Suite
+        env:
+          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}/audit-artifacts
+        run: npm run test:e2e:browser
+
+      - name: Upload Playwright E2E Screenshots & Audit Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-e2e-artifacts
+          path: |
+            audit-artifacts/screenshots/
+            audit-artifacts/playwright_e2e_results.json
+          retention-days: 14
+
+  package-and-release-verify:
+    name: Cross-Platform ZIP Release Packaging, SHA-256 Re-Verify & Clean Install
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Package Cross-Platform Release ZIP, Extract & Recompute Every SHA-256
+        env:
+          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}/audit-artifacts
+        run: npm run package:release
+
+      - name: Run Clean Isolated Release Installation Suite (Zero node_modules)
+        run: npm run test:release:clean
+
+      - name: Upload Standalone Release Distribution Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniflow-release-package
+          path: |
+            release/v*.zip
+            release/v1.0.2-windows-local/RELEASE_MANIFEST.json
+          retention-days: 14
+
+  windows-ntfs-and-launchers:
+    name: Windows NTFS Hardening, Rollback & Real Launchers Execution
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run Windows NTFS Hardening & Rollback Harness (Isolated Temp Root)
+        shell: powershell
+        env:
+          OMNIFLOW_NTFS_TEST_ROOT: ${{ runner.temp }}
+        run: npm run test:ntfs
+
+      - name: Package Release Archive & Verify Windows Launchers (BAT & PS1)
+        shell: powershell
+        env:
+          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}\audit-artifacts
+        run: |
+          npm run package:release
+          npm run test:launchers
+
+      - name: Upload Windows Release Package & Manifest Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-package
+          path: |
+            release/v*.zip
+            release/v1.0.2-windows-local/RELEASE_MANIFEST.json
+          retention-days: 14

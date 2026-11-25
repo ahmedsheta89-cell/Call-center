@@ -1,7 +1,7 @@
 {
   "releaseVersion": "1.0.2",
   "releaseTag": "v1.0.2-windows-local",
-  "buildTimestamp": "2026-11-23T22:48:44.423Z",
+  "buildTimestamp": "2026-11-25T03:10:28.969Z",
   "targetPlatform": "Windows 10 / Windows 11 / Windows Server 2019/2022",
   "runtimeRequirements": {
     "node": ">=22.0.0",
@@ -10,8 +10,8 @@
     "networkBinding": "127.0.0.1 (Strict Loopback / Zero Cloud Exposure)"
   },
   "totalFiles": 22,
-  "totalSizeBytes": 7273129,
-  "totalSizeMB": 6.94,
+  "totalSizeBytes": 7315090,
+  "totalSizeMB": 6.98,
   "fileInventory": {
     ".env.example": {
       "sizeBytes": 2024,
@@ -29,13 +29,13 @@
       "sizeBytes": 46265,
       "sha256": "a40d0e54aefcb7304e89d5a9c387b7ed64161c9f2f6801dda337679fdc392b68"
     },
-    "dist/assets/index-CvdhVAZG.js": {
-      "sizeBytes": 702198,
-      "sha256": "b0556493cb4af93e91c042fe4bb50368f068e8d81b08192506ffca7d9680b9ca"
+    "dist/assets/index-0g97N6FJ.css": {
+      "sizeBytes": 95422,
+      "sha256": "f1d9b3a6a4f7e832151392f46fb9544ec195675f920d0e6aa5c8c2858675491e"
     },
-    "dist/assets/index-yCmVQW8k.css": {
-      "sizeBytes": 95065,
-      "sha256": "7abf120af527b8b203ab5eba1eb338dad9382f26906de79a3186d3cabd3d4dab"
+    "dist/assets/index-BedkQ6mf.js": {
+      "sizeBytes": 702828,
+      "sha256": "008fbcc7a4e40be5572c5812c2889931f6d8d923f934d80ac15e8a640cc20393"
     },
     "dist/assets/vendor-firebase-CE1IJy2A.js": {
       "sizeBytes": 674207,
@@ -55,7 +55,7 @@
     },
     "dist/index.html": {
       "sizeBytes": 2370,
-      "sha256": "a064b4b633c64d63e59754d60c17bcb04f3601a6e9a935b03adcca34220b5d88"
+      "sha256": "b9dcb36d51d8e958e23a02930f256af998cb1becfee6c7f3d96b1a67831f70cb"
     },
     "dist/manifest.webmanifest": {
       "sizeBytes": 1992,
@@ -67,39 +67,39 @@
     },
     "dist/sw.js": {
       "sizeBytes": 1988,
-      "sha256": "b75e1ff245bb7a6a86e92325b72321243f231d0abb365b3c41377485ec4344d2"
+      "sha256": "ca6092a964a6b9fee8b3055b8315e8cdd6610c2855101c6a451e7df8f2795c2c"
     },
     "dist/workbox-c121765f.js": {
       "sizeBytes": 22270,
       "sha256": "209c89a1434f9012dac6de78f07f9f78278b911a5d7622f1c1e5369bb74e1d9e"
     },
     "dist-server/server.cjs": {
-      "sizeBytes": 5059343,
-      "sha256": "d012c309bfd7636efed1158358f932265de97299bf00402c15e038f30247cab9"
+      "sizeBytes": 5085476,
+      "sha256": "ed1140b7fe5e7ed4c7a157a31a794839af3779da3e8f366094547945cdc65c79"
     },
     "package.json": {
-      "sizeBytes": 2491,
-      "sha256": "b21cb0b9b27a097400c87dd4f69eff926cd35821346a183c2b3ec1756d6d7e2e"
+      "sizeBytes": 2614,
+      "sha256": "bbf87d2d3bf668e8f7fc6d66d5f239966e664c17e962b07a51dc2d3155a1979e"
     },
     "prepare_ntfs_acl_hardening.ps1": {
-      "sizeBytes": 28036,
-      "sha256": "b9ec4fc785642e29b3decba1b2d6537318b9f561686881dc9a3da40705b88006"
+      "sizeBytes": 30695,
+      "sha256": "1d0fc10787730d0b96261304dfa227b27af32d05fe5023f39ea4ab8b78bc7b7c"
     },
     "setup-keys.bat": {
-      "sizeBytes": 1644,
-      "sha256": "4b1c144562550d276316f062f6b2c69264449c7a430831d29b0f116fa721eb0b"
+      "sizeBytes": 4708,
+      "sha256": "1698e1b076500cacbc439ce5cb05af08f537e2cdfa21779a06c2aaaea0d88f58"
     },
     "setup-keys.ps1": {
-      "sizeBytes": 1522,
-      "sha256": "81558a91bbdc2fea03117e7b872099110a500920eda82ce05a1acf6b8ccd73fb"
+      "sizeBytes": 4730,
+      "sha256": "f0f7f054c1e4e4ebdf4abe799be3456c972d970760c17533ee6904d1602da870"
     },
     "start-omniflow.bat": {
-      "sizeBytes": 848,
-      "sha256": "839c6e168507dc7bbfe639daabab6bde8ec3ec361ce401c381376d344d5e2542"
+      "sizeBytes": 3727,
+      "sha256": "d3f1ac5d5e658cbb32bd9af1224bd553c2982113dde834f890cd95e746ab377b"
     },
     "start-omniflow.ps1": {
-      "sizeBytes": 1140,
-      "sha256": "2f522f301689a4587b021da216118b9813c4f631c70fd7ab5836db86fdcd2598"
+      "sizeBytes": 4048,
+      "sha256": "f3f3e3c649c6ecf3e4751f580121559d2fab2029d0acefdeebe40ae7a95b392e"
     }
   },
   "securityCheck": {
@@ -109,7 +109,7 @@
       "Law 151/2020 (Data Privacy)",
       "Law 10/2003 (Telecom Regulation)"
     ],
-    "authentication": "Local Owner Scrypt-KDF (N=32768, r=8, p=1) + Permanent Lockout Protection",
+    "authentication": "Local Owner Scrypt-KDF (N=131072, r=8, p=1, keyLen=64) + Permanent Lockout Protection",
     "dataEncryption": "AES-256-GCM at-rest credential vault + HMAC-SHA256 audit checkpoints"
   }
 }

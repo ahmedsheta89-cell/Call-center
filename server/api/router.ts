@@ -1416,73 +1416,151 @@ apiRouter.get('/calls', (req: Request, res: Response) => {
 
 apiRouter.post('/calls/dial', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'call.make');
-  const { phoneNumber, customerName, customerId } = req.body;
+  const { phoneNumber, customerName, customerId, simulate } = req.body || {};
   const targetNumber = phoneNumber || '01018108979';
-  const isAdminTarget = targetNumber.includes('01018108979');
-  const targetName = customerName || (isAdminTarget ? 'م. أحمد شتا (مدير النظام - Admin)' : 'عميل هاتف');
+  const orgId = currentActor.organizationId;
+  const voiceConfig = db.getChannelConfig(orgId, 'chan-voice');
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceConfig, simulate === true);
+  const adapterState = sipAdapter.getState();
 
-  const callId = `call-${Date.now().toString(36)}`;
-  const newCall: CallSession = {
-    id: callId,
-    organizationId: currentActor.organizationId,
-    direction: 'outbound',
-    status: 'in_progress',
-    callerNumber: targetNumber,
-    calleeNumber: '01018108979',
-    customerName: targetName,
+  if (adapterState === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'agent',
+      action: 'call.dial_rejected_disabled',
+      entityType: 'call',
+      entityId: 'chan-voice',
+      afterState: { adapterState, phoneNumber: targetNumber },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: 'بوابة الاتصال الصوتي SIP غير مهيأة (DISABLED). يرجى تهيئة بيانات السنترال أو تفعيل المحاكاة المحلية صراحة.',
+      },
+    });
+    return;
+  }
+
+  const session = await sipAdapter.initiateOutboundCall({
+    organizationId: orgId,
+    from: voiceConfig?.defaultCallerId || '+20220000000',
+    to: targetNumber,
     agentId: currentActor.userId,
-    customerId: customerId || (isAdminTarget ? 'cust-admin-ahmed' : undefined),
-    startedAt: new Date().toISOString(),
-    durationSeconds: 1,
-    aiSentiment: 'positive',
-    transcript: `[بدء الاتصال الصوتي WebRTC / SIP مع ${targetName} على الرقم ${targetNumber}]`,
-    aiSummary: `مكالمة صادرة من مدير النظام (م. أحمد شتا - 01018108979). جاهزة للاستماع والتحليل.`,
-  };
-  db.calls.set(callId, newCall);
+  });
+
+  if (customerName) {
+    session.customerName = customerName;
+  }
+  if (customerId) {
+    session.customerId = customerId;
+  }
+  db.calls.set(session.id, session);
   db.schedulePersist();
-  EventBus.publish('call:event', { action: 'dial', call: newCall });
+  EventBus.publish('call:event', { action: 'dial', call: session, adapterState });
 
   await AuditLogger.log({
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'agent',
     action: 'call.outbound_dial',
     entityType: 'call',
-    entityId: callId,
-    afterState: { phoneNumber: targetNumber, customerName: targetName, isAdminTarget },
+    entityId: session.id,
+    afterState: {
+      phoneNumber: targetNumber,
+      customerName: session.customerName,
+      status: session.status,
+      disposition: session.disposition,
+      adapterState,
+    },
   });
 
-  res.json({ success: true, data: newCall, message: `تم تأسيس قناة الاتصال الصوتي للرقم ${targetNumber}` });
+  res.json({
+    success: true,
+    data: session,
+    adapterState,
+    message:
+      adapterState === 'SIMULATED'
+        ? `تم بدء طلب مكالمة محاكاة للرقم ${targetNumber} (بانتظار تأكيد الجلسة)`
+        : `تم إرسال طلب الاتصال عبر SIP للرقم ${targetNumber} (بانتظار تأكيد المزود)`,
+  });
+});
+
+// Explicit Provider Call/Session Confirmation (never mark a SIP call connected without confirmation)
+apiRouter.post('/calls/:id/confirm', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'call.make');
+  const orgId = currentActor.organizationId;
+  const call = db.calls.get(req.params.id);
+  if (!call || call.organizationId !== orgId) {
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
+    return;
+  }
+
+  const voiceConfig = db.getChannelConfig(orgId, 'chan-voice');
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(
+    voiceConfig,
+    req.body?.simulate === true || String(call.disposition || '').startsWith('simulated')
+  );
+  if (sipAdapter.getState() === 'DISABLED') {
+    res.status(409).json({
+      success: false,
+      error: { code: 'ADAPTER_DISABLED', message: 'SIP Telephony adapter is DISABLED; cannot confirm call session.' },
+    });
+    return;
+  }
+
+  const confirmedCall = sipAdapter.confirmCallConnected
+    ? await sipAdapter.confirmCallConnected(call.id, req.body?.providerSessionId)
+    : call;
+
+  EventBus.publish('call:event', { action: 'confirm', call: confirmedCall });
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'system',
+    action: 'call.provider_confirmed',
+    entityType: 'call',
+    entityId: confirmedCall.id,
+    afterState: {
+      status: confirmedCall.status,
+      disposition: confirmedCall.disposition,
+      providerSessionId: req.body?.providerSessionId || 'sip-session-ack',
+    },
+  });
+
+  res.json({ success: true, data: confirmedCall });
 });
 
 apiRouter.post('/calls/:id/end', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'call.make');
+  const orgId = currentActor.organizationId;
   const call = db.calls.get(req.params.id);
-  if (!call || call.organizationId !== currentActor.organizationId) {
+  if (!call || call.organizationId !== orgId) {
     res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
     return;
   }
-  call.status = 'completed';
-  call.endedAt = new Date().toISOString();
 
-  db.schedulePersist();
-  EventBus.publish('call:event', { action: 'end', call });
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(db.getChannelConfig(orgId, 'chan-voice'), true);
+  const endedCall = await sipAdapter.terminateCall(call.id, req.body?.disposition || 'completed_normal');
+
+  EventBus.publish('call:event', { action: 'end', call: endedCall });
 
   await AuditLogger.log({
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'user',
     action: 'call.hangup',
     entityType: 'call',
-    entityId: call.id,
-    afterState: { status: 'completed' },
+    entityId: endedCall.id,
+    afterState: { status: endedCall.status, disposition: endedCall.disposition },
   });
 
-  res.json({ success: true, data: call });
+  res.json({ success: true, data: endedCall });
 });
 
 apiRouter.post('/calls/:id/control', async (req: Request, res: Response) => {
-  const { action, supervisorMode } = req.body || {}; // 'hold' | 'unhold' | 'mute' | 'hangup' | 'whisper' | 'barge'
+  const { action, supervisorMode } = req.body || {}; // 'hold' | 'unhold' | 'mute' | 'unmute' | 'hangup' | 'whisper' | 'barge'
   const allowedActions = ['hold', 'unhold', 'mute', 'unmute', 'hangup', 'whisper', 'barge'];
   if (!action || typeof action !== 'string' || !allowedActions.includes(action)) {
     res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Valid call control action is required' } });
@@ -1495,33 +1573,38 @@ apiRouter.post('/calls/:id/control', async (req: Request, res: Response) => {
     assertPermission(currentActor.role, [], 'call.make');
   }
 
+  const orgId = currentActor.organizationId;
   const call = db.calls.get(req.params.id);
-  if (!call || call.organizationId !== currentActor.organizationId) {
+  if (!call || call.organizationId !== orgId) {
     res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
     return;
   }
 
-  if (action === 'hold') call.status = 'hold';
-  else if (action === 'unhold') call.status = 'in_progress';
-  else if (action === 'hangup') {
-    call.status = 'completed';
-    call.endedAt = new Date().toISOString();
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(db.getChannelConfig(orgId, 'chan-voice'), true);
+  if (action === 'hold') await sipAdapter.toggleHold(call.id, true);
+  else if (action === 'unhold') await sipAdapter.toggleHold(call.id, false);
+  else if (action === 'mute') await sipAdapter.toggleMute(call.id, true);
+  else if (action === 'unmute') await sipAdapter.toggleMute(call.id, false);
+  else if (action === 'whisper' || action === 'barge') {
+    await sipAdapter.bargeOrWhisperCall(call.id, currentActor.userId, action);
+  } else if (action === 'hangup') {
+    await sipAdapter.terminateCall(call.id, 'completed_by_operator');
   }
 
-  db.schedulePersist();
-  EventBus.publish('call:event', { action, call });
+  const updatedCall = db.calls.get(call.id) || call;
+  EventBus.publish('call:event', { action, call: updatedCall });
 
   await AuditLogger.log({
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'user',
     action: `call.${action}`,
     entityType: 'call',
-    entityId: call.id,
-    afterState: { status: call.status, supervisorMode },
+    entityId: updatedCall.id,
+    afterState: { status: updatedCall.status, supervisorMode },
   });
 
-  res.json({ success: true, data: call });
+  res.json({ success: true, data: updatedCall });
 });
 
 // ----------------------------------------------------
@@ -2466,8 +2549,30 @@ apiRouter.post('/ai/summarize', async (req: Request, res: Response) => {
 });
 
 // ----------------------------------------------------
-// 12. Omnichannel Integrations & Meta WhatsApp Cloud API
+// 12. Omnichannel Integrations & Adapter Registry Wiring
 // ----------------------------------------------------
+function mapAdapterStateToUiStatus(
+  state: 'DISABLED' | 'CONFIGURED' | 'CONNECTED' | 'SIMULATED' | 'FAILED',
+  storedConfig?: Record<string, any>
+): { status: string; adapterState: string } {
+  if (state === 'CONNECTED') {
+    return { status: 'online', adapterState: 'CONNECTED' };
+  }
+  if (state === 'CONFIGURED') {
+    const lastProven = storedConfig?.lastHealthState;
+    if (lastProven === 'CONNECTED') return { status: 'online', adapterState: 'CONNECTED' };
+    if (lastProven === 'FAILED') return { status: 'degraded', adapterState: 'FAILED' };
+    return { status: 'configured', adapterState: 'CONFIGURED' };
+  }
+  if (state === 'SIMULATED') {
+    return { status: 'simulated', adapterState: 'SIMULATED' };
+  }
+  if (state === 'FAILED') {
+    return { status: 'degraded', adapterState: 'FAILED' };
+  }
+  return { status: 'disabled', adapterState: 'DISABLED' };
+}
+
 apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
   const orgId = db.assertValidOrganizationId(currentActor.organizationId);
@@ -2478,32 +2583,37 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
   const voiceStored = db.getChannelConfig(orgId, 'chan-voice');
   const emailStored = db.getChannelConfig(orgId, 'chan-email');
   const messengerStored = db.getChannelConfig(orgId, 'chan-messenger');
+  const smsStored = db.getChannelConfig(orgId, 'chan-cequens');
+  const tgStored = db.getChannelConfig(orgId, 'chan-telegram');
 
-  const isConfigured = (stored: Record<string, any> | undefined) =>
-    Boolean(stored && stored.credentialsConfigured !== false && stored.verified !== false);
+  const waAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('whatsapp_cloud', waStored, false);
+  const webchatAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('webchat', webchatStored, false);
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceStored, false);
+  const emailAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('email', emailStored, false);
+  const messengerAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('messenger', messengerStored, false);
+  const cequensAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('cequens_sms', smsStored, false);
+  const tgAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('telegram', tgStored, false);
+
+  const waStateInfo = mapAdapterStateToUiStatus(waAdapter.getState(), waStored);
+  const webStateInfo = mapAdapterStateToUiStatus(webchatAdapter.getState(), webchatStored);
+  const voiceStateInfo = mapAdapterStateToUiStatus(sipAdapter.getState(), voiceStored);
+  const emailStateInfo = mapAdapterStateToUiStatus(emailAdapter.getState(), emailStored);
+  const msgStateInfo = mapAdapterStateToUiStatus(messengerAdapter.getState(), messengerStored);
+  const smsStateInfo = mapAdapterStateToUiStatus(cequensAdapter.getState(), smsStored);
+  const tgStateInfo = mapAdapterStateToUiStatus(tgAdapter.getState(), tgStored);
 
   const defaultChannels = [
     {
       id: 'chan-whatsapp',
       type: 'whatsapp',
-      name: 'WhatsApp Business Cloud API (Official)',
-      badge: 'موثق ومعتمد من Meta',
-      status: (isDemoTenant && (!waStored || isConfigured(waStored))) || isConfigured(waStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            wabaId: 'WABA-902184920194',
-            phoneNumberId: 'PNID-8820194829',
-            displayNumber: '+20 101 810 8979 (م. أحمد شتا - Admin)',
-            verifiedName: 'مدار كير - م. أحمد شتا (01018108979)',
-            qualityRating: 'High',
-            messagingLimitTier: 'Tier 2 (10,000 محادثة / 24 ساعة)',
-            ...(waStored || {}),
-          }
-        : { ...(waStored || {}) },
+      name: waAdapter.name,
+      badge: waStateInfo.adapterState === 'CONNECTED' ? 'متصل فعلياً (Meta Cloud)' : waStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ (بانتظار فحص الاتصال)' : 'غير مفعّل (يتطلب بيانات الاعتماد)',
+      status: waStateInfo.status,
+      adapterState: waStateInfo.adapterState,
+      accountInfo: { ...(waStored || {}) },
       metrics: {
-        latencyMs: 42,
+        latencyMs: waStored?.lastLatencyMs ?? 0,
         messagesSent24h: isDemoTenant ? 3842 : 0,
-        deliveryRatePercent: 99.4,
         webhookUrl: '/api/v1/integrations/whatsapp/webhook',
       },
       compliance: {
@@ -2515,18 +2625,13 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
     {
       id: 'chan-webchat',
       type: 'webchat',
-      name: 'Live Web Chat Widget (Portal & Mobile App)',
-      badge: 'WebSockets نشط',
-      status: isDemoTenant || webchatStored ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            widgetId: 'widget-madar-portal-v2',
-            sslEnabled: true,
-            ...(webchatStored || {}),
-          }
-        : { ...(webchatStored || {}) },
+      name: webchatAdapter.name,
+      badge: 'قناة محلية نشطة ($0.00)',
+      status: webStateInfo.status,
+      adapterState: webStateInfo.adapterState,
+      accountInfo: { widgetId: 'widget-omniflow-local', sslEnabled: true, ...(webchatStored || {}) },
       metrics: {
-        latencyMs: 14,
+        latencyMs: 1,
         messagesSent24h: isDemoTenant ? 1240 : 0,
         deliveryRatePercent: 100,
         webhookUrl: '/api/v1/integrations/webchat/webhook',
@@ -2535,59 +2640,67 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
     {
       id: 'chan-voice',
       type: 'voice',
-      name: 'Cloud SIP Trunk & WebRTC (Asterisk/FreeSWITCH)',
-      badge: 'سنترال سحابي نشط',
-      status: (isDemoTenant && (!voiceStored || isConfigured(voiceStored))) || isConfigured(voiceStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            trunkName: 'STC-SIP-TRUNK-RIYADH-01',
-            concurrentLines: 32,
-            codecs: 'Opus, G.711u',
-            ...(voiceStored || {}),
-          }
-        : { ...(voiceStored || {}) },
+      name: sipAdapter.name,
+      badge: voiceStateInfo.adapterState === 'CONNECTED' ? 'SIP Connected (Verified)' : voiceStateInfo.adapterState === 'CONFIGURED' ? 'SIP Configured (Unverified Reachability)' : 'غير مفعّل (يتطلب بوابة SIP)',
+      status: voiceStateInfo.status,
+      adapterState: voiceStateInfo.adapterState,
+      accountInfo: { ...(voiceStored || {}) },
       metrics: {
-        latencyMs: 24,
-        callsHandled24h: isDemoTenant ? 340 : 0,
-        averageMOSScore: 4.4,
+        latencyMs: voiceStored?.lastLatencyMs ?? 0,
+        callsHandled24h: db.getCalls(orgId).length,
         webhookUrl: '/api/v1/integrations/voice/webhook',
       },
     },
     {
       id: 'chan-email',
       type: 'email',
-      name: 'Enterprise Email Gate (support@madar.sa)',
-      badge: 'TLS 1.3 مشفر',
-      status: (isDemoTenant && (!emailStored || isConfigured(emailStored))) || isConfigured(emailStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            smtpHost: 'smtp.madar.sa',
-            pollingIntervalSec: 30,
-            ...(emailStored || {}),
-          }
-        : { ...(emailStored || {}) },
+      name: emailAdapter.name,
+      badge: emailStateInfo.adapterState === 'CONNECTED' ? 'SMTP متصل' : emailStateInfo.adapterState === 'CONFIGURED' ? 'SMTP مهيأ' : 'غير مفعّل (يتطلب SMTP)',
+      status: emailStateInfo.status,
+      adapterState: emailStateInfo.adapterState,
+      accountInfo: { ...(emailStored || {}) },
       metrics: {
-        latencyMs: 120,
-        emailsProcessed24h: isDemoTenant ? 185 : 0,
+        latencyMs: emailStored?.lastLatencyMs ?? 0,
+        emailsProcessed24h: 0,
         webhookUrl: '/api/v1/integrations/email/webhook',
+      },
+    },
+    {
+      id: 'chan-cequens',
+      type: 'sms',
+      name: cequensAdapter.name,
+      badge: smsStateInfo.adapterState === 'CONNECTED' ? 'CEQUENS Connected' : smsStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ (CEQUENS Egypt)' : 'غير مفعّل (يتطلب API Key)',
+      status: smsStateInfo.status,
+      adapterState: smsStateInfo.adapterState,
+      accountInfo: { ...(smsStored || {}) },
+      metrics: {
+        latencyMs: smsStored?.lastLatencyMs ?? 0,
+        webhookUrl: '/api/v1/integrations/sms/webhook',
+      },
+    },
+    {
+      id: 'chan-telegram',
+      type: 'telegram',
+      name: tgAdapter.name,
+      badge: tgStateInfo.adapterState === 'CONNECTED' ? 'Bot API Connected' : tgStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ' : 'غير مفعّل (يتطلب Bot Token)',
+      status: tgStateInfo.status,
+      adapterState: tgStateInfo.adapterState,
+      accountInfo: { ...(tgStored || {}) },
+      metrics: {
+        latencyMs: tgStored?.lastLatencyMs ?? 0,
+        webhookUrl: '/api/v1/integrations/telegram/webhook',
       },
     },
     {
       id: 'chan-messenger',
       type: 'messenger',
       name: 'Meta Messenger & Instagram Direct',
-      badge: 'Graph API v21',
-      status: (isDemoTenant && (!messengerStored || isConfigured(messengerStored))) || isConfigured(messengerStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            pageName: 'Madar Telecom Official',
-            igHandle: '@madar_sa',
-            ...(messengerStored || {}),
-          }
-        : { ...(messengerStored || {}) },
+      badge: msgStateInfo.adapterState === 'CONNECTED' ? 'Graph API Verified' : msgStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ' : 'غير مفعّل',
+      status: msgStateInfo.status,
+      adapterState: msgStateInfo.adapterState,
+      accountInfo: { ...(messengerStored || {}) },
       metrics: {
-        latencyMs: 65,
-        messagesSent24h: isDemoTenant ? 520 : 0,
+        latencyMs: messengerStored?.lastLatencyMs ?? 0,
         webhookUrl: '/api/v1/integrations/messenger/webhook',
       },
     },
@@ -2607,7 +2720,11 @@ apiRouter.put('/integrations/channels/:id/config', (req: Request, res: Response)
   const channelId = req.params.id;
   const config = req.body || {};
 
-  const savedRecord = db.setChannelConfig(currentActor.organizationId, channelId, config);
+  const savedRecord = db.setChannelConfig(currentActor.organizationId, channelId, {
+    ...config,
+    lastHealthState: 'CONFIGURED',
+    verified: false,
+  });
 
   AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -2622,122 +2739,201 @@ apiRouter.put('/integrations/channels/:id/config', (req: Request, res: Response)
   res.json({
     success: true,
     data: redactSensitiveValue(savedRecord.config),
-    message: 'تم حفظ إعدادات القناة والاعتمادات بنجاح',
+    message: 'تم حفظ إعدادات القناة والاعتمادات المشفرة بنجاح (يرجى إجراء فحص الاتصال لإثبات الجاهزية)',
   });
 });
 
-// Test channel connection live
+// Genuine provider health check via IntegrationRegistry
 apiRouter.post('/integrations/channels/:id/test-connection', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
+  const orgId = currentActor.organizationId;
   const channelId = req.params.id;
-  const simulatedDelay = Math.floor(20 + Math.random() * 30);
-  await new Promise((r) => setTimeout(r, simulatedDelay));
+  const storedConfig = db.getChannelConfig(orgId, channelId);
+  const allowSimulation = req.body?.simulate === true;
 
-  const config = redactSensitiveValue(db.getChannelConfig(currentActor.organizationId, channelId) || {}) as Record<string, any>;
+  const isVoice = channelId === 'chan-voice' || channelId === 'voice' || channelId === 'sip_egypt';
+  const health = isVoice
+    ? await IntegrationRegistry.resolveTelephonyAdapterForTenant(storedConfig, allowSimulation).fetchHealthStatus()
+    : await IntegrationRegistry.resolveChannelAdapterForTenant(channelId, storedConfig, allowSimulation).fetchHealthStatus();
+
+  const uiStatus =
+    health.state === 'CONNECTED'
+      ? 'online'
+      : health.state === 'SIMULATED'
+      ? 'simulated'
+      : health.state === 'CONFIGURED'
+      ? 'configured'
+      : health.state === 'FAILED'
+      ? 'failed'
+      : 'disabled';
+
+  if (storedConfig) {
+    db.setChannelConfig(orgId, channelId, {
+      lastHealthState: health.state,
+      lastLatencyMs: health.latencyMs,
+      verified: health.state === 'CONNECTED',
+    });
+  }
+
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'channel.health_check',
+    entityType: 'channel',
+    entityId: channelId,
+    afterState: { adapterState: health.state, isHealthy: health.isHealthy, latencyMs: health.latencyMs },
+  });
 
   res.json({
     success: true,
     data: {
       channelId,
-      status: 'online',
-      latencyMs: simulatedDelay,
-      handshake: 'TLS 1.3 - Verified',
-      endpoint: `/api/v1/integrations/${channelId.replace('chan-', '')}/webhook`,
+      status: uiStatus,
+      adapterState: health.state,
+      isHealthy: health.isHealthy,
+      isSimulated: Boolean(health.isSimulated),
+      latencyMs: health.latencyMs,
+      endpoint: `/api/v1/integrations/${channelId.replace(/^chan-/, '')}/webhook`,
       testedAt: new Date().toISOString(),
       details: {
-        optInCompliant: true,
-        credentialsValid: true,
-        ...config,
+        healthMessage: health.details,
+        ...(redactSensitiveValue(storedConfig || {}) as Record<string, any>),
       },
     },
   });
 });
 
-// Meta WhatsApp Webhook Verification Endpoint (hub.challenge)
+// Meta / Provider Webhook Verification Endpoint (hub.challenge) — Fail-closed on unconfigured/mismatched verifyToken
 apiRouter.get(['/integrations/:channel/webhook', '/webhooks/:channel'], (req: Request, res: Response) => {
   const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
+  const token = typeof req.query['hub.verify_token'] === 'string' ? req.query['hub.verify_token'] : '';
   const challenge = req.query['hub.challenge'];
+  const channelParam = req.params.channel;
+  const orgId = currentActor.organizationId;
+  const storedConfig = db.getChannelConfig(orgId, `chan-${channelParam}`) || db.getChannelConfig(orgId, channelParam);
+  const expectedToken =
+    (typeof storedConfig?.verifyToken === 'string' && storedConfig.verifyToken) ||
+    process.env.WHATSAPP_VERIFY_TOKEN ||
+    process.env.WEBHOOK_VERIFY_TOKEN ||
+    '';
 
   if (mode === 'subscribe') {
-    if (token === 'madar_verify_token_2026' || !token) {
+    if (
+      expectedToken &&
+      token &&
+      token.length === expectedToken.length &&
+      crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expectedToken))
+    ) {
       res.status(200).send(challenge || 'VERIFIED');
       return;
     }
-    res.status(403).send('Forbidden: Verify token mismatch');
+    res.status(403).send('Forbidden: Verify token unconfigured or mismatched');
     return;
   }
 
-  res.status(200).json({ status: 'active', channel: req.params.channel });
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelParam, storedConfig, false);
+  res.status(200).json({ status: adapter.getState().toLowerCase(), adapterState: adapter.getState(), channel: channelParam });
 });
 
-// Universal Inbound Webhook Processor (Meta WhatsApp, Twilio, Generic HTTP Webhooks)
+// Universal Inbound Webhook Processor wired through IntegrationRegistry cryptographic verifyWebhook & normalizeInboundMessage
 const handleIncomingWebhook = async (req: Request, res: Response) => {
   const channelType = (req.params.channel || 'whatsapp') as UnifiedMessage['channel'];
-  const payload = req.body || {};
+  const orgId = currentActor.organizationId;
+  const storedConfig =
+    db.getChannelConfig(orgId, `chan-${channelType}`) || db.getChannelConfig(orgId, channelType);
 
-  // Extract from Meta WhatsApp Cloud API format or generic JSON
-  let text = '';
-  let phone = '';
-  let name = 'عميل عبر Webhook';
+  const allowSim = req.query.simulate === 'true' || (req.body && req.body.simulate === true);
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelType, storedConfig, allowSim);
 
-  if (payload.object === 'whatsapp_business_account') {
-    const entry = payload.entry?.[0];
-    const change = entry?.changes?.[0]?.value;
-    const msg = change?.messages?.[0];
-    const contact = change?.contacts?.[0];
-
-    text = msg?.text?.body || 'رسالة وسائط واردة';
-    phone = msg?.from ? `+${msg.from}` : '+966500112233';
-    name = contact?.profile?.name || 'عميل واتساب';
-  } else if (payload.From || payload.Body) {
-    // Twilio SMS/Voice webhook format
-    text = payload.Body || payload.TranscriptionText || 'مكالمة أو رسالة واردة';
-    phone = payload.From || '+966500112233';
-    name = payload.CallerName || 'متصل عبر الهاتف';
-  } else {
-    // Generic JSON payload
-    text = payload.messageText || payload.text || payload.body || 'استفسار وارد جديد';
-    phone = payload.senderPhone || payload.phone || payload.from || '+966500112233';
-    name = payload.senderName || payload.customerName || payload.name || 'عميل تجريبي';
+  if (adapter.getState() === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'system',
+      action: 'webhook.rejected_disabled',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { adapterState: 'DISABLED' },
+    });
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: `Webhook rejected: adapter '${channelType}' is DISABLED (missing verified credentials).`,
+      },
+    });
+    return;
   }
 
-  // 1. Find or create Customer
+  const normalizedHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (typeof v === 'string') normalizedHeaders[k.toLowerCase()] = v;
+    else if (Array.isArray(v) && v[0]) normalizedHeaders[k.toLowerCase()] = v[0];
+  }
+
+  const rawBody: string | Buffer = (req as any).rawBody || JSON.stringify(req.body || {});
+  const verification = await adapter.verifyWebhook(normalizedHeaders, rawBody);
+
+  if (!verification.isValid) {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'system',
+      action: 'webhook.signature_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { error: verification.error },
+    });
+    res.status(401).json({
+      success: false,
+      error: {
+        code: 'WEBHOOK_VERIFICATION_FAILED',
+        message: verification.error || 'Webhook signature/secret verification failed.',
+      },
+    });
+    return;
+  }
+
+  const normalizedMsg = await adapter.normalizeInboundMessage(verification.rawPayload, orgId);
+  const phone = verification.senderIdentifier || normalizedMsg.customerId;
+  const text = normalizedMsg.body;
+  const name = normalizedMsg.sender?.name || 'عميل عبر Webhook';
+
   let customer = Array.from(db.customers.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.phone === phone
+    (c) => c.organizationId === orgId && (c.phone === phone || c.id === normalizedMsg.customerId)
   );
 
   if (!customer) {
-    const custId = `cust-wh-${Date.now().toString(36)}`;
+    const custId = normalizedMsg.customerId || `cust-wh-${Date.now().toString(36)}`;
     customer = {
       id: custId,
-      organizationId: currentActor.organizationId,
+      organizationId: orgId,
       name,
       phone,
-      email: `${custId}@madar.sa`,
+      email: `${custId.replace(/[^a-zA-Z0-9_-]/g, '_')}@omniflow.local`,
       customerTier: 'standard',
-      lifetimeValue: 1500,
-      tags: [`webhook_${channelType}`, 'عميل_مباشر'],
-      customFields: { source: 'webhook', channel: channelType },
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      lifetimeValue: 0,
+      tags: [`webhook_${channelType}`],
+      customFields: { source: 'webhook', channel: channelType, adapterState: adapter.getState() },
+      createdAt: normalizedMsg.createdAt,
+      updatedAt: normalizedMsg.createdAt,
     };
     db.customers.set(custId, customer);
   }
 
-  // 2. Find or create Conversation
   let conv = Array.from(db.conversations.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.customerId === customer!.id && c.status === 'open'
+    (c) => c.organizationId === orgId && c.customerId === customer!.id && c.status === 'open'
   );
 
   const now = new Date().toISOString();
   if (!conv) {
-    const convId = `conv-wh-${Date.now().toString(36)}`;
+    const convId = normalizedMsg.conversationId || `conv-wh-${Date.now().toString(36)}`;
     conv = {
       id: convId,
-      organizationId: currentActor.organizationId,
+      organizationId: orgId,
       customerId: customer.id,
-      channel: channelType,
+      channel: normalizedMsg.channel,
       status: 'open',
       priority: customer.customerTier === 'vip' ? 'urgent' : 'medium',
       sentiment: 'neutral',
@@ -2747,34 +2943,26 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
       updatedAt: now,
     };
     db.conversations.set(convId, conv);
+  } else {
+    conv.lastMessageAt = now;
   }
 
-  // 3. Create Unified Message
-  const msgId = `msg-wh-${Date.now().toString(36)}`;
   const msg: UnifiedMessage = {
-    id: msgId,
-    organizationId: currentActor.organizationId,
+    ...normalizedMsg,
     conversationId: conv.id,
     customerId: customer.id,
-    channel: channelType,
-    direction: 'inbound',
-    type: 'text',
-    body: text,
-    sender: {
-      id: customer.id,
-      type: 'customer',
-      name: customer.name,
+    metadata: {
+      ...(normalizedMsg.metadata || {}),
+      webhook: true,
+      adapterState: adapter.getState(),
+      receivedAt: now,
     },
-    status: 'delivered',
-    metadata: { webhook: true, receivedAt: now },
-    createdAt: now,
   };
-  db.messages.set(msgId, msg);
+  db.messages.set(msg.id, msg);
 
-  // 4. Run AI Sentiment & Intent analysis
   try {
     const aiResult = await AIGateway.execute({
-      organizationId: currentActor.organizationId,
+      organizationId: orgId,
       task: 'sentiment_intent_analysis',
       input: text,
       privacy: 'confidential',
@@ -2787,19 +2975,24 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
     // fallback
   }
 
-  // 5. Persist & Broadcast
   db.schedulePersist();
   EventBus.publish('message:new', { conversationId: conv.id, message: msg });
   EventBus.publish('conversation:updated', conv);
 
-  AuditLogger.log({
-    organizationId: currentActor.organizationId,
+  await AuditLogger.log({
+    organizationId: orgId,
     actorId: customer.id,
     actorType: 'system',
     action: 'webhook.inbound_processed',
     entityType: 'message',
-    entityId: msgId,
-    afterState: { channel: channelType, phone, textSnippet: text.slice(0, 30) },
+    entityId: msg.id,
+    afterState: {
+      channel: channelType,
+      adapterState: adapter.getState(),
+      status: msg.status,
+      phone,
+      textSnippet: text.slice(0, 30),
+    },
   });
 
   res.status(200).json({
@@ -2808,6 +3001,8 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
       messageId: msg.id,
       conversationId: conv.id,
       customerId: customer.id,
+      adapterState: adapter.getState(),
+      messageStatus: msg.status,
       status: 'received_and_broadcasted',
     },
   });
@@ -2868,140 +3063,261 @@ apiRouter.get('/integrations/whatsapp/templates', (req: Request, res: Response) 
   res.json({ success: true, data: templates });
 });
 
+// Unified authenticated outbound dispatch through IntegrationRegistry (used by both whatsapp/send-template and general channel dispatch)
 apiRouter.post('/integrations/whatsapp/send-template', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.reply');
-  const { templateName, recipientPhone, parameters, customerId } = req.body;
+  const { templateName, recipientPhone, parameters, customerId, simulate } = req.body || {};
+  const orgId = currentActor.organizationId;
 
   if (!recipientPhone || !templateName) {
     res.status(400).json({ success: false, error: { message: 'Template name and phone required' } });
     return;
   }
 
-  const isAdmin = recipientPhone.includes('01018108979');
-  const cleanPhone = recipientPhone.replace(/[^0-9]/g, '');
-
-  // Look up customer scoped strictly to currentActor.organizationId
   let targetCustomer = customerId ? db.customers.get(customerId) : undefined;
-  if (targetCustomer && targetCustomer.organizationId !== currentActor.organizationId) {
+  if (targetCustomer && targetCustomer.organizationId !== orgId) {
     res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found in organization' } });
     return;
   }
-  if (!targetCustomer) {
-    targetCustomer = Array.from(db.customers.values()).find(
-      (c) => c.organizationId === currentActor.organizationId && c.phone === recipientPhone
-    );
+
+  const waConfig = db.getChannelConfig(orgId, 'chan-whatsapp');
+  const waAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('whatsapp_cloud', waConfig, simulate === true);
+  const adapterState = waAdapter.getState();
+
+  if (adapterState === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'user',
+      action: 'whatsapp.send_rejected_disabled',
+      entityType: 'whatsapp_message',
+      entityId: 'chan-whatsapp',
+      afterState: { adapterState, templateName, recipientPhone },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: 'قناة WhatsApp Cloud API غير مفعلة (DISABLED). يرجى ضبط مفاتيح Meta أو تمرير simulate=true للتجربة المحلية.',
+      },
+    });
+    return;
   }
 
-  const waConfig = db.getChannelConfig(currentActor.organizationId, 'chan-whatsapp') || {};
-  const metaToken = waConfig.apiToken || process.env.META_WHATSAPP_TOKEN;
-  const phoneNumberId = waConfig.phoneNumberId || process.env.META_PHONE_NUMBER_ID;
+  const cleanPhone = recipientPhone.replace(/[^0-9]/g, '');
+  const formattedRecipient = cleanPhone.startsWith('0') && !cleanPhone.startsWith('20') ? `20${cleanPhone.slice(1)}` : cleanPhone;
 
-  let liveMetaStatus = 'simulated_ready';
-  let metaApiResponse: any = null;
+  const outboundMsg: UnifiedMessage = {
+    id: crypto.randomUUID(),
+    organizationId: orgId,
+    customerId: targetCustomer?.id || `cust-wa-${formattedRecipient}`,
+    conversationId: `conv-wa-${formattedRecipient}`,
+    channel: 'whatsapp',
+    direction: 'outbound',
+    type: 'template',
+    body: `[Template: ${templateName}] ${Array.isArray(parameters) ? parameters.join(' | ') : ''}`,
+    sender: {
+      id: currentActor.userId,
+      type: 'agent',
+      name: currentActor.name,
+    },
+    status: adapterState === 'SIMULATED' ? 'simulated' : 'pending',
+    metadata: {
+      templateName,
+      recipient: formattedRecipient,
+      parameters,
+    },
+    createdAt: new Date().toISOString(),
+  };
 
-  // Real Meta WhatsApp Cloud API Call if valid token exists
-  if (metaToken && phoneNumberId && !metaToken.includes('sec_meta_token') && !phoneNumberId.includes('PNID-')) {
-    try {
-      const metaUrl = `https://graph.facebook.com/v18.0/${phoneNumberId}/messages`;
-      const metaBody = {
-        messaging_product: 'whatsapp',
-        to: cleanPhone.startsWith('0') && !cleanPhone.startsWith('20') ? `20${cleanPhone.slice(1)}` : cleanPhone,
-        type: 'template',
-        template: {
-          name: templateName,
-          language: { code: 'ar' },
-          components: parameters && parameters.length > 0 ? [
-            {
-              type: 'body',
-              parameters: parameters.map((param: string) => ({ type: 'text', text: param })),
-            }
-          ] : [],
-        },
-      };
+  const dispatchOutcome = await waAdapter.dispatchOutboundMessage(outboundMsg);
+  outboundMsg.status = dispatchOutcome.status === 'disabled' ? 'failed' : dispatchOutcome.status;
+  db.messages.set(outboundMsg.id, outboundMsg);
+  db.schedulePersist();
 
-      const metaRes = await fetch(metaUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${metaToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(metaBody),
-      });
-
-      metaApiResponse = await metaRes.json();
-      liveMetaStatus = metaRes.ok ? 'meta_cloud_sent' : 'meta_cloud_rejected';
-    } catch (err: any) {
-      liveMetaStatus = 'meta_network_error';
-      metaApiResponse = { error: err.message };
-    }
-  }
-
-  const generatedMsgId = metaApiResponse?.messages?.[0]?.id || `wamid-${Date.now()}`;
-
-  // Log audit
-  AuditLogger.log({
-    organizationId: currentActor.organizationId,
+  await AuditLogger.log({
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'user',
     action: 'whatsapp.send_template',
     entityType: 'whatsapp_message',
-    entityId: generatedMsgId,
-    afterState: { templateName, recipientPhone, parameters, liveMetaStatus, isAdmin },
+    entityId: dispatchOutcome.externalMessageId || outboundMsg.id,
+    afterState: {
+      templateName,
+      recipientPhone,
+      adapterState,
+      deliveryStatus: dispatchOutcome.status,
+      externalMessageId: dispatchOutcome.externalMessageId,
+    },
   });
 
-  res.json({
-    success: true,
+  res.status(dispatchOutcome.status === 'failed' ? 502 : 200).json({
+    success: dispatchOutcome.status !== 'failed',
     data: {
-      messageId: generatedMsgId,
-      status: liveMetaStatus === 'meta_cloud_sent' ? 'delivered' : 'queued',
-      deliveryMode: liveMetaStatus,
+      messageId: dispatchOutcome.externalMessageId || outboundMsg.id,
+      internalMessageId: outboundMsg.id,
+      status: dispatchOutcome.status,
+      adapterState,
       channel: 'whatsapp',
       recipientPhone,
-      isAdminRecipient: isAdmin,
-      adminContact: isAdmin ? 'م. أحمد شتا (01018108979)' : undefined,
-      metaApiResponse,
-      timestamp: new Date().toISOString(),
+      timestamp: outboundMsg.createdAt,
     },
-    message: liveMetaStatus === 'meta_cloud_sent'
-      ? `تم إرسال الرسالة فعلياً عبر Meta WhatsApp Cloud API إلى ${recipientPhone}`
-      : `تم توثيق إرسال القالب بنجاح إلى ${recipientPhone} (جاهز للمطابقة مع Meta Cloud API)`,
+    message:
+      dispatchOutcome.status === 'simulated'
+        ? `تم توثيق إرسال القالب في وضع المحاكاة الصفرية (SIMULATED) إلى ${recipientPhone}`
+        : dispatchOutcome.status === 'sent'
+        ? `تم إرسال الرسالة فعلياً عبر Meta WhatsApp Cloud API إلى ${recipientPhone}`
+        : `تعذر إرسال القالب عبر البوابة (${dispatchOutcome.status})`,
+  });
+});
+
+// Unified channel outbound dispatch endpoint wired via IntegrationRegistry
+apiRouter.post('/integrations/:channel/dispatch', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.reply');
+  const orgId = currentActor.organizationId;
+  const channelParam = req.params.channel;
+  const { recipient, body, conversationId, customerId, simulate } = req.body || {};
+
+  if (!body || typeof body !== 'string' || body.trim().length === 0) {
+    res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Message body is required' } });
+    return;
+  }
+
+  const storedConfig =
+    db.getChannelConfig(orgId, `chan-${channelParam}`) || db.getChannelConfig(orgId, channelParam);
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelParam, storedConfig, simulate === true);
+  const adapterState = adapter.getState();
+
+  if (adapterState === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'user',
+      action: 'channel.dispatch_rejected_disabled',
+      entityType: 'channel',
+      entityId: channelParam,
+      afterState: { adapterState },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: `Adapter '${channelParam}' is DISABLED (unconfigured). Configure credentials or set simulate=true.`,
+      },
+    });
+    return;
+  }
+
+  const outboundMsg: UnifiedMessage = {
+    id: crypto.randomUUID(),
+    organizationId: orgId,
+    customerId: customerId || `cust-${channelParam}-outbound`,
+    conversationId: conversationId || `conv-${channelParam}-${recipient || 'default'}`,
+    channel: adapter.channelType,
+    direction: 'outbound',
+    type: 'text',
+    body: body.trim(),
+    sender: {
+      id: currentActor.userId,
+      type: 'agent',
+      name: currentActor.name,
+    },
+    status: adapterState === 'SIMULATED' ? 'simulated' : 'pending',
+    metadata: {
+      recipient,
+      adapterState,
+    },
+    createdAt: new Date().toISOString(),
+  };
+
+  const dispatchRes = await adapter.dispatchOutboundMessage(outboundMsg);
+  outboundMsg.status = dispatchRes.status === 'disabled' ? 'failed' : dispatchRes.status;
+  db.messages.set(outboundMsg.id, outboundMsg);
+  db.schedulePersist();
+  EventBus.publish('message:new', { conversationId: outboundMsg.conversationId, message: outboundMsg });
+
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'channel.outbound_dispatch',
+    entityType: 'message',
+    entityId: outboundMsg.id,
+    afterState: {
+      channel: channelParam,
+      adapterState,
+      deliveryStatus: dispatchRes.status,
+      externalMessageId: dispatchRes.externalMessageId,
+    },
+  });
+
+  res.status(dispatchRes.status === 'failed' ? 502 : 200).json({
+    success: dispatchRes.status !== 'failed',
+    data: {
+      messageId: outboundMsg.id,
+      externalMessageId: dispatchRes.externalMessageId,
+      status: dispatchRes.status,
+      adapterState,
+      channel: adapter.channelType,
+    },
   });
 });
 
 apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.reply');
+  const orgId = currentActor.organizationId;
   const { channel, senderName, senderPhone, customerName, phoneNumber, messageText } = req.body || {};
   const channelType = channel || 'whatsapp';
   const text = messageText || 'السلام عليكم، أود الاستفسار عن ترقية باقتي الحالية';
   const phone = senderPhone || phoneNumber || '+966500998877';
   const name = senderName || customerName || 'عميل تجريبي';
 
-  // 1. Find or create Customer
+  const storedConfig = db.getChannelConfig(orgId, `chan-${channelType}`);
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelType, storedConfig, true);
+  const simulatedPayload =
+    channelType === 'whatsapp'
+      ? {
+          entry: [
+            {
+              changes: [
+                {
+                  value: {
+                    contacts: [{ wa_id: phone.replace(/[^0-9]/g, ''), profile: { name } }],
+                    messages: [{ id: `sim-${Date.now()}`, from: phone.replace(/[^0-9]/g, ''), text: { body: text } }],
+                  },
+                },
+              ],
+            },
+          ],
+        }
+      : { from: phone, sender: phone, visitorId: phone, visitorName: name, message: text, text, body: text };
+
+  const normalized = await adapter.normalizeInboundMessage(simulatedPayload, orgId);
+
   let customer = Array.from(db.customers.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.phone === phone
+    (c) => c.organizationId === orgId && c.phone === phone
   );
 
   if (!customer) {
     const custId = `cust-sim-${Date.now().toString(36)}`;
     customer = {
       id: custId,
-      organizationId: currentActor.organizationId,
+      organizationId: orgId,
       name,
       phone,
-      email: `${custId}@demo.sa`,
+      email: `${custId}@demo.local`,
       customerTier: 'standard',
       lifetimeValue: 1200,
-      tags: ['تطبيق_واتساب', 'عميل_جديد'],
-      customFields: { channel: channelType },
+      tags: ['محاكاة_محلية', `channel_${channelType}`],
+      customFields: { channel: channelType, simulated: true },
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     db.customers.set(custId, customer);
   }
 
-  // 2. Find or create Conversation
   let conv = Array.from(db.conversations.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.customerId === customer!.id && c.status === 'open'
+    (c) => c.organizationId === orgId && c.customerId === customer!.id && c.status === 'open'
   );
 
   const now = new Date().toISOString();
@@ -3009,7 +3325,7 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
     const convId = `conv-sim-${Date.now().toString(36)}`;
     conv = {
       id: convId,
-      organizationId: currentActor.organizationId,
+      organizationId: orgId,
       customerId: customer.id,
       channel: channelType,
       status: 'open',
@@ -3026,11 +3342,11 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
     conv.lastMessageAt = now;
   }
 
-  // 3. Create Unified Message
   const msgId = `msg-sim-${Date.now().toString(36)}`;
   const msg: UnifiedMessage = {
+    ...normalized,
     id: msgId,
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
     conversationId: conv.id,
     customerId: customer.id,
     channel: channelType,
@@ -3042,11 +3358,21 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
       type: 'customer',
       name: customer.name,
     },
-    status: 'delivered',
-    metadata: { simulated: true, simulatedAt: now },
+    status: 'simulated',
+    metadata: { ...(normalized.metadata || {}), simulated: true, adapterState: adapter.getState(), simulatedAt: now },
     createdAt: now,
   };
   db.messages.set(msgId, msg);
+
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'integration.simulate_inbound',
+    entityType: 'message',
+    entityId: msgId,
+    afterState: { channel: channelType, adapterState: adapter.getState(), status: 'simulated' },
+  });
 
   // 4. Run AI Sentiment & Intent analysis
   try {

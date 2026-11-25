@@ -7,6 +7,7 @@ process.env.NODE_ENV = 'test';
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
 import {
   checkRateLimit,
@@ -26,7 +27,9 @@ import {
   SCRYPT_FAST,
 } from '../server/core/localAuth.ts';
 
-const testDir = path.join('F:', 'Dev_Workspace', 'Temp', 'OMNIFLOW_OS', `rate_limit_fail_${Date.now()}`);
+const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omniflow-rl-fail-'));
+const OWNER_MARKER = path.join(testDir, '.omniflow_test_owner');
+fs.writeFileSync(OWNER_MARKER, JSON.stringify({ tag: 'OMNIFLOW_RL_FAIL_ISOLATION', pid: process.pid }), 'utf8');
 
 let passed = 0;
 let failed = 0;
@@ -218,7 +221,7 @@ async function runFailureSuite() {
     }
   } finally {
     try {
-      if (fs.existsSync(testDir)) {
+      if (fs.existsSync(testDir) && fs.existsSync(OWNER_MARKER)) {
         fs.rmSync(testDir, { recursive: true, force: true });
       }
     } catch (_) {}

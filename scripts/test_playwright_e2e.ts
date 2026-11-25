@@ -207,12 +207,20 @@ async function main() {
 
   let serverProc = await startServerProcess(true);
 
-  log('Launching Playwright Chrome instance...');
-  const browser: Browser = await chromium.launch({
-    channel: 'chrome',
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  log('Launching Playwright Chromium/Chrome instance...');
+  let browser: Browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+  } catch {
+    browser = await chromium.launch({
+      channel: 'chrome',
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+  }
 
   const context: BrowserContext = await browser.newContext({
     viewport: { width: 1366, height: 850 },

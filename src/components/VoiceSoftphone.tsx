@@ -215,7 +215,11 @@ export const VoiceSoftphone: React.FC<VoiceSoftphoneProps> = ({
           {activeCall && activeCall.status !== 'completed' ? (
             <div className="bg-slate-950 border border-emerald-500/40 rounded-2xl p-4 mb-5 text-center space-y-2">
               <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 animate-pulse">
-                {activeCall.status === 'hold' ? 'المكالمة قيد الانتظار (HOLD)' : 'مكالمة جارية الآن'}
+                {activeCall.status === 'hold'
+                  ? 'المكالمة قيد الانتظار (HOLD)'
+                  : activeCall.status === 'ringing'
+                  ? 'جاري الرنين / بانتظار تأكيد المزود (RINGING)'
+                  : 'مكالمة جارية الآن'}
               </span>
               <div className="text-lg font-bold text-white font-mono">{activeCall.callerNumber}</div>
               <div className="text-xs text-slate-400 font-medium">العميل: {activeCall.customerName || 'عميل مسجل'}</div>

@@ -14,6 +14,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
 import {
   writeVerifiedAtomicFileSync,
@@ -40,7 +41,7 @@ function runDisasterRecoveryTestSuite() {
 
   const pid = process.pid;
   const timestamp = Date.now();
-  const sandboxRoot = path.resolve(`F:\\Dev_Workspace\\Temp\\OMNIFLOW_OS\\dr_sandbox_${pid}_${timestamp}`);
+  const sandboxRoot = path.resolve(path.join(os.tmpdir(), `omniflow-dr-sandbox-${pid}_${timestamp}`));
   fs.mkdirSync(sandboxRoot, { recursive: true, mode: 0o700 });
 
   let testsPassed = 0;

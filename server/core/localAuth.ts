@@ -108,8 +108,17 @@ export interface RateLimitCheckpoint {
   durableGeneration: number;
   lastPersistedAt: string;
   lockedKeys: string[];
-  primarySha256?: string;
+  attemptFloors?: Record<string, RateLimitEntry>;
+  primarySha256: string;
   backupSha256?: string;
+}
+
+function timingSafeEqualHex(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b || typeof a !== 'string' || typeof b !== 'string') return false;
+  if (!/^[0-9a-f]{64}$/i.test(a) || !/^[0-9a-f]{64}$/i.test(b)) return false;
+  const bufA = Buffer.from(a.toLowerCase(), 'utf8');
+  const bufB = Buffer.from(b.toLowerCase(), 'utf8');
+  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
 }
 
 export function getRateLimitCheckpointFilePath(dataDir: string): string {
@@ -268,23 +277,27 @@ function writeStateFile(filePath: string, bakPath: string, payload: PersistentRa
   fs.renameSync(tmpPath, filePath);
   latestKnownGeneration = Math.max(latestKnownGeneration, payload.generation);
 
-  // Persist durable checkpoint (anti-rollback freshness & lockout anchor)
+  // Persist durable checkpoint (anti-rollback freshness, cryptographic digests & lockout/attempt floors)
+  // CRITICAL: Failure to persist the durable checkpoint MUST fail closed (never warn-and-ignore).
+  const checkpointPath = getRateLimitCheckpointFilePath(dataDir);
+  cleanupStaleTmpFiles(dataDir, checkpointPath);
   try {
-    const checkpointPath = getRateLimitCheckpointFilePath(dataDir);
     const now = Date.now();
     const lockedKeys: string[] = [];
+    const attemptFloors: Record<string, RateLimitEntry> = {};
     for (const [k, v] of Object.entries(payload.entries)) {
       if (v.blockedUntil > now || v.attempts >= MAX_FAILED_ATTEMPTS) {
         lockedKeys.push(k);
       }
+      if (v.blockedUntil > now || (v.attempts > 0 && now - v.firstAttemptAt <= RATE_LIMIT_WINDOW_MS)) {
+        attemptFloors[k] = { ...v };
+      }
     }
 
-    const primarySha256 = crypto.createHash('sha256').update(serialized).digest('hex');
+    const primarySha256 = crypto.createHash('sha256').update(serialized, 'utf8').digest('hex');
     let backupSha256: string | undefined = undefined;
     if (fs.existsSync(bakPath)) {
-      try {
-        backupSha256 = crypto.createHash('sha256').update(fs.readFileSync(bakPath)).digest('hex');
-      } catch {}
+      backupSha256 = crypto.createHash('sha256').update(fs.readFileSync(bakPath, 'utf8'), 'utf8').digest('hex');
     }
 
     const checkpointPayload: RateLimitCheckpoint = {
@@ -292,6 +305,7 @@ function writeStateFile(filePath: string, bakPath: string, payload: PersistentRa
       durableGeneration: payload.generation,
       lastPersistedAt: payload.updatedAt,
       lockedKeys,
+      attemptFloors,
       primarySha256,
       backupSha256,
     };
@@ -307,7 +321,54 @@ function writeStateFile(filePath: string, bakPath: string, payload: PersistentRa
     }
     fs.renameSync(cpTmpPath, checkpointPath);
   } catch (cpErr: any) {
-    console.warn(`[RateLimit Security] Failed to update durable checkpoint: ${cpErr?.message}`);
+    currentStorageHealth = 'STORAGE_UNWRITABLE';
+    lastStorageError = `Failed to persist durable rate-limit checkpoint fail-closed: ${cpErr?.message || cpErr}`;
+    console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
+    throw new Error(lastStorageError);
+  }
+}
+
+function applyAntiRelaxationFromCheckpoint(checkpoint: RateLimitCheckpoint | null): void {
+  if (!checkpoint) return;
+  const now = Date.now();
+
+  if (checkpoint.attemptFloors && typeof checkpoint.attemptFloors === 'object') {
+    for (const [k, floor] of Object.entries(checkpoint.attemptFloors)) {
+      if (
+        !floor ||
+        typeof floor.attempts !== 'number' ||
+        typeof floor.firstAttemptAt !== 'number' ||
+        typeof floor.blockedUntil !== 'number'
+      ) {
+        continue;
+      }
+      if (floor.blockedUntil <= now && now - floor.firstAttemptAt > RATE_LIMIT_WINDOW_MS) {
+        continue;
+      }
+      const existing = rateLimitMap.get(k);
+      if (!existing) {
+        rateLimitMap.set(k, { ...floor });
+      } else {
+        rateLimitMap.set(k, {
+          attempts: Math.max(existing.attempts, floor.attempts),
+          firstAttemptAt: Math.min(existing.firstAttemptAt, floor.firstAttemptAt),
+          blockedUntil: Math.max(existing.blockedUntil, floor.blockedUntil),
+        });
+      }
+    }
+  }
+
+  if (Array.isArray(checkpoint.lockedKeys)) {
+    for (const lk of checkpoint.lockedKeys) {
+      const existing = rateLimitMap.get(lk);
+      if (!existing || existing.blockedUntil <= now || existing.attempts < MAX_FAILED_ATTEMPTS) {
+        rateLimitMap.set(lk, {
+          attempts: Math.max(existing?.attempts ?? 0, MAX_FAILED_ATTEMPTS),
+          firstAttemptAt: existing?.firstAttemptAt ?? now,
+          blockedUntil: Math.max(existing?.blockedUntil ?? 0, now + BLOCK_DURATION_MS),
+        });
+      }
+    }
   }
 }
 
@@ -316,23 +377,39 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
   const bakPath = getRateLimitBackupFilePath(dataDir);
   const checkpointPath = getRateLimitCheckpointFilePath(dataDir);
 
-  // Read durable checkpoint to establish baseline freshness and anti-relaxation requirements
+  // Read durable checkpoint and fail closed if an existing checkpoint is partial or corrupted
   let checkpoint: RateLimitCheckpoint | null = null;
   if (fs.existsSync(checkpointPath)) {
     try {
       const cpRaw = fs.readFileSync(checkpointPath, 'utf8');
       const cpParsed = JSON.parse(cpRaw);
+      const validPrimaryHex = typeof cpParsed?.primarySha256 === 'string' && /^[0-9a-f]{64}$/i.test(cpParsed.primarySha256);
+      const validBakHex =
+        cpParsed?.backupSha256 === undefined ||
+        (typeof cpParsed.backupSha256 === 'string' && /^[0-9a-f]{64}$/i.test(cpParsed.backupSha256));
       if (
         cpParsed &&
         cpParsed.schemaVersion === 1 &&
         typeof cpParsed.durableGeneration === 'number' &&
         Number.isFinite(cpParsed.durableGeneration) &&
-        Array.isArray(cpParsed.lockedKeys)
+        Array.isArray(cpParsed.lockedKeys) &&
+        validPrimaryHex &&
+        validBakHex
       ) {
         checkpoint = cpParsed;
         latestKnownGeneration = Math.max(latestKnownGeneration, checkpoint.durableGeneration);
+      } else {
+        currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
+        lastStorageError = 'Durable rate-limit checkpoint failed schema or digest validation (partial/corrupted checkpoint). Halting authentication fail-secure.';
+        console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
+        return;
       }
-    } catch {}
+    } catch (cpParseErr: any) {
+      currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
+      lastStorageError = `Durable rate-limit checkpoint is unreadable or malformed JSON (${cpParseErr?.message}). Halting authentication fail-secure.`;
+      console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
+      return;
+    }
   }
 
   // 1. Primary file missing check
@@ -340,6 +417,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     if (fs.existsSync(bakPath)) {
       try {
         const bakRaw = fs.readFileSync(bakPath, 'utf8');
+        const actualBakSha256 = crypto.createHash('sha256').update(bakRaw, 'utf8').digest('hex');
         const parsed: PersistentRateLimitStore = JSON.parse(bakRaw);
         const isBakValid =
           parsed &&
@@ -349,31 +427,16 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
           typeof parsed.generation === 'number' &&
           Number.isFinite(parsed.generation);
 
-        // Anti-rollback / anti-relaxation across cold restart:
-        // Freshness can ONLY be proven if:
-        // A) A valid checkpoint exists, AND
-        // B) The backup generation is at least (checkpoint.durableGeneration - 1)
-        // If checkpoint is absent or backup generation is older, freshness CANNOT be proven!
-        const isBakFresh =
+        const isBakFreshAndAuthenticated =
           isBakValid &&
           checkpoint !== null &&
-          parsed.generation >= checkpoint.durableGeneration - 1;
+          parsed.generation >= checkpoint.durableGeneration - 1 &&
+          typeof checkpoint.backupSha256 === 'string' &&
+          timingSafeEqualHex(checkpoint.backupSha256, actualBakSha256);
 
-        if (isBakValid && isBakFresh) {
+        if (isBakFreshAndAuthenticated) {
           populateRateLimitMap(parsed.entries);
-          // Enforce anti-relaxation: all locked keys from checkpoint remain locked
-          if (checkpoint && Array.isArray(checkpoint.lockedKeys)) {
-            for (const lk of checkpoint.lockedKeys) {
-              const existing = rateLimitMap.get(lk);
-              if (!existing || existing.blockedUntil <= Date.now() || existing.attempts < MAX_FAILED_ATTEMPTS) {
-                rateLimitMap.set(lk, {
-                  attempts: MAX_FAILED_ATTEMPTS,
-                  firstAttemptAt: Date.now(),
-                  blockedUntil: Date.now() + BLOCK_DURATION_MS,
-                });
-              }
-            }
-          }
+          applyAntiRelaxationFromCheckpoint(checkpoint);
 
           latestKnownGeneration = Math.max(latestKnownGeneration, parsed.generation + 1);
           const recoveredPayload: PersistentRateLimitStore = {
@@ -384,16 +447,21 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
           };
           writeStateFile(filePath, bakPath, recoveredPayload);
           currentStorageHealth = 'CORRUPTED_RECOVERED';
-          lastStorageError = 'Primary state missing; restored restrictive state from verified fresh .bak';
+          lastStorageError = 'Primary state missing; restored restrictive state from SHA-256 verified fresh .bak';
           return;
         } else {
           currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
-          lastStorageError = checkpoint === null
-            ? 'Primary state missing and checkpoint absent; freshness cannot be proven across restart. Halting authentication fail-secure.'
-            : `Primary state missing and backup generation (${parsed?.generation}) is stale compared to durable checkpoint (${checkpoint.durableGeneration}). Halting authentication fail-secure.`;
+          lastStorageError =
+            checkpoint === null
+              ? 'Primary state missing and checkpoint absent; freshness cannot be proven across restart. Halting authentication fail-secure.'
+              : `Primary state missing and backup rejected (bakGen=${parsed?.generation}, expectedGen>=${checkpoint.durableGeneration - 1}, digestMatch=${timingSafeEqualHex(checkpoint.backupSha256, actualBakSha256)}). Halting authentication fail-secure.`;
           return;
         }
-      } catch {}
+      } catch {
+        currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
+        lastStorageError = 'Primary state missing and backup failed integrity parsing. Halting authentication fail-secure.';
+        return;
+      }
     }
 
     // Neither primary nor backup exists
@@ -410,7 +478,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     return;
   }
 
-  // 2. Primary file exists: attempt to read and validate
+  // 2. Primary file exists: attempt to read, verify SHA-256 digest & generation, and parse
   let raw: string;
   try {
     raw = fs.readFileSync(filePath, 'utf8');
@@ -421,6 +489,7 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
   }
 
   let parsed: PersistentRateLimitStore | null = null;
+  const actualPrimarySha256 = crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
   try {
     parsed = JSON.parse(raw);
     if (
@@ -437,29 +506,21 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     parsed = null;
   }
 
-  // Verify primary freshness against durable checkpoint if checkpoint exists
-  if (parsed && checkpoint && parsed.generation < checkpoint.durableGeneration) {
-    console.warn(`[RateLimit Security] Primary state generation (${parsed.generation}) is older than durable checkpoint (${checkpoint.durableGeneration}). Treating primary as corrupt.`);
-    parsed = null;
+  // Cryptographically verify primary digest AND freshness against durable checkpoint
+  if (parsed && checkpoint) {
+    if (!timingSafeEqualHex(checkpoint.primarySha256, actualPrimarySha256)) {
+      console.warn('[RateLimit CRITICAL] Primary state SHA-256 digest mismatch against durable checkpoint! Treating primary as tampered/corrupt.');
+      parsed = null;
+    } else if (parsed.generation < checkpoint.durableGeneration) {
+      console.warn(`[RateLimit Security] Primary state generation (${parsed.generation}) is older than durable checkpoint (${checkpoint.durableGeneration}). Treating primary as corrupt.`);
+      parsed = null;
+    }
   }
 
   if (parsed) {
     latestKnownGeneration = Math.max(latestKnownGeneration, parsed.generation);
     populateRateLimitMap(parsed.entries);
-
-    // Enforce anti-relaxation from durable checkpoint
-    if (checkpoint && Array.isArray(checkpoint.lockedKeys)) {
-      for (const lk of checkpoint.lockedKeys) {
-        const existing = rateLimitMap.get(lk);
-        if (!existing || existing.blockedUntil <= Date.now() || existing.attempts < MAX_FAILED_ATTEMPTS) {
-          rateLimitMap.set(lk, {
-            attempts: MAX_FAILED_ATTEMPTS,
-            firstAttemptAt: Date.now(),
-            blockedUntil: Date.now() + BLOCK_DURATION_MS,
-          });
-        }
-      }
-    }
+    applyAntiRelaxationFromCheckpoint(checkpoint);
 
     if (currentStorageHealth !== 'CORRUPTED_RECOVERED') {
       currentStorageHealth = 'HEALTHY';
@@ -473,20 +534,21 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
     return;
   }
 
-  // === CORRUPTION DETECTED IN PRIMARY ===
+  // === CORRUPTION / TAMPERING DETECTED IN PRIMARY ===
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const corruptPath = `${filePath}.corrupt.${timestamp}`;
   try {
     fs.renameSync(filePath, corruptPath);
-    console.warn(`[RateLimit Security] Corrupt state file quarantined to: ${corruptPath}`);
+    console.warn(`[RateLimit Security] Corrupt/tampered state file quarantined to: ${corruptPath}`);
   } catch (qErr: any) {
     console.error(`[RateLimit Security] Failed to quarantine corrupt state file: ${qErr?.message}`);
   }
 
-  // Attempt recovery from backup (.bak) with durable freshness verification
+  // Attempt recovery from backup (.bak) with SHA-256 digest & generation verification
   if (fs.existsSync(bakPath)) {
     try {
       const bakRaw = fs.readFileSync(bakPath, 'utf8');
+      const actualBakSha256 = crypto.createHash('sha256').update(bakRaw, 'utf8').digest('hex');
       const bakParsed: PersistentRateLimitStore = JSON.parse(bakRaw);
       const isBakStructureValid =
         bakParsed &&
@@ -497,27 +559,18 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
         Number.isFinite(bakParsed.generation);
 
       const minRequiredGen = checkpoint ? checkpoint.durableGeneration - 1 : (latestKnownGeneration > 0 ? latestKnownGeneration - 1 : -1);
-      const isBackupFresh =
+      const isDigestValid = checkpoint
+        ? typeof checkpoint.backupSha256 === 'string' && timingSafeEqualHex(checkpoint.backupSha256, actualBakSha256)
+        : false;
+      const isBackupFreshAndVerified =
         isBakStructureValid &&
         minRequiredGen >= 0 &&
-        bakParsed.generation >= minRequiredGen;
+        bakParsed.generation >= minRequiredGen &&
+        isDigestValid;
 
-      if (isBakStructureValid && isBackupFresh) {
+      if (isBackupFreshAndVerified) {
         populateRateLimitMap(bakParsed.entries);
-
-        // Anti-relaxation: locked keys from checkpoint must remain locked
-        if (checkpoint && Array.isArray(checkpoint.lockedKeys)) {
-          for (const lk of checkpoint.lockedKeys) {
-            const existing = rateLimitMap.get(lk);
-            if (!existing || existing.blockedUntil <= Date.now() || existing.attempts < MAX_FAILED_ATTEMPTS) {
-              rateLimitMap.set(lk, {
-                attempts: MAX_FAILED_ATTEMPTS,
-                firstAttemptAt: Date.now(),
-                blockedUntil: Date.now() + BLOCK_DURATION_MS,
-              });
-            }
-          }
-        }
+        applyAntiRelaxationFromCheckpoint(checkpoint);
 
         latestKnownGeneration = Math.max(latestKnownGeneration, bakParsed.generation + 1);
 
@@ -529,14 +582,14 @@ export function loadRateLimitStateFromDisk(dataDir: string): void {
         };
         writeStateFile(filePath, bakPath, recoveredPayload);
         currentStorageHealth = 'CORRUPTED_RECOVERED';
-        lastStorageError = `Corrupt primary state quarantined to ${path.basename(corruptPath)}; restored restrictive state from verified .bak (gen ${bakParsed.generation} -> ${latestKnownGeneration})`;
+        lastStorageError = `Corrupt/tampered primary quarantined to ${path.basename(corruptPath)}; restored restrictive state from SHA-256 verified .bak (gen ${bakParsed.generation} -> ${latestKnownGeneration})`;
         console.warn(`[RateLimit Security] ${lastStorageError}`);
         return;
       } else {
         const corruptBakPath = `${bakPath}.corrupt.${timestamp}`;
         try { fs.renameSync(bakPath, corruptBakPath); } catch {}
         currentStorageHealth = 'CORRUPTED_UNRECOVERABLE';
-        lastStorageError = `Primary corrupt and backup is stale or unverified (bakGen=${bakParsed?.generation}, minRequired=${minRequiredGen}). Refusing restore fail-closed.`;
+        lastStorageError = `Primary corrupt and backup rejected (bakGen=${bakParsed?.generation}, minRequired=${minRequiredGen}, digestValid=${isDigestValid}). Refusing restore fail-closed.`;
         console.error(`[RateLimit CRITICAL] ${lastStorageError}`);
         return;
       }

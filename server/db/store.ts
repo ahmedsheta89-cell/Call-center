@@ -612,7 +612,11 @@ class DatabaseStore implements IDataStore {
 
     const hasSecrets = hasConfiguredSecretCredential(mergedConfig);
     mergedConfig.credentialsConfigured = hasSecrets;
-    mergedConfig.verified = true;
+    if (typeof sanitizedConfig.verified === 'boolean') {
+      mergedConfig.verified = sanitizedConfig.verified;
+    } else if (hasNewSecretField) {
+      mergedConfig.verified = false;
+    }
     mergedConfig.lastCheckedAt = now;
 
     const updatedRecord: ChannelConfigRecord = {

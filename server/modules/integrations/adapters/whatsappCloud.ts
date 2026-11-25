@@ -37,10 +37,11 @@ export class WhatsAppCloudChannelAdapter implements ChannelAdapter {
       allowSimulation,
     };
 
-    if (this.config.accessToken && this.config.phoneNumberId) {
-      this.state = 'CONFIGURED';
-    } else if (this.config.allowSimulation) {
+    if (this.config.allowSimulation) {
+      // Explicit simulation request takes precedence — never make real API calls in SIMULATED mode
       this.state = 'SIMULATED';
+    } else if (this.config.accessToken && this.config.phoneNumberId) {
+      this.state = 'CONFIGURED';
     } else {
       this.state = 'DISABLED';
     }

@@ -2,9 +2,12 @@
  * @file server/modules/integrations/adapters/sipTelephony.ts
  * SIP Telephony & Egypt NTRA / Law 10 & Law 151 Compliant Voice Engine
  * Strict State Separation: DISABLED (default), CONFIGURED, CONNECTED, SIMULATED, FAILED
+ * Never reports CONNECTED solely from credentials; verifies TCP SIP endpoint reachability.
+ * Never marks calls connected until explicit provider call/session confirmation exists.
  */
 
 import crypto from 'crypto';
+import net from 'net';
 import { CallSession, UUID } from '../../../core/types.ts';
 import {
   TelephonyAdapter,
@@ -13,6 +16,39 @@ import {
   AdapterHealthStatus,
 } from '../contracts.ts';
 import { db } from '../../../db/store.ts';
+
+function parseSipTarget(uri: string): { host: string; port: number } | null {
+  try {
+    const cleaned = uri.trim().replace(/^sips?:/i, '');
+    const hostPortPart = cleaned.split('@').pop()?.split(';')[0] || '';
+    const [host, portStr] = hostPortPart.split(':');
+    if (!host) return null;
+    const defaultPort = /^sips:/i.test(uri.trim()) ? 5061 : 5060;
+    const port = portStr ? parseInt(portStr, 10) : defaultPort;
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) return null;
+    return { host, port };
+  } catch {
+    return null;
+  }
+}
+
+async function probeTcpSocket(host: string, port: number, timeoutMs = 1500): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    const done = (ok: boolean, error?: string) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ ok, latencyMs: Date.now() - start, error });
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false, `TCP connection timeout after ${timeoutMs}ms`));
+    socket.once('error', (err) => done(false, err.message));
+  });
+}
 
 export class SipTelephonyAdapter implements TelephonyAdapter {
   public name = 'SIP Egypt Enterprise Telephony (Law 10/2003 & 151/2020 Compliant)';
@@ -40,6 +76,7 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       allowSimulation,
     };
 
+    // Never transition to CONNECTED solely from credentials; stay at CONFIGURED until proven.
     if (this.config.sipServerUri && this.config.sipUsername) {
       this.state = 'CONFIGURED';
     } else if (this.config.allowSimulation) {
@@ -73,11 +110,35 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       };
     }
 
+    // CONFIGURED / CONNECTED / FAILED: Genuine socket reachability probe required to report CONNECTED
+    const target = parseSipTarget(this.config.sipServerUri || '');
+    if (!target) {
+      this.state = 'FAILED';
+      return {
+        state: 'FAILED',
+        isHealthy: false,
+        latencyMs: 0,
+        details: `Invalid SIP Server URI '${this.config.sipServerUri}'; cannot establish live SIP connection.`,
+      };
+    }
+
+    const probe = await probeTcpSocket(target.host, target.port, 1500);
+    if (probe.ok) {
+      this.state = 'CONNECTED';
+      return {
+        state: 'CONNECTED',
+        isHealthy: true,
+        latencyMs: probe.latencyMs,
+        details: `Verified live SIP gateway reachability at ${target.host}:${target.port} as ${this.config.sipUsername}`,
+      };
+    }
+
+    this.state = 'FAILED';
     return {
-      state: 'CONNECTED',
-      isHealthy: true,
-      latencyMs: 12,
-      details: `Connected to SIP Server ${this.config.sipServerUri} as ${this.config.sipUsername}`,
+      state: 'FAILED',
+      isHealthy: false,
+      latencyMs: probe.latencyMs,
+      details: `SIP gateway ${target.host}:${target.port} unreachable (${probe.error || 'connection failed'}). Remaining disconnected.`,
     };
   }
 
@@ -99,6 +160,7 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     );
 
     const isSim = this.state === 'SIMULATED';
+    // Do NOT mark a SIP call connected until a real provider call/session confirmation exists
     const session: CallSession = {
       id: callId,
       organizationId: params.organizationId,
@@ -106,19 +168,19 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       customerName: customer?.name || `عميل هاتف (${params.to})`,
       agentId: params.agentId,
       direction: 'outbound',
-      status: 'in_progress',
+      status: 'ringing',
       callerNumber: params.from || this.config.defaultCallerId || '+20220000000',
       calleeNumber: params.to,
       durationSeconds: 0,
       startedAt: new Date().toISOString(),
-      disposition: isSim ? 'simulated_connected' : 'connected',
+      disposition: isSim ? 'simulated_ringing' : 'awaiting_provider_confirmation',
       transcript: this.config.mandatoryRecordingDisclosure
-        ? `[تسجيل نظامي]: ${this.config.legalComplianceNotice}\n[اتصال]: تم بدء الاتصال بالعميل بواسطة ${agentUser?.fullName || 'الموظف'}.`
-        : `[اتصال]: تم بدء الاتصال بالعميل بواسطة ${agentUser?.fullName || 'الموظف'}.`,
+        ? `[تسجيل نظامي]: ${this.config.legalComplianceNotice}\n[اتصال]: جاري طلب المكالمة بواسطة ${agentUser?.fullName || 'الموظف'} (بانتظار تأكيد المزود).`
+        : `[اتصال]: جاري طلب المكالمة بواسطة ${agentUser?.fullName || 'الموظف'} (بانتظار تأكيد المزود).`,
       aiSentiment: 'neutral',
       aiSummary: isSim
-        ? 'مكالمة هاتفية صادرة محاكاة محلياً (SIMULATED).'
-        : 'مكالمة هاتفية صادرة عبر بوابة SIP Egypt المعتمدة.',
+        ? 'طلب مكالمة هاتفية صادرة محاكاة (بانتظار تأكيد الجلسة - SIMULATED).'
+        : 'طلب مكالمة هاتفية صادرة عبر بوابة SIP Egypt (بانتظار تأكيد جلسة المزود).',
     };
 
     this.activeSessions.set(callId, session);
@@ -126,6 +188,22 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     db.schedulePersist();
 
     return session;
+  }
+
+  public async confirmCallConnected(callId: UUID, providerSessionId?: string): Promise<CallSession> {
+    const call = db.calls.get(callId) || this.activeSessions.get(callId);
+    if (!call) throw new Error(`Call session ${callId} not found`);
+    if (this.state === 'DISABLED') {
+      throw new Error('SIP Telephony Adapter is DISABLED: Cannot confirm session.');
+    }
+    call.status = 'in_progress';
+    call.disposition = this.state === 'SIMULATED' ? 'simulated_confirmed' : 'provider_confirmed';
+    call.transcript =
+      (call.transcript || '') +
+      `\n[تأكيد المزود]: تم تأكيد اتصال الجلسة الصوتية فعلياً (${providerSessionId || 'sip-session-ack'}).`;
+    db.calls.set(callId, call);
+    db.schedulePersist();
+    return call;
   }
 
   public async handleInboundCall(params: {
@@ -153,17 +231,17 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
       customerName: customer?.name || `متصل جديد (${params.callerNumber})`,
       agentId: availableAgent?.id || 'agent-queue-01',
       direction: 'inbound',
-      status: 'in_progress',
+      status: 'ringing',
       callerNumber: params.callerNumber,
       calleeNumber: params.calleeNumber,
       durationSeconds: 0,
       startedAt: new Date().toISOString(),
-      disposition: isSim ? 'simulated_queued' : 'queued',
+      disposition: isSim ? 'simulated_queued' : 'awaiting_provider_confirmation',
       transcript: this.config.mandatoryRecordingDisclosure
         ? `[رسالة الترحيب الآلية والامتثال]: مرحباً بك في خدمة العملاء. يرجى العلم بأن هذه المكالمة قد تكون مسجلة لأغراض مراقبة الجودة والتدريب.\n`
         : '',
       aiSentiment: 'neutral',
-      aiSummary: isSim ? 'مكالمة هاتفية واردة محاكاة (SIMULATED).' : 'مكالمة هاتفية واردة عبر الـ IVR.',
+      aiSummary: isSim ? 'مكالمة هاتفية واردة محاكاة (SIMULATED).' : 'مكالمة هاتفية واردة عبر الـ IVR (بانتظار تأكيد الإجابة).',
     };
 
     this.activeSessions.set(callId, session);
@@ -235,6 +313,7 @@ export class SipTelephonyAdapter implements TelephonyAdapter {
     call.durationSeconds = call.durationSeconds > 0 ? call.durationSeconds : elapsed;
     call.status = 'completed';
     call.disposition = disposition || 'completed_normal';
+    call.endedAt = call.endedAt || new Date().toISOString();
     call.transcript = (call.transcript || '') + `\n[إنهاء]: انتهت المكالمة بنجاح، التصنيف: ${call.disposition}.`;
 
     this.activeSessions.delete(callId);

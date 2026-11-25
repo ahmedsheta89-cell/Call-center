@@ -7,6 +7,7 @@ process.env.NODE_ENV = 'test';
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import {
   checkRateLimit,
   recordFailedAttempt,
@@ -22,7 +23,9 @@ import {
   setLatestKnownGenerationForTesting,
 } from '../server/core/localAuth.ts';
 
-const sandboxDir = path.join('F:', 'Dev_Workspace', 'Temp', 'OMNIFLOW_OS', `rate_limit_deep_${Date.now()}`);
+const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omniflow-rl-deep-'));
+const OWNER_MARKER = path.join(sandboxDir, '.omniflow_test_owner');
+fs.writeFileSync(OWNER_MARKER, JSON.stringify({ tag: 'OMNIFLOW_RL_DEEP_ISOLATION', pid: process.pid }), 'utf8');
 
 let totalPassed = 0;
 let totalFailed = 0;
@@ -351,7 +354,9 @@ async function runDeepTests() {
     }
   } finally {
     try {
-      fs.rmSync(sandboxDir, { recursive: true, force: true });
+      if (fs.existsSync(OWNER_MARKER)) {
+        fs.rmSync(sandboxDir, { recursive: true, force: true });
+      }
     } catch (_) {}
   }
 }

@@ -5,6 +5,7 @@
  */
 
 import crypto from 'crypto';
+import net from 'net';
 import { ChannelType, UnifiedMessage, UUID } from '../../../core/types.ts';
 import {
   ChannelAdapter,
@@ -14,6 +15,24 @@ import {
   AdapterHealthStatus,
   MessageDeliveryStatus,
 } from '../contracts.ts';
+
+async function probeSmtpSocket(host: string, port: number, timeoutMs = 1500): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    const done = (ok: boolean, error?: string) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ ok, latencyMs: Date.now() - start, error });
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false, `SMTP TCP timeout after ${timeoutMs}ms`));
+    socket.once('error', (err) => done(false, err.message));
+  });
+}
 
 export class EmailChannelAdapter implements ChannelAdapter {
   public channelType: ChannelType = 'email';
@@ -35,10 +54,10 @@ export class EmailChannelAdapter implements ChannelAdapter {
       allowSimulation,
     };
 
-    if (this.config.smtpHost && this.config.smtpUser) {
-      this.state = 'CONFIGURED';
-    } else if (this.config.allowSimulation) {
+    if (this.config.allowSimulation) {
       this.state = 'SIMULATED';
+    } else if (this.config.smtpHost && this.config.smtpUser) {
+      this.state = 'CONFIGURED';
     } else {
       this.state = 'DISABLED';
     }
@@ -81,21 +100,27 @@ export class EmailChannelAdapter implements ChannelAdapter {
       }
     }
 
-    // Live verification
-    if (this.config.webhookSecret) {
-      const authHeader = headers['authorization'] || headers['x-email-webhook-secret'] || '';
-      const expected = this.config.webhookSecret;
-      const isValid =
-        authHeader.length === expected.length &&
-        crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
-      if (!isValid) {
-        return {
-          isValid: false,
-          rawPayload: null,
-          senderIdentifier: '',
-          error: 'Invalid email webhook authorization secret',
-        };
-      }
+    if (!this.config.webhookSecret) {
+      return {
+        isValid: false,
+        rawPayload: null,
+        senderIdentifier: '',
+        error: 'Missing webhook secret for Email signature verification',
+      };
+    }
+
+    const authHeader = headers['authorization'] || headers['x-email-webhook-secret'] || '';
+    const expected = this.config.webhookSecret;
+    const isValid =
+      authHeader.length === expected.length &&
+      crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
+    if (!isValid) {
+      return {
+        isValid: false,
+        rawPayload: null,
+        senderIdentifier: '',
+        error: 'Invalid email webhook authorization secret',
+      };
     }
 
     try {
@@ -165,7 +190,17 @@ export class EmailChannelAdapter implements ChannelAdapter {
       };
     }
 
-    // In configured state, email dispatch would communicate with SMTP server
+    // Probe live SMTP socket before claiming outbound send
+    const probe = await probeSmtpSocket(this.config.smtpHost || '', this.config.smtpPort || 587, 1500);
+    if (!probe.ok) {
+      this.state = 'FAILED';
+      return {
+        externalMessageId: '',
+        status: 'failed',
+      };
+    }
+
+    this.state = 'CONNECTED';
     return {
       externalMessageId: `<out-${Date.now()}@omniflow.local>`,
       status: 'sent',
@@ -192,11 +227,23 @@ export class EmailChannelAdapter implements ChannelAdapter {
       };
     }
 
+    const probe = await probeSmtpSocket(this.config.smtpHost || '', this.config.smtpPort || 587, 1500);
+    if (probe.ok) {
+      this.state = 'CONNECTED';
+      return {
+        state: 'CONNECTED',
+        isHealthy: true,
+        latencyMs: probe.latencyMs,
+        details: `Verified SMTP socket reachability for ${this.config.smtpHost}:${this.config.smtpPort}`,
+      };
+    }
+
+    this.state = 'FAILED';
     return {
-      state: 'CONNECTED',
-      isHealthy: true,
-      latencyMs: 5,
-      details: `Configured for SMTP host ${this.config.smtpHost}:${this.config.smtpPort}`,
+      state: 'FAILED',
+      isHealthy: false,
+      latencyMs: probe.latencyMs,
+      details: `SMTP host ${this.config.smtpHost}:${this.config.smtpPort} unreachable (${probe.error || 'connection failed'}).`,
     };
   }
 }

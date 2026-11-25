@@ -1,38 +1,30 @@
-# OmniFlow OS - Production Security Key Setup
+# OmniFlow OS - Production Security Key Setup (CSPRNG via Node.js crypto.randomBytes)
+$ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host "OmniFlow OS - Generating Cryptographic Production Secrets" -ForegroundColor Green
 Write-Host "========================================================" -ForegroundColor Cyan
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Write-Error "[FATAL] Node.js is not installed or not in PATH. Node.js 22+ is required."
+    Write-Error "[FATAL] Node.js is not installed or not in PATH. Node.js 22+ is strictly required."
     exit 1
 }
 
-$envPath = Join-Path $PSScriptRoot ".env"
-if (Test-Path $envPath) {
-    $existing = Get-Content $envPath -Raw
-    if ($existing -notmatch "REPLACE_WITH") {
-        Write-Host "[INFO] .env already exists with non-placeholder configuration." -ForegroundColor Yellow
-        exit 0
-    }
+$nodeVer = (node -v).TrimStart('v')
+$majorVer = [int]($nodeVer.Split('.')[0])
+if ($majorVer -lt 22) {
+    Write-Error "[FATAL] Unsupported Node.js v$nodeVer. Node.js >=22.0.0 is strictly required."
+    exit 1
 }
 
-$sessionSec = [System.Guid]::NewGuid().ToString("N") + [System.Guid]::NewGuid().ToString("N")
-$channelKey = -join ((1..64) | ForEach-Object { "{0:x}" -f (Get-Random -Max 16) })
-$auditKey = -join ((1..64) | ForEach-Object { "{0:x}" -f (Get-Random -Max 16) })
-$dataDir = Join-Path $PSScriptRoot "data"
-
-$content = @"
-NODE_ENV=production
-PORT=3000
-HOST=127.0.0.1
-DATA_DIR=$dataDir
-SESSION_SECRET=$sessionSec
-CHANNEL_SECRET_ENCRYPTION_KEY=$channelKey
-AUDIT_CHECKPOINT_HMAC_KEY=$auditKey
-AUDIT_CHECKPOINT_HMAC_KEY_ID=audit-hmac-v1
-"@
-
-Set-Content -Path $envPath -Value $content -Encoding UTF8
-Write-Host "[SUCCESS] Generated secure CSPRNG production secrets in .env" -ForegroundColor Green
+Push-Location $PSScriptRoot
+try {
+    $jsCode = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('Y29uc3QgY3J5cHRvID0gcmVxdWlyZSgnY3J5cHRvJyk7CmNvbnN0IGZzID0gcmVxdWlyZSgnZnMnKTsKY29uc3QgcGF0aCA9IHJlcXVpcmUoJ3BhdGgnKTsKCmNvbnN0IHRhcmdldERpciA9IHBhdGgucmVzb2x2ZShwcm9jZXNzLmFyZ3ZbMV0gfHwgcHJvY2Vzcy5jd2QoKSk7CmNvbnN0IGVudlBhdGggPSBwYXRoLmpvaW4odGFyZ2V0RGlyLCAnLmVudicpOwpjb25zdCBQTEFDRUhPTERFUl9SRSA9IC8oUkVQTEFDRV9XSVRIfFlPVVJffENIQU5HRU1FfE1ZX3xERUZBVUxUfEVYQU1QTEV8VEVNUExBVEV8UExBQ0VIT0xERVIpL2k7CmNvbnN0IEhFWF82NF9SRSA9IC9eWzAtOWEtZl17NjR9JC87CgpmdW5jdGlvbiBwYXJzZUVudk1hcChyYXcpIHsKICBjb25zdCBtYXAgPSB7fTsKICBmb3IgKGNvbnN0IGxpbmUgb2YgcmF3LnNwbGl0KC9ccj9cbi8pKSB7CiAgICBjb25zdCB0cmltbWVkID0gbGluZS50cmltKCk7CiAgICBpZiAoIXRyaW1tZWQgfHwgdHJpbW1lZC5zdGFydHNXaXRoKCcjJykpIGNvbnRpbnVlOwogICAgY29uc3QgZXEgPSB0cmltbWVkLmluZGV4T2YoJz0nKTsKICAgIGlmIChlcSA+IDApIHsKICAgICAgbWFwW3RyaW1tZWQuc2xpY2UoMCwgZXEpLnRyaW0oKV0gPSB0cmltbWVkLnNsaWNlKGVxICsgMSkudHJpbSgpOwogICAgfQogIH0KICByZXR1cm4gbWFwOwp9CgpmdW5jdGlvbiBoYXNWYWxpZE5vblBsYWNlaG9sZGVyS2V5cyhlbnZNYXApIHsKICBjb25zdCBzID0gZW52TWFwLlNFU1NJT05fU0VDUkVUIHx8ICcnOwogIGNvbnN0IGMgPSBlbnZNYXAuQ0hBTk5FTF9TRUNSRVRfRU5DUllQVElPTl9LRVkgfHwgJyc7CiAgY29uc3QgYSA9IGVudk1hcC5BVURJVF9DSEVDS1BPSU5UX0hNQUNfS0VZIHx8ICcnOwogIGlmICghcyB8fCBzLmxlbmd0aCA8IDMyIHx8IFBMQUNFSE9MREVSX1JFLnRlc3QocykpIHJldHVybiBmYWxzZTsKICBpZiAoIUhFWF82NF9SRS50ZXN0KGMpIHx8IFBMQUNFSE9MREVSX1JFLnRlc3QoYykpIHJldHVybiBmYWxzZTsKICBpZiAoIUhFWF82NF9SRS50ZXN0KGEpIHx8IFBMQUNFSE9MREVSX1JFLnRlc3QoYSkpIHJldHVybiBmYWxzZTsKICBpZiAoYyA9PT0gYSB8fCBzID09PSBjIHx8IHMgPT09IGEpIHJldHVybiBmYWxzZTsKICByZXR1cm4gdHJ1ZTsKfQoKaWYgKGZzLmV4aXN0c1N5bmMoZW52UGF0aCkpIHsKICBjb25zdCBjdXJyZW50ID0gZnMucmVhZEZpbGVTeW5jKGVudlBhdGgsICd1dGY4Jyk7CiAgY29uc3QgcGFyc2VkID0gcGFyc2VFbnZNYXAoY3VycmVudCk7CiAgaWYgKGhhc1ZhbGlkTm9uUGxhY2Vob2xkZXJLZXlzKHBhcnNlZCkpIHsKICAgIGNvbnNvbGUubG9nKCdbSU5GT10gLmVudiBhbHJlYWR5IGV4aXN0cyB3aXRoIHZhbGlkIGNyeXB0b2dyYXBoaWMgbm9uLXBsYWNlaG9sZGVyIGNvbmZpZ3VyYXRpb24uJyk7CiAgICBwcm9jZXNzLmV4aXQoMCk7CiAgfQogIGlmIChQTEFDRUhPTERFUl9SRS50ZXN0KGN1cnJlbnQpKSB7CiAgICBjb25zb2xlLmVycm9yKCdbRVJST1JdIEV4aXN0aW5nIC5lbnYgY29udGFpbnMgdW5yZXNvbHZlZCBwbGFjZWhvbGRlciBzZWNyZXRzLiBSZWZ1c2luZyB1bnNhZmUgcmV1c2U7IHJlcGxhY2UgcGxhY2Vob2xkZXJzIG9yIHJlbW92ZSAuZW52IGZpcnN0LicpOwogICAgcHJvY2Vzcy5leGl0KDIpOwogIH0KICBjb25zb2xlLmVycm9yKCdbRVJST1JdIEV4aXN0aW5nIC5lbnYgaGFzIGludmFsaWQgb3Igd2VhayBzZWNyZXQgbGVuZ3Rocy91bmlxdWVuZXNzLiBSZWZ1c2luZyBsYXVuY2ggdW50aWwgY29ycmVjdGVkLicpOwogIHByb2Nlc3MuZXhpdCgyKTsKfQoKY29uc3Qgc2Vzc2lvblNlY3JldCA9IGNyeXB0by5yYW5kb21CeXRlcygzMikudG9TdHJpbmcoJ2hleCcpOwpsZXQgY2hhbm5lbEtleSA9IGNyeXB0by5yYW5kb21CeXRlcygzMikudG9TdHJpbmcoJ2hleCcpOwp3aGlsZSAoY2hhbm5lbEtleSA9PT0gc2Vzc2lvblNlY3JldCkgewogIGNoYW5uZWxLZXkgPSBjcnlwdG8ucmFuZG9tQnl0ZXMoMzIpLnRvU3RyaW5nKCdoZXgnKTsKfQpsZXQgYXVkaXRLZXkgPSBjcnlwdG8ucmFuZG9tQnl0ZXMoMzIpLnRvU3RyaW5nKCdoZXgnKTsKd2hpbGUgKGF1ZGl0S2V5ID09PSBjaGFubmVsS2V5IHx8IGF1ZGl0S2V5ID09PSBzZXNzaW9uU2VjcmV0KSB7CiAgYXVkaXRLZXkgPSBjcnlwdG8ucmFuZG9tQnl0ZXMoMzIpLnRvU3RyaW5nKCdoZXgnKTsKfQoKY29uc3QgZW52Q29udGVudCA9IFsKICAnTk9ERV9FTlY9cHJvZHVjdGlvbicsCiAgJ1BPUlQ9MzAwMCcsCiAgJ0hPU1Q9MTI3LjAuMC4xJywKICAnREFUQV9ESVI9JyArIHBhdGguam9pbih0YXJnZXREaXIsICdkYXRhJyksCiAgJ1NFU1NJT05fU0VDUkVUPScgKyBzZXNzaW9uU2VjcmV0LAogICdDSEFOTkVMX1NFQ1JFVF9FTkNSWVBUSU9OX0tFWT0nICsgY2hhbm5lbEtleSwKICAnQVVESVRfQ0hFQ0tQT0lOVF9ITUFDX0tFWT0nICsgYXVkaXRLZXksCiAgJ0FVRElUX0NIRUNLUE9JTlRfSE1BQ19LRVlfSUQ9YXVkaXQtaG1hYy12MScsCiAgJycKXS5qb2luKCdcclxuJyk7Cgpmcy53cml0ZUZpbGVTeW5jKGVudlBhdGgsIGVudkNvbnRlbnQsIHsgZW5jb2Rpbmc6ICd1dGY4JywgbW9kZTogMG82MDAgfSk7CmNvbnNvbGUubG9nKCdbU1VDQ0VTU10gR2VuZXJhdGVkIGRpc3RpbmN0IDI1Ni1iaXQgQ1NQUk5HIHByb2R1Y3Rpb24gc2VjcmV0cyBpbiAnICsgZW52UGF0aCk7'))
+    & node -e $jsCode $PSScriptRoot
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "[FATAL] Key setup exited with error code $LASTEXITCODE."
+        exit $LASTEXITCODE
+    }
+} finally {
+    Pop-Location
+}

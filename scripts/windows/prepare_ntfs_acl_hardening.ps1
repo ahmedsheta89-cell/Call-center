@@ -197,6 +197,113 @@ $RollbackPath = if ($RollbackFile) {
     Join-Path $APPROVED_BASE "Audit\OMNIFLOW_OS\PHASE_2_1_4\ntfs_acl_baseline_rollback.json"
 }
 
+function Assert-BaselineIntegrity {
+    param(
+        [Parameter(Mandatory=$true)]$ParsedBaseline,
+        [Parameter(Mandatory=$true)][string]$ModeLabel,
+        [Parameter(Mandatory=$true)][string[]]$ExpectedTargets,
+        [Parameter(Mandatory=$true)][string]$ExpectedOwner,
+        [Parameter(Mandatory=$true)][string]$ExpectedScope
+    )
+
+    if (-not $ParsedBaseline -or $ParsedBaseline -is [Array]) {
+        Write-Error "$ModeLabel ABORT: Baseline must use the versioned metadata envelope object (raw arrays are rejected)."
+        exit 1
+    }
+
+    if ($ParsedBaseline.SchemaVersion -ne "1.1.0-dacl-only") {
+        Write-Error "$ModeLabel ABORT: Unsupported or missing baseline SchemaVersion '$($ParsedBaseline.SchemaVersion)' (expected '1.1.0-dacl-only')."
+        exit 1
+    }
+
+    if ($ParsedBaseline.Scope -ne $ExpectedScope) {
+        Write-Error "$ModeLabel ABORT: Baseline Scope '$($ParsedBaseline.Scope)' does not match current execution scope '$ExpectedScope'."
+        exit 1
+    }
+
+    if ($ParsedBaseline.OwnerSid -ne $ExpectedOwner) {
+        Write-Error "$ModeLabel ABORT: Baseline OwnerSid '$($ParsedBaseline.OwnerSid)' does not match verified OwnerSid '$ExpectedOwner'."
+        exit 1
+    }
+
+    $normExpectedTargets = @($ExpectedTargets | ForEach-Object { [System.IO.Path]::GetFullPath($_).TrimEnd('\').ToLowerInvariant() } | Sort-Object)
+    $rawMetaTargets = @($ParsedBaseline.TargetDirectories)
+    if ($rawMetaTargets.Count -ne $normExpectedTargets.Count) {
+        Write-Error "$ModeLabel ABORT: Baseline TargetDirectories count mismatch ($($rawMetaTargets.Count) vs expected $($normExpectedTargets.Count))."
+        exit 1
+    }
+    $normMetaTargets = @($rawMetaTargets | ForEach-Object { [System.IO.Path]::GetFullPath([string]$_).TrimEnd('\').ToLowerInvariant() } | Sort-Object)
+    for ($i = 0; $i -lt $normExpectedTargets.Count; $i++) {
+        if ($normMetaTargets[$i] -ne $normExpectedTargets[$i]) {
+            Write-Error "$ModeLabel ABORT: Baseline TargetDirectories metadata mismatch ('$($normMetaTargets[$i])' vs expected '$($normExpectedTargets[$i])')."
+            exit 1
+        }
+    }
+
+    $entries = @($ParsedBaseline.Entries)
+    if (-not $entries -or $entries.Count -eq 0) {
+        Write-Error "$ModeLabel ABORT: Baseline Entries array is missing or empty."
+        exit 1
+    }
+
+    if ($ParsedBaseline.EntryCount -ne $entries.Count) {
+        Write-Error "$ModeLabel ABORT: Baseline EntryCount metadata ($($ParsedBaseline.EntryCount)) does not match actual entries count ($($entries.Count))."
+        exit 1
+    }
+
+    $pathMap = @{}
+    $coveredTargets = @{}
+    foreach ($entry in $entries) {
+        if (-not $entry.Path -or -not $entry.SDDL -or $null -eq $entry.IsContainer) {
+            Write-Error "$ModeLabel ABORT: Malformed baseline entry detected (missing Path, SDDL, or IsContainer)."
+            exit 1
+        }
+        $normEntry = [System.IO.Path]::GetFullPath([string]$entry.Path).TrimEnd('\')
+        $normEntryLower = $normEntry.ToLowerInvariant()
+        $isEntryAllowed = $false
+        foreach ($d in $ExpectedTargets) {
+            $normD = [System.IO.Path]::GetFullPath($d).TrimEnd('\')
+            $normDLower = $normD.ToLowerInvariant()
+            if ($normEntryLower -eq $normDLower) {
+                $isEntryAllowed = $true
+                $coveredTargets[$normDLower] = $true
+                break
+            }
+            if ($normEntryLower.StartsWith($normDLower + "\")) {
+                $isEntryAllowed = $true
+                break
+            }
+        }
+        if (-not $isEntryAllowed) {
+            Write-Error "$ModeLabel ABORT: Baseline entry path '$($entry.Path)' is outside authorized target directories ($($ExpectedTargets -join ', ')). Halting to prevent unauthorized ACL alteration."
+            exit 1
+        }
+
+        try {
+            $testSec = if ($entry.IsContainer) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
+            $testSec.SetSecurityDescriptorSddlForm($entry.SDDL, [System.Security.AccessControl.AccessControlSections]::Access)
+        } catch {
+            Write-Error "$ModeLabel ABORT: Invalid or unparseable SDDL detected for entry '$($entry.Path)': $_"
+            exit 1
+        }
+        $pathMap[$normEntry] = $entry
+    }
+
+    foreach ($normDLower in $normExpectedTargets) {
+        if (-not $coveredTargets.ContainsKey($normDLower)) {
+            Write-Error "$ModeLabel ABORT: Baseline fails complete target coverage check — missing root entry for '$normDLower'."
+            exit 1
+        }
+    }
+
+    return @{
+        Entries = $entries
+        PathMap = $pathMap
+    }
+}
+
+$expectedScopeLabel = if ($TestMode) { "Test" } else { "Operational" }
+
 # --------------------------------------------------------------------------
 # ROLLBACK EXECUTION
 # --------------------------------------------------------------------------
@@ -218,46 +325,10 @@ if ($Rollback) {
         exit 1
     }
 
-    # Extract entries (support both enveloped format and flat array)
-    $rollbackEntries = if ($parsedBaseline.Entries) { $parsedBaseline.Entries } else { $parsedBaseline }
-
-    if (-not $rollbackEntries -or ($rollbackEntries -is [Array] -and $rollbackEntries.Count -eq 0)) {
-        Write-Error "ROLLBACK ABORT: Rollback baseline is empty or corrupted."
-        exit 1
-    }
-
-    # 1. Validate baseline integrity, schema, and scope before any modifications
-    $baselinePathMap = @{}
-    foreach ($entry in $rollbackEntries) {
-        if (-not $entry.Path -or -not $entry.SDDL) {
-            Write-Error "ROLLBACK ABORT: Malformed baseline entry detected (missing Path or SDDL)."
-            exit 1
-        }
-        $normEntry = [System.IO.Path]::GetFullPath($entry.Path).TrimEnd('\')
-        $isEntryAllowed = $false
-        foreach ($d in $TargetDirectories) {
-            $normD = [System.IO.Path]::GetFullPath($d).TrimEnd('\')
-            if ($normEntry.Equals($normD, [System.StringComparison]::OrdinalIgnoreCase) -or 
-                $normEntry.StartsWith($normD + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
-                $isEntryAllowed = $true
-                break
-            }
-        }
-        if (-not $isEntryAllowed) {
-            Write-Error "ROLLBACK ABORT: Baseline entry path '$($entry.Path)' is outside authorized target directories ($($TargetDirectories -join ', ')). Halting to prevent unauthorized ACL alteration."
-            exit 1
-        }
-        
-        # Test that SDDL is valid before modifying anything
-        try {
-            $testSec = if ($entry.IsContainer) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
-            $testSec.SetSecurityDescriptorSddlForm($entry.SDDL, [System.Security.AccessControl.AccessControlSections]::Access)
-        } catch {
-            Write-Error "ROLLBACK ABORT: Invalid SDDL detected for entry '$($entry.Path)': $_"
-            exit 1
-        }
-        $baselinePathMap[$normEntry] = $entry
-    }
+    # 1. Validate baseline schema, metadata, owner identity, entry count, coverage, scope & SDDL
+    $validated = Assert-BaselineIntegrity -ParsedBaseline $parsedBaseline -ModeLabel "ROLLBACK" -ExpectedTargets $TargetDirectories -ExpectedOwner $ownerSid -ExpectedScope $expectedScopeLabel
+    $rollbackEntries = $validated.Entries
+    $baselinePathMap = $validated.PathMap
 
     # 2. Sort baseline entries top-down (containers first, shortest path to longest)
     # This ensures parent directory DACLs and inheritance protection flags are restored before children
@@ -295,20 +366,32 @@ if ($Rollback) {
 
     # 4. Handle new files/directories created AFTER baseline capture
     # These items were not in the baseline. Reset them to inherit cleanly from their restored parent directory.
+    # Fail-closed: any failed icacls /reset aborts Rollback with exit code 1.
     $newItemsResetCount = 0
     foreach ($d in $TargetDirectories) {
         if (Test-Path $d) {
             $currentDiskItems = Get-ChildItem -Path $d -Recurse -Force
             foreach ($item in $currentDiskItems) {
                 $normItem = [System.IO.Path]::GetFullPath($item.FullName).TrimEnd('\')
-                if (-not $baselinePathMap.ContainsKey($normItem)) {
+                $foundInBaseline = $false
+                foreach ($k in $baselinePathMap.Keys) {
+                    if ($k.Equals($normItem, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $foundInBaseline = $true
+                        break
+                    }
+                }
+                if (-not $foundInBaseline) {
                     Write-Host "  [New Item] Resetting un-baselined item to inherit from parent: $($item.FullName)" -ForegroundColor Cyan
+                    if ($TestMode -and $env:OMNIFLOW_TEST_INJECT_ROLLBACK_RESET_FAIL -eq "1") {
+                        Write-Error "ROLLBACK FAILED: icacls /reset failed with exit code 5 (injected fault) on un-baselined item: $($item.FullName)"
+                        exit 1
+                    }
                     & icacls "$($item.FullName)" /reset
                     if ($LASTEXITCODE -ne 0) {
-                        Write-Warning "Failed to reset inheritance on new item: $($item.FullName)"
-                    } else {
-                        $newItemsResetCount++
+                        Write-Error "ROLLBACK FAILED: icacls /reset failed with exit code $LASTEXITCODE on un-baselined item: $($item.FullName)"
+                        exit 1
                     }
+                    $newItemsResetCount++
                 }
             }
         }
@@ -436,41 +519,9 @@ try {
     exit 1
 }
 
-$baselineEntries = if ($parsedBaseline.Entries) { $parsedBaseline.Entries } else { $parsedBaseline }
-if (-not $baselineEntries -or ($baselineEntries -is [Array] -and $baselineEntries.Count -eq 0)) {
-    Write-Error "APPLY ABORT: Baseline at '$RollbackPath' contains no entries or is invalid."
-    exit 1
-}
-
-# Validate every baseline entry scope and SDDL syntax before proceeding
-foreach ($entry in $baselineEntries) {
-    if (-not $entry.Path -or -not $entry.SDDL) {
-        Write-Error "APPLY ABORT: Malformed baseline entry detected (missing Path or SDDL)."
-        exit 1
-    }
-    $normEntry = [System.IO.Path]::GetFullPath($entry.Path).TrimEnd('\')
-    $isEntryAllowed = $false
-    foreach ($d in $TargetDirectories) {
-        $normD = [System.IO.Path]::GetFullPath($d).TrimEnd('\')
-        if ($normEntry.Equals($normD, [System.StringComparison]::OrdinalIgnoreCase) -or 
-            $normEntry.StartsWith($normD + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
-            $isEntryAllowed = $true
-            break
-        }
-    }
-    if (-not $isEntryAllowed) {
-        Write-Error "APPLY ABORT: Baseline entry path '$($entry.Path)' is outside authorized target directories ($($TargetDirectories -join ', ')). Halting before any mutation."
-        exit 1
-    }
-    try {
-        $testSec = if ($entry.IsContainer) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
-        $testSec.SetSecurityDescriptorSddlForm($entry.SDDL, [System.Security.AccessControl.AccessControlSections]::Access)
-    } catch {
-        Write-Error "APPLY ABORT: Invalid or unparseable SDDL in baseline entry for '$($entry.Path)': $_"
-        exit 1
-    }
-}
-Write-Host "  -> Pre-existing baseline verified ($($baselineEntries.Count) entries): $RollbackPath" -ForegroundColor Green
+$validatedApply = Assert-BaselineIntegrity -ParsedBaseline $parsedBaseline -ModeLabel "APPLY" -ExpectedTargets $TargetDirectories -ExpectedOwner $ownerSid -ExpectedScope $expectedScopeLabel
+$baselineEntries = $validatedApply.Entries
+Write-Host "  -> Pre-existing baseline verified ($($baselineEntries.Count) entries, Schema=$($parsedBaseline.SchemaVersion)): $RollbackPath" -ForegroundColor Green
 
 # Resolve Account Names from SIDs (with fallback to SID literal *S-1-...)
 try {
@@ -496,6 +547,11 @@ Write-Host "    System: $systemAccountName ($SYSTEM_SID)" -ForegroundColor White
 
 foreach ($d in $TargetDirectories) {
     Write-Host "`nHardening: $d" -ForegroundColor Yellow
+
+    if ($TestMode -and $env:OMNIFLOW_TEST_INJECT_APPLY_FAIL -eq "1") {
+        Write-Error "HARDENING FAILED: icacls /grant returned exit code 5 (injected fault) for $d.`nROLLBACK INSTRUCTION: Run .\prepare_ntfs_acl_hardening.ps1 -Rollback to restore original baseline."
+        exit 1
+    }
     
     # 1. Break inheritance on target root (/inheritance:r)
     & icacls "$d" /inheritance:r
@@ -511,8 +567,8 @@ foreach ($d in $TargetDirectories) {
         exit 1
     }
 
-    # 3. Explicitly purge any remaining Users, Authenticated Users, Everyone rules recursively (WITHOUT /c error masking)
-    & icacls "$d" /remove:g "BUILTIN\Users" "NT AUTHORITY\Authenticated Users" "Everyone" /t
+    # 3. Explicitly purge any remaining Users, Authenticated Users, Everyone rules recursively (WITHOUT /c error masking, locale-independent SID literals)
+    & icacls "$d" /remove:g "*$USERS_SID" "*$AUTH_USERS_SID" "*$EVERYONE_SID" /t
     if ($LASTEXITCODE -ne 0) {
         Write-Error "HARDENING FAILED: icacls /remove:g returned exit code $LASTEXITCODE for $d.`nROLLBACK INSTRUCTION: Run .\prepare_ntfs_acl_hardening.ps1 -Rollback to restore original baseline."
         exit 1

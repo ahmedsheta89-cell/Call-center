@@ -86,8 +86,12 @@ export function validateSessionSecretConfig(
     if (trimmed.length < 32) {
       return { valid: false, reason: 'SESSION_SECRET must be at least 32 characters in production' };
     }
-    if (WEAK_SECRETS.has(trimmed.toLowerCase())) {
-      return { valid: false, reason: 'SESSION_SECRET uses a forbidden weak/default value' };
+    if (
+      WEAK_SECRETS.has(trimmed.toLowerCase()) ||
+      /^(REPLACE_WITH|YOUR_|CHANGEME|MY_|DEFAULT|EXAMPLE|TEMPLATE)/i.test(trimmed) ||
+      /(REPLACE_WITH|CHANGEME|PLACEHOLDER)/i.test(trimmed)
+    ) {
+      return { valid: false, reason: 'SESSION_SECRET uses a forbidden weak, default, or unresolved placeholder value' };
     }
   }
   return { valid: true };

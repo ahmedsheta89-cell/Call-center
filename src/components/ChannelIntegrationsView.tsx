@@ -31,7 +31,8 @@ interface ChannelIntegration {
   type: string;
   name: string;
   badge: string;
-  status: 'online' | 'degraded' | 'offline';
+  status: 'online' | 'configured' | 'simulated' | 'degraded' | 'disabled' | 'failed' | 'offline';
+  adapterState?: 'DISABLED' | 'CONFIGURED' | 'CONNECTED' | 'SIMULATED' | 'FAILED';
   accountInfo: Record<string, any>;
   metrics: Record<string, any>;
 }
@@ -249,15 +250,41 @@ export const ChannelIntegrationsView: React.FC = () => {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span
+                      className={`w-2.5 h-2.5 rounded-full ${
+                        chan.status === 'online'
+                          ? 'bg-emerald-400 animate-pulse'
+                          : chan.status === 'configured' || chan.status === 'simulated'
+                          ? 'bg-amber-400'
+                          : chan.status === 'degraded' || chan.status === 'failed'
+                          ? 'bg-rose-400'
+                          : 'bg-slate-500'
+                      }`}
+                    />
                     <span className="text-xs font-bold text-white truncate">{chan.type.toUpperCase()}</span>
                   </div>
-                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-medium">
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded font-medium ${
+                      chan.status === 'online'
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : chan.status === 'configured'
+                        ? 'bg-sky-500/20 text-sky-300'
+                        : chan.status === 'simulated'
+                        ? 'bg-amber-500/20 text-amber-300'
+                        : chan.status === 'degraded' || chan.status === 'failed'
+                        ? 'bg-rose-500/20 text-rose-300'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
                     {chan.status === 'online'
-                      ? 'متصل ونشط'
-                      : chan.status === 'degraded'
-                      ? 'أداء متذبذب'
-                      : 'غير متصل'}
+                      ? 'متصل ومؤكد'
+                      : chan.status === 'configured'
+                      ? 'مهيأ (CONFIGURED)'
+                      : chan.status === 'simulated'
+                      ? 'محاكاة (SIMULATED)'
+                      : chan.status === 'degraded' || chan.status === 'failed'
+                      ? 'تعذر الاتصال (FAILED)'
+                      : 'معطل (DISABLED)'}
                   </span>
                 </div>
                 <div className="text-xs text-slate-300 font-medium truncate">{chan.name}</div>

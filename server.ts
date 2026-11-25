@@ -110,7 +110,14 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`[AI Contact Center OS] Server listening on http://${HOST}:${PORT} (Local-First Zero-Cost Mode)`);
 });
 
-app.use(express.json({ limit: '10mb' }));
+app.use(
+  express.json({
+    limit: '10mb',
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 
 // Immediate Health Check Endpoint (validates fail-closed production secret requirements)

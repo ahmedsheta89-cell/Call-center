@@ -32,10 +32,10 @@ export class TelegramChannelAdapter implements ChannelAdapter {
       allowSimulation,
     };
 
-    if (this.config.botToken) {
-      this.state = 'CONFIGURED';
-    } else if (this.config.allowSimulation) {
+    if (this.config.allowSimulation) {
       this.state = 'SIMULATED';
+    } else if (this.config.botToken) {
+      this.state = 'CONFIGURED';
     } else {
       this.state = 'DISABLED';
     }
