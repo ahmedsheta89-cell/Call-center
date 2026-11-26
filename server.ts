@@ -193,6 +193,7 @@ async function bootstrapModules() {
     { apiRouter },
     { mountLegacyUserRouteClosuresAndApiFallback },
     { initLocalOwnerAuth },
+    { reconcileDurableIdempotencyOnStartup },
   ] = await Promise.all([
     import('./server/db/store.ts'),
     import('./server/db/seed.ts'),
@@ -200,6 +201,7 @@ async function bootstrapModules() {
     import('./server/api/router.ts'),
     import('./server/core/identity.ts'),
     import('./server/core/localAuth.ts'),
+    import('./server/core/durableIdempotency.ts'),
   ]);
 
   // 1. Initialize Seed Data or Load from Persistent Storage
@@ -223,8 +225,14 @@ async function bootstrapModules() {
     ensureEgyptSpecialCustomer();
     ensureAdminUser(); if (!db.saveToDisk()) throw new Error("[Storage] Final bootstrap persistence failed."); canFlushPersistence = true;
 } 
-  // 1.1. Initialize Local Owner Auth Engine
+  // 1.1. Initialize Local Owner Auth Engine & Reconcile Durable Idempotency
   initLocalOwnerAuth(path.dirname(durableDataPath.filePath));
+  const idemReconcile = reconcileDurableIdempotencyOnStartup();
+  if (!idemReconcile.ok) {
+    console.error(`[Idempotency] Startup reconciliation failed fail-closed: ${idemReconcile.error}`);
+    fatalBootstrapShutdown();
+    throw new Error(`[Idempotency] Durable idempotency storage corrupted or untrusted: ${idemReconcile.error}`);
+  }
 
   // 2. ynamic PWA Binary Icon Serving
   ensurePwaIconsGenerated();

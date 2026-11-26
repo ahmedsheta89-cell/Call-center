@@ -23,6 +23,7 @@
     "test:ntfs": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test_ntfs_hardening_script.ps1",
     "test:adapters": "tsx scripts/test_integration_adapters_contracts.ts",
     "test:external-security": "tsx scripts/test_external_integration_security.ts",
+    "test:crash-consistency": "tsx scripts/test_crash_consistent_idempotency.ts",
     "test:release:clean": "tsx scripts/test_clean_release_execution.ts",
     "test:launchers": "tsx scripts/test_windows_launchers.ts",
     "test:e2e:browser": "tsx scripts/test_playwright_e2e.ts",

@@ -338,6 +338,26 @@ class DatabaseStore implements IDataStore {
   public customerFollowUps: Map<UUID, CustomerFollowUp> = new Map();
   public ticketComments: Map<UUID, TicketComment> = new Map();
   public automationRuleExecutions: Map<UUID, AutomationRuleExecution> = new Map();
+  public committedWebhookTxIds: string[] = [];
+
+  public recordCommittedWebhookTx(txId: string): void {
+    if (!txId) return;
+    if (!this.committedWebhookTxIds.includes(txId)) {
+      this.committedWebhookTxIds.push(txId);
+      if (this.committedWebhookTxIds.length > 50000) {
+        this.committedWebhookTxIds = this.committedWebhookTxIds.slice(-50000);
+      }
+    }
+  }
+
+  public hasCommittedWebhookTx(txId: string): boolean {
+    return Boolean(txId) && this.committedWebhookTxIds.includes(txId);
+  }
+
+  public removeCommittedWebhookTx(txId: string): void {
+    if (!txId) return;
+    this.committedWebhookTxIds = this.committedWebhookTxIds.filter((id) => id !== txId);
+  }
 
   // Indexes for high performance tenant filtering
   public orgIndex = {
@@ -1041,6 +1061,7 @@ class DatabaseStore implements IDataStore {
       customerFollowUps: Array.from(this.customerFollowUps.values()),
       ticketComments: Array.from(this.ticketComments.values()),
       automationRuleExecutions: Array.from(this.automationRuleExecutions.values()),
+      committedWebhookTxIds: [...this.committedWebhookTxIds],
       auditEvents,
       auditCheckpoint,
       auditIntegrityManifest,
@@ -1207,6 +1228,7 @@ class DatabaseStore implements IDataStore {
       customerFollowUps: Array.from(this.customerFollowUps.values()),
       ticketComments: Array.from(this.ticketComments.values()),
       automationRuleExecutions: Array.from(this.automationRuleExecutions.values()),
+      committedWebhookTxIds: [...this.committedWebhookTxIds],
       auditEvents,
       auditCheckpoint,
       auditIntegrityManifest,
@@ -1887,6 +1909,11 @@ class DatabaseStore implements IDataStore {
 
       if (stagedAuditEvents !== null && !scopeOrgId) {
         AuditLogger.importEvents(stagedAuditEvents, data.auditCheckpoint);
+        if (Array.isArray(data.committedWebhookTxIds)) {
+          this.committedWebhookTxIds = data.committedWebhookTxIds.filter((x: any) => typeof x === 'string').slice(-50000);
+        } else {
+          this.committedWebhookTxIds = [];
+        }
       }
       if (data.auditIntegrityManifest && typeof data.auditIntegrityManifest === 'object') {
         AuditLogger.recordVerifiedRestoreMetadata(data.auditIntegrityManifest);

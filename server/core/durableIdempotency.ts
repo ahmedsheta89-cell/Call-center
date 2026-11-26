@@ -1,55 +1,99 @@
 /**
  * @file server/core/durableIdempotency.ts
- * Durable, Tenant-Scoped Idempotency & Webhook Replay Protection Store
+ * Crash-Consistent Durable Idempotency & Side-Effect Intent State Machine
  *
- * - Persists keys atomically to disk alongside the primary database state file.
- * - Namespaces keys by organization, provider, and account.
- * - Enforces in-flight concurrency locks to prevent race-condition duplicates.
- * - Fails closed when durable storage is corrupted or unwritable.
- * - Supports retention TTL expiry and two-phase reserve/commit/release so
- *   persistence failures never silently drop unprocessed events.
+ * Lifecycle:
+ *   RESERVED -> PROCESSING / SENDING -> COMMITTED / RELAY_ACCEPTED
+ *   Failure / Crash States: FAILED_SAFE_TO_RETRY | AMBIGUOUS | RECONCILIATION_REQUIRED
+ *
+ * Guarantees:
+ * - Every reservation is persisted atomically to disk BEFORE side effects.
+ * - Unresolved reservations (RESERVED, PROCESSING, SENDING, AMBIGUOUS, RECONCILIATION_REQUIRED)
+ *   NEVER expire merely because normal TTL elapsed.
+ * - Startup/load reconciliation checks db.hasCommittedWebhookTx(txId) for webhooks/SIP
+ *   and blocks automatic resend for interrupted SMTP SENDING intents.
+ * - Fails closed if durable storage is corrupted or unwritable.
  */
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { writeVerifiedAtomicFileSync } from '../db/localPersistenceEngine.ts';
 import { db } from '../db/store.ts';
 
 export const DEFAULT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_IDEMPOTENCY_ENTRIES = 50000;
 
+export type DurableIdempotencyState =
+  | 'RESERVED'
+  | 'PROCESSING'
+  | 'SENDING'
+  | 'COMMITTED'
+  | 'RELAY_ACCEPTED'
+  | 'AMBIGUOUS'
+  | 'FAILED_SAFE_TO_RETRY'
+  | 'RECONCILIATION_REQUIRED';
+
+export type IdempotencyKind = 'webhook' | 'smtp' | 'sip_confirm';
+
 export interface DurableIdempotencyEntry {
-  expiresAt: number;
+  state: DurableIdempotencyState;
+  kind: IdempotencyKind;
+  txId: string;
+  bootId: string;
   createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
   metadata?: Record<string, string | boolean | number>;
 }
 
 interface DurableIdempotencyFile {
-  schemaVersion: 1;
+  schemaVersion: 2;
   entries: Record<string, DurableIdempotencyEntry>;
 }
 
 export interface ReserveResult {
   ok: boolean;
-  reason?: 'DUPLICATE_EVENT' | 'CONCURRENT_IN_FLIGHT' | 'STORAGE_UNTRUSTED';
+  reason?: 'DUPLICATE_EVENT' | 'CONCURRENT_IN_FLIGHT' | 'STORAGE_UNTRUSTED' | 'RECONCILIATION_REQUIRED';
   message?: string;
   existingMetadata?: Record<string, any>;
+  existingState?: DurableIdempotencyState;
 }
 
+const VALID_STATES = new Set<DurableIdempotencyState>([
+  'RESERVED',
+  'PROCESSING',
+  'SENDING',
+  'COMMITTED',
+  'RELAY_ACCEPTED',
+  'AMBIGUOUS',
+  'FAILED_SAFE_TO_RETRY',
+  'RECONCILIATION_REQUIRED',
+]);
+
+const EXPIRABLE_STATES = new Set<DurableIdempotencyState>([
+  'COMMITTED',
+  'RELAY_ACCEPTED',
+  'FAILED_SAFE_TO_RETRY',
+]);
+
+let currentBootId = crypto.randomUUID();
 const inFlightKeys = new Set<string>();
 let overrideIdempotencyFilePath: string | null = null;
 
 /**
- * Allows tests to override the durable idempotency file path explicitly.
+ * Simulates a fresh process boot (used by crash-recovery tests without spawning a new OS process).
  */
+export function simulateProcessRestartForTesting(): void {
+  currentBootId = crypto.randomUUID();
+  inFlightKeys.clear();
+}
+
 export function setIdempotencyFilePathForTesting(filePath: string | null): void {
   overrideIdempotencyFilePath = filePath;
   inFlightKeys.clear();
 }
 
-/**
- * Resolves the durable idempotency file path co-located with the DB persistence file.
- */
 export function getIdempotencyFilePath(): string {
   if (overrideIdempotencyFilePath) {
     return overrideIdempotencyFilePath;
@@ -72,23 +116,37 @@ function getEffectiveTtlMs(customTtlMs?: number): number {
   return DEFAULT_IDEMPOTENCY_TTL_MS;
 }
 
-function loadDurableStoreSync(filePath: string, now: number): DurableIdempotencyFile {
+function isValidEntry(v: any): v is DurableIdempotencyEntry {
+  return (
+    v &&
+    typeof v === 'object' &&
+    !Array.isArray(v) &&
+    VALID_STATES.has(v.state) &&
+    (v.kind === 'webhook' || v.kind === 'smtp' || v.kind === 'sip_confirm') &&
+    typeof v.txId === 'string' &&
+    v.txId.length > 0 &&
+    typeof v.bootId === 'string' &&
+    typeof v.createdAt === 'number' &&
+    typeof v.expiresAt === 'number'
+  );
+}
+
+function loadDurableStoreSync(filePath: string, now: number): { store: DurableIdempotencyFile; dirty: boolean } {
   if (!fs.existsSync(filePath)) {
-    // Verify parent directory is writable before trusting empty initial state
     const dir = path.dirname(filePath);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const probe = path.join(dir, `.idem-probe-${process.pid}-${Date.now()}.tmp`);
     fs.writeFileSync(probe, 'ok', 'utf8');
     fs.unlinkSync(probe);
-    return { schemaVersion: 1, entries: {} };
+    return { store: { schemaVersion: 2, entries: Object.create(null) }, dirty: false };
   }
 
   const raw = fs.readFileSync(filePath, 'utf8');
-  const parsed = JSON.parse(raw) as DurableIdempotencyFile;
+  const parsed = JSON.parse(raw) as any;
   if (
     !parsed ||
     typeof parsed !== 'object' ||
-    parsed.schemaVersion !== 1 ||
+    parsed.schemaVersion !== 2 ||
     !parsed.entries ||
     typeof parsed.entries !== 'object' ||
     Array.isArray(parsed.entries)
@@ -96,36 +154,107 @@ function loadDurableStoreSync(filePath: string, now: number): DurableIdempotency
     throw new Error('IDEMPOTENCY_STORAGE_CORRUPT: Invalid idempotency store schema.');
   }
 
-  // Prune expired entries on load
+  let dirty = false;
   const pruned: Record<string, DurableIdempotencyEntry> = Object.create(null);
-  for (const [k, v] of Object.entries(parsed.entries)) {
-    if (v && typeof v.expiresAt === 'number' && v.expiresAt > now) {
-      pruned[k] = v;
+
+  for (const [k, rawEntry] of Object.entries(parsed.entries)) {
+    if (!isValidEntry(rawEntry)) {
+      throw new Error(`IDEMPOTENCY_STORAGE_CORRUPT: Malformed entry '${k}'.`);
     }
+
+    const entry = { ...rawEntry };
+
+    // Startup reconciliation for unfinished entries from a prior process/boot
+    if (entry.bootId !== currentBootId) {
+      if (entry.kind === 'smtp') {
+        if (entry.state === 'RESERVED') {
+          entry.state = 'FAILED_SAFE_TO_RETRY';
+          entry.updatedAt = now;
+          entry.bootId = currentBootId;
+          dirty = true;
+        } else if (entry.state === 'SENDING') {
+          // Process crashed mid-SMTP send: must NOT automatically resend!
+          entry.state = 'RECONCILIATION_REQUIRED';
+          entry.updatedAt = now;
+          entry.bootId = currentBootId;
+          entry.metadata = { ...(entry.metadata || {}), interruptedInSending: true };
+          dirty = true;
+        }
+      } else if (entry.kind === 'webhook' || entry.kind === 'sip_confirm') {
+        if (entry.state === 'RESERVED' || entry.state === 'PROCESSING') {
+          if (db.hasCommittedWebhookTx(entry.txId)) {
+            // DB snapshot already durably contains this transaction! Promote to COMMITTED.
+            entry.state = 'COMMITTED';
+            entry.updatedAt = now;
+            entry.bootId = currentBootId;
+            entry.metadata = { ...(entry.metadata || {}), reconciledFromDb: true };
+            dirty = true;
+          } else {
+            // DB snapshot does NOT contain this transaction -> never applied, safe for retry.
+            entry.state = 'FAILED_SAFE_TO_RETRY';
+            entry.updatedAt = now;
+            entry.bootId = currentBootId;
+            dirty = true;
+          }
+        }
+      }
+    }
+
+    // NEVER expire unresolved external side-effect reservations merely because TTL elapsed
+    if (EXPIRABLE_STATES.has(entry.state) && entry.expiresAt <= now) {
+      dirty = true;
+      continue;
+    }
+
+    pruned[k] = entry;
   }
-  return { schemaVersion: 1, entries: pruned };
+
+  return { store: { schemaVersion: 2, entries: pruned }, dirty };
 }
 
 function saveDurableStoreSync(filePath: string, data: DurableIdempotencyFile): void {
   const keys = Object.keys(data.entries);
   if (keys.length > MAX_IDEMPOTENCY_ENTRIES) {
-    // Evict oldest entries by createdAt
-    keys.sort((a, b) => (data.entries[a]?.createdAt || 0) - (data.entries[b]?.createdAt || 0));
-    const toRemove = keys.length - MAX_IDEMPOTENCY_ENTRIES;
-    for (let i = 0; i < toRemove; i++) {
-      delete data.entries[keys[i]];
+    // Only evict oldest COMPLETED/EXPIRABLE entries; preserve unresolved reservations
+    const expirableKeys = keys
+      .filter((k) => EXPIRABLE_STATES.has(data.entries[k].state))
+      .sort((a, b) => (data.entries[a]?.createdAt || 0) - (data.entries[b]?.createdAt || 0));
+    const overflow = keys.length - MAX_IDEMPOTENCY_ENTRIES;
+    for (let i = 0; i < Math.min(overflow, expirableKeys.length); i++) {
+      delete data.entries[expirableKeys[i]];
     }
   }
   writeVerifiedAtomicFileSync(filePath, JSON.stringify(data));
 }
 
 /**
- * Phase 1: Checks durable storage and in-flight locks, reserving the given keys in memory.
- * Fails closed if durable storage is corrupted or unwritable.
+ * Reconciles any unfinished reservations on startup against the durable DB snapshot.
+ * Fails closed if idempotency storage is corrupted or unreadable.
+ */
+export function reconcileDurableIdempotencyOnStartup(): {
+  ok: boolean;
+  reconciledEntries: number;
+  error?: string;
+} {
+  try {
+    const filePath = getIdempotencyFilePath();
+    const now = Date.now();
+    const { store, dirty } = loadDurableStoreSync(filePath, now);
+    if (dirty) {
+      saveDurableStoreSync(filePath, store);
+    }
+    return { ok: true, reconciledEntries: Object.keys(store.entries).length };
+  } catch (err: any) {
+    return { ok: false, reconciledEntries: 0, error: err?.message || 'Reconciliation failed' };
+  }
+}
+
+/**
+ * Phase 1: Durably persists a RESERVED entry to disk BEFORE any side effects occur.
  */
 export function reserveDurableIdempotencyKeys(
   keys: string[],
-  customTtlMs?: number
+  options?: { kind?: IdempotencyKind; txId?: string; ttlMs?: number; metadata?: Record<string, string | boolean | number> }
 ): ReserveResult {
   if (keys.length === 0) {
     return { ok: true };
@@ -141,12 +270,16 @@ export function reserveDurableIdempotencyKeys(
     }
   }
 
-  let filePath: string;
-  let store: DurableIdempotencyFile;
   const now = Date.now();
+  const ttlMs = getEffectiveTtlMs(options?.ttlMs);
+  const kind: IdempotencyKind = options?.kind || 'webhook';
+  const txId = options?.txId || crypto.randomUUID();
+
+  let filePath: string;
+  let loaded: { store: DurableIdempotencyFile; dirty: boolean };
   try {
     filePath = getIdempotencyFilePath();
-    store = loadDurableStoreSync(filePath, now);
+    loaded = loadDurableStoreSync(filePath, now);
   } catch (err: any) {
     return {
       ok: false,
@@ -156,78 +289,142 @@ export function reserveDurableIdempotencyKeys(
   }
 
   for (const key of keys) {
-    const existing = store.entries[key];
-    if (existing && existing.expiresAt > now) {
+    const existing = loaded.store.entries[key];
+    if (!existing) continue;
+
+    if (existing.state === 'AMBIGUOUS' || existing.state === 'RECONCILIATION_REQUIRED') {
+      return {
+        ok: false,
+        reason: 'RECONCILIATION_REQUIRED',
+        message: `Operation '${key}' is in state '${existing.state}'; automatic retry is blocked pending reconciliation.`,
+        existingMetadata: existing.metadata,
+        existingState: existing.state,
+      };
+    }
+
+    if (existing.state === 'RESERVED' || existing.state === 'PROCESSING' || existing.state === 'SENDING') {
+      return {
+        ok: false,
+        reason: 'CONCURRENT_IN_FLIGHT',
+        message: `Operation '${key}' is already '${existing.state}'.`,
+        existingMetadata: existing.metadata,
+        existingState: existing.state,
+      };
+    }
+
+    if ((existing.state === 'COMMITTED' || existing.state === 'RELAY_ACCEPTED') && existing.expiresAt > now) {
       return {
         ok: false,
         reason: 'DUPLICATE_EVENT',
         message: 'Duplicate or replayed event rejected.',
         existingMetadata: existing.metadata,
+        existingState: existing.state,
       };
     }
   }
 
-  // Reserve in memory while processing proceeds
+  try {
+    for (const key of keys) {
+      loaded.store.entries[key] = {
+        state: 'RESERVED',
+        kind,
+        txId,
+        bootId: currentBootId,
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: now + ttlMs,
+        metadata: options?.metadata,
+      };
+    }
+    saveDurableStoreSync(filePath, loaded.store);
+  } catch (err: any) {
+    return {
+      ok: false,
+      reason: 'STORAGE_UNTRUSTED',
+      message: `Fail-closed: could not persist durable reservation (${err?.message || 'write error'}).`,
+    };
+  }
+
   for (const key of keys) {
     inFlightKeys.add(key);
   }
-  // Ensure unused param lint doesn't complain; ttl used on commit
-  void getEffectiveTtlMs(customTtlMs);
   return { ok: true };
 }
 
 /**
- * Phase 2: Atomically commits reserved keys to durable storage and releases in-flight locks.
- * Throws if durable persistence fails so the caller can fail closed.
+ * Transitions reserved keys to a new durable state on disk (`PROCESSING`, `SENDING`, `COMMITTED`, `RELAY_ACCEPTED`, `AMBIGUOUS`, `FAILED_SAFE_TO_RETRY`, `RECONCILIATION_REQUIRED`).
  */
-export function commitDurableIdempotencyKeys(
+export function transitionDurableIdempotencyState(
   keys: string[],
+  nextState: DurableIdempotencyState,
   options?: { ttlMs?: number; metadata?: Record<string, string | boolean | number> }
 ): void {
   if (keys.length === 0) return;
 
   const now = Date.now();
   const ttlMs = getEffectiveTtlMs(options?.ttlMs);
+  const shouldReleaseInFlight =
+    nextState === 'COMMITTED' ||
+    nextState === 'RELAY_ACCEPTED' ||
+    nextState === 'AMBIGUOUS' ||
+    nextState === 'FAILED_SAFE_TO_RETRY' ||
+    nextState === 'RECONCILIATION_REQUIRED';
 
   try {
     const filePath = getIdempotencyFilePath();
-    const store = loadDurableStoreSync(filePath, now);
+    const { store } = loadDurableStoreSync(filePath, now);
     for (const key of keys) {
+      const existing = store.entries[key];
+      if (!existing) {
+        throw new Error(`IDEMPOTENCY_TRANSITION_ERROR: Missing reservation for '${key}'.`);
+      }
       store.entries[key] = {
-        createdAt: now,
-        expiresAt: now + ttlMs,
-        metadata: options?.metadata,
+        ...existing,
+        state: nextState,
+        bootId: currentBootId,
+        updatedAt: now,
+        expiresAt: EXPIRABLE_STATES.has(nextState) ? now + ttlMs : existing.expiresAt,
+        metadata: options?.metadata ? { ...(existing.metadata || {}), ...options.metadata } : existing.metadata,
       };
     }
     saveDurableStoreSync(filePath, store);
   } finally {
+    if (shouldReleaseInFlight) {
+      for (const key of keys) {
+        inFlightKeys.delete(key);
+      }
+    }
+  }
+}
+
+export function commitDurableIdempotencyKeys(
+  keys: string[],
+  options?: { ttlMs?: number; metadata?: Record<string, string | boolean | number> }
+): void {
+  transitionDurableIdempotencyState(keys, 'COMMITTED', options);
+}
+
+export function releaseDurableIdempotencyKeys(keys: string[]): void {
+  try {
+    transitionDurableIdempotencyState(keys, 'FAILED_SAFE_TO_RETRY');
+  } catch {
     for (const key of keys) {
       inFlightKeys.delete(key);
     }
   }
 }
 
-/**
- * Releases in-flight locks without committing when processing fails before completion,
- * allowing safe retries without losing events.
- */
-export function releaseDurableIdempotencyKeys(keys: string[]): void {
-  for (const key of keys) {
-    inFlightKeys.delete(key);
-  }
-}
-
-/**
- * Reads a durable idempotency record if present and unexpired.
- * Throws if durable storage is corrupted or unreadable (fail-closed).
- */
 export function lookupDurableIdempotencyKey(key: string): DurableIdempotencyEntry | null {
   const now = Date.now();
   const filePath = getIdempotencyFilePath();
-  const store = loadDurableStoreSync(filePath, now);
-  const entry = store.entries[key];
-  if (entry && entry.expiresAt > now) {
-    return entry;
+  const { store, dirty } = loadDurableStoreSync(filePath, now);
+  if (dirty) {
+    saveDurableStoreSync(filePath, store);
   }
-  return null;
+  const entry = store.entries[key];
+  if (!entry) return null;
+  if (EXPIRABLE_STATES.has(entry.state) && entry.expiresAt <= now) {
+    return null;
+  }
+  return entry;
 }

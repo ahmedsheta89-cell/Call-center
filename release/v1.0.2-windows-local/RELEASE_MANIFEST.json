@@ -1,7 +1,7 @@
 {
   "releaseVersion": "1.0.2",
   "releaseTag": "v1.0.2-windows-local",
-  "buildTimestamp": "2026-11-25T05:10:12.077Z",
+  "buildTimestamp": "2026-11-26T18:44:29.701Z",
   "targetPlatform": "Windows 10 / Windows 11 / Windows Server 2019/2022",
   "runtimeRequirements": {
     "node": ">=22.0.0",
@@ -10,8 +10,8 @@
     "networkBinding": "127.0.0.1 (Strict Loopback / Zero Cloud Exposure)"
   },
   "totalFiles": 22,
-  "totalSizeBytes": 7868516,
-  "totalSizeMB": 7.5,
+  "totalSizeBytes": 7880160,
+  "totalSizeMB": 7.52,
   "fileInventory": {
     ".env.example": {
       "sizeBytes": 2024,
@@ -74,12 +74,12 @@
       "sha256": "209c89a1434f9012dac6de78f07f9f78278b911a5d7622f1c1e5369bb74e1d9e"
     },
     "dist-server/server.cjs": {
-      "sizeBytes": 5632511,
-      "sha256": "d54578d799d2cd60f16f603deb4bdd403a69de6591bae5297acfb1509f02ec73"
+      "sizeBytes": 5644072,
+      "sha256": "f9175e33488d029d792359c204087af936522b2489eb538f36f7954106fec4a9"
     },
     "package.json": {
-      "sizeBytes": 2764,
-      "sha256": "03b02ebfe20b40407e240e8605961145a634e0f407daf3adc6e9b3afb5a52b5f"
+      "sizeBytes": 2847,
+      "sha256": "196760f1dc71409ac76c7e8c0f3c4cca02fe36646d8dcddf08e0d20d240ea1c3"
     },
     "prepare_ntfs_acl_hardening.ps1": {
       "sizeBytes": 30695,

@@ -5,6 +5,7 @@
  */
 
 import express from 'express';
+import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -153,6 +154,8 @@ async function runComprehensiveEnterpriseAudit() {
   const server = app.listen(0);
   server.keepAliveTimeout = 120_000;
   server.headersTimeout = 125_000;
+  server.requestTimeout = 0;
+  server.setTimeout(0);
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 3099;
   const rootUrl = `http://127.0.0.1:${port}`;
@@ -2059,10 +2062,24 @@ async function runComprehensiveEnterpriseAudit() {
         }),
       });
       const validSnapshotSyncJson = await validSnapshotSyncRes.json();
-      const exportBundleRes = await fetch(`${baseUrl}/github/export-bundle`, {
-        headers: authHeaders(adminSession.token),
+      const exportBundleJson: any = await new Promise((resolve, reject) => {
+        const req = http.get(
+          `${baseUrl}/github/export-bundle`,
+          { headers: { ...authHeaders(adminSession.token), Connection: 'keep-alive' } },
+          (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on('data', (c: Buffer) => chunks.push(c));
+          resp.on('error', reject);
+          resp.on('end', () => {
+            try {
+              resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            } catch (e) {
+              reject(e);
+            }
+          });
+        });
+        req.on('error', reject);
       });
-      const exportBundleJson = await exportBundleRes.json();
       const ciYamlContent = fs.readFileSync(path.join(process.cwd(), '.github', 'workflows', 'ci.yml'), 'utf-8');
       const hasPackageLock = fs.existsSync(path.join(process.cwd(), 'package-lock.json'));
       const ciHasBrokenNpmCache =

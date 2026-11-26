@@ -59,6 +59,7 @@ import { initializeIntegrationAdapters } from '../modules/integrations/init.ts';
 import { IntegrationRegistry } from '../modules/integrations/registry.ts';
 import {
   reserveDurableIdempotencyKeys,
+  transitionDurableIdempotencyState,
   commitDurableIdempotencyKeys,
   releaseDurableIdempotencyKeys,
 } from '../core/durableIdempotency.ts';
@@ -1722,7 +1723,8 @@ apiRouter.post(
     ];
     if (eventId) replayKeys.push(`sip_confirm:${orgId}:${accountId}:evt:${eventId}`);
 
-    const reserve = reserveDurableIdempotencyKeys(replayKeys);
+    const sipTxId = crypto.randomUUID();
+    const reserve = reserveDurableIdempotencyKeys(replayKeys, { kind: 'sip_confirm', txId: sipTxId });
     if (!reserve.ok) {
       if (reserve.reason === 'STORAGE_UNTRUSTED') {
         res.status(503).json({
@@ -1742,8 +1744,10 @@ apiRouter.post(
     const prevDisposition = call.disposition;
     const prevTranscript = call.transcript;
     const prevProviderSessionId = call.providerSessionId;
+    let sipDbPersisted = false;
 
     try {
+      transitionDurableIdempotencyState(replayKeys, 'PROCESSING');
       const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceConfig, false);
       if (sipAdapter.getState() === 'DISABLED') {
         releaseDurableIdempotencyKeys(replayKeys);
@@ -1758,10 +1762,12 @@ apiRouter.post(
         ? await sipAdapter.confirmCallConnected(call.id, providerSessionId)
         : call;
 
+      db.recordCommittedWebhookTx(sipTxId);
       const persisted = db.saveToDisk();
       if (!persisted) {
         throw new Error('Failed to persist confirmed call state to disk.');
       }
+      sipDbPersisted = true;
       commitDurableIdempotencyKeys(replayKeys, { metadata: { callId: call.id, providerSessionId } });
 
       EventBus.publish('call:event', { action: 'confirm', call: confirmedCall });
@@ -1781,12 +1787,15 @@ apiRouter.post(
 
       res.json({ success: true, data: confirmedCall });
     } catch (err: any) {
-      call.status = prevStatus;
-      call.disposition = prevDisposition;
-      call.transcript = prevTranscript;
-      call.providerSessionId = prevProviderSessionId;
-      db.calls.set(call.id, call);
-      releaseDurableIdempotencyKeys(replayKeys);
+      if (!sipDbPersisted) {
+        db.removeCommittedWebhookTx(sipTxId);
+        call.status = prevStatus;
+        call.disposition = prevDisposition;
+        call.transcript = prevTranscript;
+        call.providerSessionId = prevProviderSessionId;
+        db.calls.set(call.id, call);
+        releaseDurableIdempotencyKeys(replayKeys);
+      }
       res.status(503).json({
         success: false,
         error: { code: 'PERSISTENCE_FAILED', message: err?.message || 'Failed to persist confirmation.' },
@@ -3455,9 +3464,10 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
   const accountKey = resolveWebhookAccountKey(channelType, storedConfig || {});
   const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
   const rawDigestKey = `wh:${orgId}:${channelType}:${accountKey}:sha256:${rawDigest}`;
+  const txId = crypto.randomUUID();
 
   // First check raw payload digest (exact duplicate payload replay)
-  const rawReserve = reserveDurableIdempotencyKeys([rawDigestKey]);
+  const rawReserve = reserveDurableIdempotencyKeys([rawDigestKey], { kind: 'webhook', txId });
   if (!rawReserve.ok) {
     if (rawReserve.reason === 'STORAGE_UNTRUSTED') {
       res.status(503).json({
@@ -3495,7 +3505,7 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
       continue;
     }
     const evtKey = `wh:${orgId}:${channelType}:${accountKey}:evt:${item.eventId}`;
-    const itemRes = reserveDurableIdempotencyKeys([evtKey]);
+    const itemRes = reserveDurableIdempotencyKeys([evtKey], { kind: 'webhook', txId });
     if (!itemRes.ok) {
       if (itemRes.reason === 'STORAGE_UNTRUSTED') {
         releaseDurableIdempotencyKeys([rawDigestKey, ...acceptedItems.flatMap((a) => a.keys)]);
@@ -3533,14 +3543,21 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
   }
 
   const allReservedKeys = [rawDigestKey, ...acceptedItems.flatMap((a) => a.keys)];
+  const faultInject = process.env.NODE_ENV === 'test' ? process.env.OMNIFLOW_TEST_FAULT_INJECT : undefined;
   const processedResults: Array<{ messageId: string; conversationId: string; customerId: string; messageStatus: string }> = [];
   const createdCustomerIds: string[] = [];
   const createdConvIds: string[] = [];
   const prevConvSnapshots: Array<{ id: string; lastMessageAt: string; intent: any; sentiment: any }> = [];
   const createdMsgIds: string[] = [];
   const pendingEvents: Array<{ conv: Conversation; msg: UnifiedMessage; phone: string; text: string }> = [];
+  let dbPersisted = false;
 
   try {
+    if (faultInject === 'CRASH_AFTER_RESERVE') {
+      throw new Error('FAULT_INJECT: CRASH_AFTER_RESERVE');
+    }
+
+    transitionDurableIdempotencyState(allReservedKeys, 'PROCESSING');
     for (const item of acceptedItems) {
       const normalizedMsg = await adapter.normalizeInboundMessage(item.itemPayload, orgId);
       const phone = normalizedMsg.sender?.id?.replace(/^cust-[^-]+-/, '') || verification.senderIdentifier || normalizedMsg.customerId;
@@ -3643,10 +3660,21 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
       });
     }
 
+    if (faultInject === 'CRASH_AFTER_MEMORY_MUTATE' || faultInject === 'CRASH_BEFORE_DB_SAVE') {
+      throw new Error(`FAULT_INJECT: ${faultInject}`);
+    }
+
+    db.recordCommittedWebhookTx(txId);
     const persisted = db.saveToDisk();
     if (!persisted) {
       throw new Error('Failed to persist webhook messages to durable storage.');
     }
+    dbPersisted = true;
+
+    if (faultInject === 'CRASH_AFTER_DB_SAVE' || faultInject === 'FAIL_IDEMPOTENCY_COMMIT') {
+      throw new Error(`FAULT_INJECT: ${faultInject}`);
+    }
+
     commitDurableIdempotencyKeys(allReservedKeys, {
       metadata: { channel: channelType, processedCount: processedResults.length },
     });
@@ -3688,19 +3716,22 @@ const handleIncomingWebhook = async (req: Request, res: Response) => {
       },
     });
   } catch (err: any) {
-    // Rollback in-memory mutations if durable persistence failed
-    for (const mid of createdMsgIds) db.messages.delete(mid);
-    for (const cid of createdConvIds) db.conversations.delete(cid);
-    for (const snap of prevConvSnapshots) {
-      const c = db.conversations.get(snap.id);
-      if (c) {
-        c.lastMessageAt = snap.lastMessageAt;
-        c.intent = snap.intent;
-        c.sentiment = snap.sentiment;
+    if (!dbPersisted) {
+      // Rollback in-memory mutations only when DB snapshot was NOT durably persisted
+      db.removeCommittedWebhookTx(txId);
+      for (const mid of createdMsgIds) db.messages.delete(mid);
+      for (const cid of createdConvIds) db.conversations.delete(cid);
+      for (const snap of prevConvSnapshots) {
+        const c = db.conversations.get(snap.id);
+        if (c) {
+          c.lastMessageAt = snap.lastMessageAt;
+          c.intent = snap.intent;
+          c.sentiment = snap.sentiment;
+        }
       }
+      for (const cuid of createdCustomerIds) db.customers.delete(cuid);
+      releaseDurableIdempotencyKeys(allReservedKeys);
     }
-    for (const cuid of createdCustomerIds) db.customers.delete(cuid);
-    releaseDurableIdempotencyKeys(allReservedKeys);
     res.status(503).json({
       success: false,
       error: {

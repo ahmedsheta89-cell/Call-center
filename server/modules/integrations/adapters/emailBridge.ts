@@ -26,7 +26,7 @@ import {
 } from '../contracts.ts';
 import {
   reserveDurableIdempotencyKeys,
-  commitDurableIdempotencyKeys,
+  transitionDurableIdempotencyState,
   releaseDurableIdempotencyKeys,
   lookupDurableIdempotencyKey,
 } from '../../../core/durableIdempotency.ts';
@@ -328,22 +328,31 @@ export class EmailChannelAdapter implements ChannelAdapter {
     const orgId = message.organizationId || 'default-org';
     const rawKey = String(message.metadata?.idempotencyKey || message.id);
     const durableKey = `smtp:${orgId}:${this.config.smtpHost}:${this.config.smtpUser}:${rawKey}`;
+    const txId = crypto.randomUUID();
 
     try {
       const existing = lookupDurableIdempotencyKey(durableKey);
       if (existing) {
-        if (existing.metadata?.ambiguous === true) {
-          this.lastErrorCode = 'SMTP_RESPONSE_AMBIGUOUS_BLOCKED_RETRY';
+        if (
+          existing.state === 'AMBIGUOUS' ||
+          existing.state === 'RECONCILIATION_REQUIRED' ||
+          existing.state === 'SENDING' ||
+          existing.state === 'RESERVED' ||
+          existing.metadata?.ambiguous === true
+        ) {
+          this.lastErrorCode = 'SMTP_RECONCILIATION_REQUIRED';
           this.lastError =
-            'Previous SMTP attempt transmitted DATA but lost server response; refusing automatic resend to prevent duplicate delivery.';
+            `Existing SMTP intent is in state '${existing.state}'; refusing automatic resend to prevent duplicate delivery.`;
           return { externalMessageId: '', status: 'failed', relayAccepted: false, inboxDeliveryConfirmed: false };
         }
-        return {
-          externalMessageId: String(existing.metadata?.externalMessageId || ''),
-          status: 'sent',
-          relayAccepted: true,
-          inboxDeliveryConfirmed: false,
-        };
+        if (existing.state === 'RELAY_ACCEPTED' || existing.state === 'COMMITTED') {
+          return {
+            externalMessageId: String(existing.metadata?.externalMessageId || ''),
+            status: 'sent',
+            relayAccepted: true,
+            inboxDeliveryConfirmed: false,
+          };
+        }
       }
     } catch (err: any) {
       this.lastErrorCode = 'IDEMPOTENCY_STORAGE_UNTRUSTED';
@@ -351,10 +360,30 @@ export class EmailChannelAdapter implements ChannelAdapter {
       return { externalMessageId: '', status: 'failed' };
     }
 
-    const reserve = reserveDurableIdempotencyKeys([durableKey]);
+    // Step 1: Persist durable RESERVED intent BEFORE any SMTP side effects
+    const reserve = reserveDurableIdempotencyKeys([durableKey], {
+      kind: 'smtp',
+      txId,
+      metadata: { recipient: toAddr },
+    });
     if (!reserve.ok) {
-      this.lastErrorCode = reserve.reason;
-      this.lastError = reserve.message;
+      this.lastErrorCode = reserve.reason || 'RESERVE_FAILED';
+      this.lastError = reserve.message || 'Failed to reserve durable SMTP sending intent.';
+      return { externalMessageId: '', status: 'failed' };
+    }
+
+    const faultInject = process.env.NODE_ENV === 'test' ? process.env.OMNIFLOW_TEST_FAULT_INJECT : undefined;
+    if (faultInject === 'SMTP_CRASH_AFTER_RESERVE') {
+      throw new Error('FAULT_INJECT: SMTP_CRASH_AFTER_RESERVE');
+    }
+
+    // Step 2: Transition durable intent to SENDING BEFORE calling transporter.sendMail()
+    try {
+      transitionDurableIdempotencyState([durableKey], 'SENDING');
+    } catch (err: any) {
+      releaseDurableIdempotencyKeys([durableKey]);
+      this.lastErrorCode = 'IDEMPOTENCY_STORAGE_UNTRUSTED';
+      this.lastError = redactPasswordFromError(err?.message || 'Failed to persist SENDING intent', this.config.smtpPass);
       return { externalMessageId: '', status: 'failed' };
     }
 
@@ -371,6 +400,10 @@ export class EmailChannelAdapter implements ChannelAdapter {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const transporter = this.createTransporter();
       try {
+        if (faultInject === 'SMTP_CRASH_BEFORE_DATA') {
+          throw Object.assign(new Error('FAULT_INJECT: SMTP_CRASH_BEFORE_DATA'), { code: 'ECONNRESET', command: 'DATA' });
+        }
+
         const info = await transporter.sendMail({
           from: fromAddr,
           to: toAddr,
@@ -383,12 +416,20 @@ export class EmailChannelAdapter implements ChannelAdapter {
           },
         });
 
+        if (faultInject === 'SMTP_CRASH_AFTER_DATA') {
+          throw Object.assign(new Error('FAULT_INJECT: SMTP_CRASH_AFTER_DATA'), { code: 'ECONNRESET', command: 'DATA' });
+        }
+
         const capturedMessageId = String(info.messageId || '').trim();
         if (!capturedMessageId) {
           throw new Error('SMTP server accepted message without returning a provider messageId');
         }
 
-        commitDurableIdempotencyKeys([durableKey], {
+        if (faultInject === 'SMTP_FAIL_COMMIT_AFTER_RELAY') {
+          throw Object.assign(new Error('FAULT_INJECT: SMTP_FAIL_COMMIT_AFTER_RELAY'), { isCommitFailure: true });
+        }
+
+        transitionDurableIdempotencyState([durableKey], 'RELAY_ACCEPTED', {
           metadata: {
             externalMessageId: capturedMessageId,
             relayAccepted: true,
@@ -406,15 +447,29 @@ export class EmailChannelAdapter implements ChannelAdapter {
           inboxDeliveryConfirmed: false,
         };
       } catch (err: any) {
+        if (err?.isCommitFailure) {
+          // Relay accepted, but commit write failed: transition to RECONCILIATION_REQUIRED / retain SENDING
+          try {
+            transitionDurableIdempotencyState([durableKey], 'RECONCILIATION_REQUIRED', {
+              metadata: { relayAcceptedCommitFailed: true },
+            });
+          } catch {
+            // Leave SENDING on disk; startup reconciler will block automatic resend
+          }
+          this.lastErrorCode = 'SMTP_COMMIT_FAILED_AFTER_RELAY';
+          this.lastError = 'SMTP relay accepted message, but durable commit failed; automatic resend blocked.';
+          this.state = 'FAILED';
+          return { externalMessageId: '', status: 'failed', relayAccepted: true, inboxDeliveryConfirmed: false };
+        }
+
         lastClassified = classifySmtpError(err, this.config.smtpPass);
         if (lastClassified.ambiguousPostData) {
-          // Record ambiguous post-DATA state durably so retries do not duplicate an accepted message
           try {
-            commitDurableIdempotencyKeys([durableKey], {
+            transitionDurableIdempotencyState([durableKey], 'AMBIGUOUS', {
               metadata: { ambiguous: true, errorCode: lastClassified.code },
             });
           } catch {
-            releaseDurableIdempotencyKeys([durableKey]);
+            // Leave SENDING on disk
           }
           break;
         }

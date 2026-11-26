@@ -50,6 +50,9 @@ jobs:
       - name: Run External Webhook Auth, Real SMTP & SIP Lifecycle Security Suite
         run: npm run test:external-security
 
+      - name: Run Crash-Consistent Idempotency, Webhook & SMTP Recovery Suite
+        run: npm run test:crash-consistency
+
       - name: Run Phase 2 Security & Auth Lockdown Suite
         run: npm run test:security
 
