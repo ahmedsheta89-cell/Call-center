@@ -3,7 +3,7 @@
  * Frontend Client Types for AI Contact Center OS
  */
 
-export type ChannelType = 'whatsapp' | 'webchat' | 'voice' | 'email' | 'messenger' | 'instagram' | 'sms';
+export type ChannelType = 'whatsapp' | 'webchat' | 'voice' | 'email' | 'messenger' | 'instagram' | 'sms' | 'telegram';
 export type CustomerTier = 'standard' | 'priority' | 'vip';
 export type PriorityType = 'low' | 'medium' | 'high' | 'urgent';
 export type SLAStatus = 'healthy' | 'warning' | 'at_risk' | 'breached';

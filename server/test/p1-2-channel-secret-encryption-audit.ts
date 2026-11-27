@@ -233,7 +233,8 @@ export async function runPhaseP12AcceptanceSuite(options?: {
       memWa === undefined &&
       memVoice === undefined &&
       peerWa === undefined &&
-      waItem?.status === 'unconfigured' &&
+      waItem?.status === 'disabled' &&
+      waItem?.adapterState === 'DISABLED' &&
       Object.keys(waItem?.accountInfo || {}).length === 0 &&
       !diskMarkerFound;
 
@@ -845,7 +846,8 @@ export async function runPhaseP12AcceptanceSuite(options?: {
       at10MemConfig?.apiToken !== undefined ||
       at10MemConfig?.credentialsConfigured !== false ||
       at10MemConfig?.verified !== false ||
-      at10WaChannel?.status !== 'unconfigured'
+      at10WaChannel?.status !== 'disabled' ||
+      at10WaChannel?.adapterState !== 'DISABLED'
     ) {
       throw new Error('[AT-10] Restore into fresh environment failed to mark channel unconfigured');
     }
@@ -855,7 +857,7 @@ export async function runPhaseP12AcceptanceSuite(options?: {
       id: 'AT-10',
       title: 'استعادة نسخة منقحة إلى بيئة لا تحتوي السر تترك القناة غير مضبوطة بوضوح دون إنشاء سر وهمي',
       passed: true,
-      evidenceSummary: `Non-secret wabaId/phoneNumberId restored; apiToken=undefined; credentialsConfigured=false; status="unconfigured"; unconfiguredChannels=["chan-whatsapp"]`,
+      evidenceSummary: `Non-secret wabaId/phoneNumberId restored; apiToken=undefined; credentialsConfigured=false; status="disabled" (adapterState="DISABLED"); unconfiguredChannels=["chan-whatsapp"]`,
       readAfterDeleteVerified: at10Clean,
     });
 

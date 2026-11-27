@@ -13,7 +13,7 @@ export const users = pgTable('users', {
   uid: text('uid').notNull().unique(), // Firebase Auth UID
   email: text('email').notNull(),
   displayName: text('display_name'),
-  phoneNumber: text('phone_number').default('01018108979'),
+  phoneNumber: text('phone_number'),
   role: text('role').default('agent').notNull(),
   teamName: text('team_name').default('فريق العمليات الرئيسي'),
   status: text('status').default('online').notNull(),

@@ -1,9 +1,9 @@
 /**
  * @file src/components/TicketsManager.tsx
- * Comprehensive Tickets & SLA Monitoring Console
+ * Comprehensive Tickets & SLA Monitoring Console with Live Status Transitions & Comments
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Ticket as TicketIcon,
   AlertTriangle,
@@ -17,6 +17,10 @@ import {
   Download,
   Search,
   CheckCheck,
+  MessageSquare,
+  Send,
+  X,
+  Check,
 } from 'lucide-react';
 import { Ticket, Customer } from '../types.ts';
 
@@ -34,13 +38,23 @@ interface TicketsManagerProps {
   userRole: string;
 }
 
+interface TicketCommentItem {
+  id: string;
+  authorName: string;
+  authorRole: string;
+  body: string;
+  isInternal: boolean;
+  createdAt: string;
+}
+
 export const TicketsManager: React.FC<TicketsManagerProps> = ({
-  tickets,
+  tickets: initialTickets,
   customers,
   onCreateTicket,
   onEscalateTicket,
   userRole,
 }) => {
+  const [localTickets, setLocalTickets] = useState<Ticket[]>(initialTickets);
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -52,7 +66,25 @@ export const TicketsManager: React.FC<TicketsManagerProps> = ({
   const [newCategory, setNewCategory] = useState('الدعم الفني والشبكات');
   const [newCustomerId, setNewCustomerId] = useState(customers[0]?.id || '');
 
-  const filteredTickets = tickets.filter((t) => {
+  // Comments Modal State
+  const [activeCommentTicket, setActiveCommentTicket] = useState<Ticket | null>(null);
+  const [comments, setComments] = useState<TicketCommentItem[]>([]);
+  const [loadingComments, setLoadingComments] = useState(false);
+  const [newCommentBody, setNewCommentBody] = useState('');
+  const [newCommentIsInternal, setNewCommentIsInternal] = useState(false);
+  const [submittingComment, setSubmittingComment] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLocalTickets(initialTickets);
+  }, [initialTickets]);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3500);
+  };
+
+  const filteredTickets = localTickets.filter((t) => {
     const matchesStatus = statusFilter === 'all' || t.status === statusFilter;
     const matchesSearch =
       !searchQuery.trim() ||
@@ -64,10 +96,88 @@ export const TicketsManager: React.FC<TicketsManagerProps> = ({
   });
 
   // Calculate high-level SLA metrics
-  const totalCount = tickets.length;
-  const newCount = tickets.filter((t) => t.status === 'new').length;
-  const inProgressCount = tickets.filter((t) => t.status === 'in_progress').length;
-  const atRiskCount = tickets.filter((t) => t.slaStatus === 'at_risk' || t.slaStatus === 'warning').length;
+  const totalCount = localTickets.length;
+  const newCount = localTickets.filter((t) => t.status === 'new').length;
+  const inProgressCount = localTickets.filter((t) => t.status === 'in_progress').length;
+  const atRiskCount = localTickets.filter((t) => t.slaStatus === 'at_risk' || t.slaStatus === 'warning').length;
+
+  const handleStatusChange = async (ticketId: string, newStatus: string) => {
+    setLocalTickets((prev) =>
+      prev.map((t) => (t.id === ticketId ? { ...t, status: newStatus as any } : t))
+    );
+    try {
+      await fetch(`/api/v1/tickets/${ticketId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      showToast(`تم تحديث حالة التذكرة إلى: ${newStatus}`);
+    } catch {
+      showToast('تعذر تحديث حالة التذكرة في السيرفر');
+    }
+  };
+
+  const handleAssignChange = async (ticketId: string, agentId: string, agentName: string) => {
+    setLocalTickets((prev) =>
+      prev.map((t) => (t.id === ticketId ? { ...t, assignedToAgentId: agentId, assignedAgentName: agentName } : t))
+    );
+    try {
+      await fetch(`/api/v1/tickets/${ticketId}/assign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId, agentName }),
+      });
+      showToast(`تم إسناد التذكرة إلى: ${agentName}`);
+    } catch {
+      showToast('تعذر إسناد التذكرة في السيرفر');
+    }
+  };
+
+  const openCommentsModal = async (ticket: Ticket) => {
+    setActiveCommentTicket(ticket);
+    setLoadingComments(true);
+    try {
+      const res = await fetch(`/api/v1/tickets/${ticket.id}/comments`);
+      const data = await res.json();
+      if (data.success && Array.isArray(data.data)) {
+        setComments(data.data);
+      } else {
+        setComments([]);
+      }
+    } catch {
+      setComments([]);
+    } finally {
+      setLoadingComments(false);
+    }
+  };
+
+  const handleAddComment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCommentTicket || !newCommentBody.trim()) return;
+    setSubmittingComment(true);
+    try {
+      const res = await fetch(`/api/v1/tickets/${activeCommentTicket.id}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          body: newCommentBody.trim(),
+          isInternal: newCommentIsInternal,
+        }),
+      });
+      const data = await res.json();
+      if (data.success && data.data) {
+        setComments((prev) => [...prev, data.data]);
+        setNewCommentBody('');
+        showToast('تمت إضافة التعليق بنجاح');
+      } else {
+        showToast(data.error?.message || 'فشل حفظ التعليق');
+      }
+    } catch {
+      showToast('حدث خطأ أثناء حفظ التعليق');
+    } finally {
+      setSubmittingComment(false);
+    }
+  };
 
   // Export Tickets to CSV with UTF-8 BOM for Excel Arabic compatibility
   const exportTicketsToCSV = () => {
@@ -245,6 +355,7 @@ export const TicketsManager: React.FC<TicketsManagerProps> = ({
                 <th className="p-4 font-semibold">العميل</th>
                 <th className="p-4 font-semibold">الفئة</th>
                 <th className="p-4 font-semibold">الأولوية</th>
+                <th className="p-4 font-semibold">حالة التذكرة</th>
                 <th className="p-4 font-semibold">حالة الـ SLA</th>
                 <th className="p-4 font-semibold">الموظف المعين</th>
                 <th className="p-4 font-semibold text-center">إجراءات</th>
@@ -290,23 +401,62 @@ export const TicketsManager: React.FC<TicketsManagerProps> = ({
                           : 'منخفضة'}
                       </span>
                     </td>
+                    {/* Status Dropdown */}
+                    <td className="p-4">
+                      <select
+                        value={t.status}
+                        onChange={(e) => handleStatusChange(t.id, e.target.value)}
+                        className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px] font-medium text-white focus:outline-none focus:border-emerald-500"
+                      >
+                        <option value="new">جديدة (New)</option>
+                        <option value="in_progress">قيد العمل (In Progress)</option>
+                        <option value="resolved">مكتملة (Resolved)</option>
+                        <option value="closed">مغلقة (Closed)</option>
+                      </select>
+                    </td>
                     <td className="p-4">
                       <span className={`px-2.5 py-1 rounded-full text-[10px] font-medium border ${slaBadge}`}>
                         {t.slaStatus === 'healthy' ? 'ملتزم بالمعيار (Healthy)' : t.slaStatus === 'warning' ? 'تحذير اقتراب (Warning)' : 'خطر التجاوز (At Risk)'}
                       </span>
                     </td>
-                    <td className="p-4 text-slate-300">{t.assignedAgentName || 'بانتظار الإسناد'}</td>
+                    {/* Agent Assignment Selector */}
+                    <td className="p-4">
+                      <select
+                        value={t.assignedToAgentId || ''}
+                        onChange={(e) => {
+                          const name = e.target.options[e.target.selectedIndex].text;
+                          handleAssignChange(t.id, e.target.value, name);
+                        }}
+                        className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px] text-slate-200 focus:outline-none focus:border-emerald-500 max-w-[130px] truncate"
+                      >
+                        <option value="" disabled>بانتظار الإسناد</option>
+                        <option value="usr-agent-01">سارة أحمد</option>
+                        <option value="usr-agent-02">فهد السالم</option>
+                        <option value="usr-agent-03">عمر خالد</option>
+                        <option value="usr-agent-04">منى زكي</option>
+                      </select>
+                    </td>
                     <td className="p-4 text-center">
-                      {t.priority !== 'urgent' && (
+                      <div className="flex items-center justify-center gap-1.5">
                         <button
-                          onClick={() => onEscalateTicket(t.id)}
-                          className="px-2.5 py-1 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 text-[11px] font-medium border border-rose-500/20 transition flex items-center gap-1 mx-auto"
-                          title="تصعيد الحالة لدرجة قصوى"
+                          onClick={() => openCommentsModal(t)}
+                          className="px-2.5 py-1 rounded-lg bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 text-[11px] font-medium border border-indigo-500/20 transition flex items-center gap-1"
+                          title="عرض وإضافة تعليقات التذكرة"
                         >
-                          <ArrowUpRight className="w-3.5 h-3.5" />
-                          <span>تصعيد طارئ</span>
+                          <MessageSquare className="w-3.5 h-3.5" />
+                          <span>التعليقات</span>
                         </button>
-                      )}
+                        {t.priority !== 'urgent' && (
+                          <button
+                            onClick={() => onEscalateTicket(t.id)}
+                            className="px-2 py-1 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 text-[11px] font-medium border border-rose-500/20 transition flex items-center gap-1"
+                            title="تصعيد الحالة لدرجة قصوى"
+                          >
+                            <ArrowUpRight className="w-3.5 h-3.5" />
+                            <span>تصعيد</span>
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 );
@@ -396,6 +546,7 @@ export const TicketsManager: React.FC<TicketsManagerProps> = ({
               <div className="flex items-center justify-end gap-2 pt-3">
                 <button
                   type="button"
+                  data-close-modal
                   onClick={() => setShowCreateModal(false)}
                   className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold"
                 >
@@ -410,6 +561,97 @@ export const TicketsManager: React.FC<TicketsManagerProps> = ({
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {/* Ticket Comments Modal */}
+      {activeCommentTicket && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 w-full max-w-lg shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div>
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <MessageSquare className="w-4 h-4 text-indigo-400" />
+                  <span>تعليقات التذكرة #{activeCommentTicket.ticketNumber}</span>
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-0.5 truncate max-w-sm">{activeCommentTicket.title}</p>
+              </div>
+              <button data-close-modal onClick={() => setActiveCommentTicket(null)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Comments List */}
+            <div className="space-y-2.5 max-h-60 overflow-y-auto pr-1">
+              {loadingComments ? (
+                <div className="py-6 text-center text-xs text-slate-500">جارٍ تحميل التعليقات...</div>
+              ) : comments.length > 0 ? (
+                comments.map((c) => (
+                  <div
+                    key={c.id}
+                    className={`p-3 rounded-2xl text-xs border ${
+                      c.isInternal
+                        ? 'bg-amber-950/20 border-amber-500/30 text-amber-200'
+                        : 'bg-slate-950 border-slate-800 text-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                      <span className="font-bold text-slate-200">
+                        {c.authorName} ({c.authorRole}) {c.isInternal && '• ملاحظة داخلية'}
+                      </span>
+                      <span className="font-mono">{new Date(c.createdAt).toLocaleTimeString('ar-SA')}</span>
+                    </div>
+                    <p className="leading-relaxed">{c.body}</p>
+                  </div>
+                ))
+              ) : (
+                <div className="py-6 text-center text-xs text-slate-500">لا توجد تعليقات سابقة على هذه التذكرة</div>
+              )}
+            </div>
+
+            {/* Add Comment Form */}
+            <form onSubmit={handleAddComment} className="space-y-3 pt-2 border-t border-slate-800 text-xs">
+              <div>
+                <textarea
+                  rows={3}
+                  required
+                  value={newCommentBody}
+                  onChange={(e) => setNewCommentBody(e.target.value)}
+                  placeholder="أضف تعليقاً فنياً أو رداً على العميل..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="commentInternal"
+                    checked={newCommentIsInternal}
+                    onChange={(e) => setNewCommentIsInternal(e.target.checked)}
+                    className="rounded bg-slate-950 border-slate-800 text-amber-500 focus:ring-0"
+                  />
+                  <label htmlFor="commentInternal" className="text-slate-300 text-xs">ملاحظة داخلية (فريق العمل فقط)</label>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={submittingComment}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>{submittingComment ? 'جارٍ الإرسال...' : 'إرسال التعليق'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {toastMessage && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 border border-emerald-500/50 text-white px-5 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 text-xs font-bold z-50 animate-fade-in">
+          <Check className="w-4 h-4 text-emerald-400" />
+          <span>{toastMessage}</span>
         </div>
       )}
     </div>

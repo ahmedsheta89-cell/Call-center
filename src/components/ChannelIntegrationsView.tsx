@@ -31,7 +31,8 @@ interface ChannelIntegration {
   type: string;
   name: string;
   badge: string;
-  status: 'online' | 'degraded' | 'offline';
+  status: 'online' | 'registered' | 'tcp_reachable' | 'configured' | 'simulated' | 'degraded' | 'disabled' | 'failed' | 'offline';
+  adapterState?: 'DISABLED' | 'CONFIGURED' | 'TCP_REACHABLE' | 'REGISTERED' | 'CONNECTED' | 'SIMULATED' | 'FAILED';
   accountInfo: Record<string, any>;
   metrics: Record<string, any>;
 }
@@ -147,6 +148,7 @@ export const ChannelIntegrationsView: React.FC = () => {
           ...prev,
           [channelId]: d.data,
         }));
+        fetchChannels();
       }
     } catch {
       // test failed
@@ -180,11 +182,18 @@ export const ChannelIntegrationsView: React.FC = () => {
       });
       const d = await res.json();
       if (d.success) {
-        setSendSuccess(`تم إرسال النموذج بنجاح عبر Meta Cloud API بمعرّف رسالة: ${d.data.messageId}`);
+        const isSim = d.data?.status === 'simulated' || d.data?.adapterState === 'SIMULATED';
+        setSendSuccess(
+          isSim
+            ? `تمت محاكاة القالب محلياً (SIMULATED) بمعرّف: ${d.data.messageId}`
+            : `تم إرسال النموذج عبر Meta Cloud API بمعرّف رسالة: ${d.data.messageId}`
+        );
         setTimeout(() => {
           setSelectedTemplate(null);
           setSendSuccess(null);
         }, 3000);
+      } else {
+        setSendSuccess(`تعذر الإرسال (${d.error?.code || res.status}): ${d.error?.message || 'القناة غير مفعلة'}`);
       }
     } catch (err) {
       console.error(err);
@@ -249,15 +258,47 @@ export const ChannelIntegrationsView: React.FC = () => {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span
+                      className={`w-2.5 h-2.5 rounded-full ${
+                        chan.status === 'online' || chan.status === 'registered'
+                          ? 'bg-emerald-400 animate-pulse'
+                          : chan.status === 'tcp_reachable' || chan.status === 'configured' || chan.status === 'simulated'
+                          ? 'bg-amber-400'
+                          : chan.status === 'degraded' || chan.status === 'failed'
+                          ? 'bg-rose-400'
+                          : 'bg-slate-500'
+                      }`}
+                    />
                     <span className="text-xs font-bold text-white truncate">{chan.type.toUpperCase()}</span>
                   </div>
-                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-medium">
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded font-medium ${
+                      chan.status === 'online' || chan.status === 'registered'
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : chan.status === 'tcp_reachable'
+                        ? 'bg-cyan-500/20 text-cyan-300'
+                        : chan.status === 'configured'
+                        ? 'bg-sky-500/20 text-sky-300'
+                        : chan.status === 'simulated'
+                        ? 'bg-amber-500/20 text-amber-300'
+                        : chan.status === 'degraded' || chan.status === 'failed'
+                        ? 'bg-rose-500/20 text-rose-300'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
                     {chan.status === 'online'
-                      ? 'متصل ونشط'
-                      : chan.status === 'degraded'
-                      ? 'أداء متذبذب'
-                      : 'غير متصل'}
+                      ? 'متصل ومؤكد (CONNECTED)'
+                      : chan.status === 'registered'
+                      ? 'مسجل SIP (REGISTERED)'
+                      : chan.status === 'tcp_reachable'
+                      ? 'منفذ متاح فقط (TCP_REACHABLE)'
+                      : chan.status === 'configured'
+                      ? 'مهيأ (CONFIGURED)'
+                      : chan.status === 'simulated'
+                      ? 'محاكاة (SIMULATED)'
+                      : chan.status === 'degraded' || chan.status === 'failed'
+                      ? 'تعذر الاتصال (FAILED)'
+                      : 'معطل (DISABLED)'}
                   </span>
                 </div>
                 <div className="text-xs text-slate-300 font-medium truncate">{chan.name}</div>
@@ -632,9 +673,9 @@ export const ChannelIntegrationsView: React.FC = () => {
                 )}
                 {configChannel.type === 'voice' && (
                   <p className="text-[11px] text-slate-300 leading-relaxed">
-                    💡 <strong>للاتصال الصوتي الحقيقي (PSTN / رنين على الهواتف):</strong>
+                    💡 <strong>إعدادات بوابة SIP (تسجيل REGISTER فقط حالياً):</strong>
                     <br />
-                    يمكن إدخال بيانات <strong>Twilio Account SID</strong> و <strong>Auth Token</strong> و <strong>Twilio Phone Number</strong>، ليقوم السنترال السحابي بإجراء رنين واتصال هاتفي مباشر برقمك 01018108979.
+                    أدخل <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">sipServerUri</code> و <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">sipUsername</code> و <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">sipPassword</code> و <code className="bg-slate-900 px-1 py-0.5 rounded text-emerald-300">webhookSecret</code>. ملاحظة: إجراء المكالمات الحية (SIP INVITE/RTP) غير مفعل بعد (NOT_IMPLEMENTED) والمكالمات المحلية تعمل في وضع SIMULATED فقط.
                   </p>
                 )}
               </div>
@@ -688,6 +729,81 @@ export const ChannelIntegrationsView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* 5. Egypt Integration Truthfulness Matrix */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3" data-testid="egypt-integration-matrix">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-emerald-400" />
+              <span>مصفوفة تكاملات السوق المصري وحالة الجاهزية (Egypt Integration Matrix)</span>
+            </h3>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              تصنيف صارم يميز بين IMPLEMENTED وLOCAL_PROTOCOL_FIXTURE_TESTED وSIMULATED وNOT_IMPLEMENTED، ولا يدّعي PROVIDER_SANDBOX_VERIFIED أو LIVE_PROVIDER_VERIFIED دون اختبار فعلي مع المزود.
+            </p>
+          </div>
+          <span className="text-[10px] px-2.5 py-1 rounded-lg bg-amber-500/15 text-amber-300 border border-amber-500/30 font-medium">
+            التصنيف الفعلي: LOCAL_PROVIDER_PROTOCOL_TESTED / LOCAL_SIMULATED_PILOT
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-right text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-slate-800 text-slate-400">
+                <th className="py-2 px-3">القناة / القدرة</th>
+                <th className="py-2 px-3">حالة التنفيذ</th>
+                <th className="py-2 px-3">مستوى التحقق</th>
+                <th className="py-2 px-3">ملاحظات الحقيقة والقيود</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/70 text-slate-200">
+              <tr>
+                <td className="py-2 px-3 font-medium">WebChat المحلي ($0.00)</td>
+                <td className="py-2 px-3 text-emerald-400 font-mono">IMPLEMENTED</td>
+                <td className="py-2 px-3 text-emerald-400 font-mono">IMPLEMENTED</td>
+                <td className="py-2 px-3 text-slate-300">نشط محلياً عبر الخادم دون وسطاء خارجيين</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">WhatsApp Cloud API (Meta)</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">اختبارات توقيع HMAC وReplay محلية؛ غير مختبر مع Meta الحي</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">CEQUENS Egypt SMS / CPaaS</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">اختبارات Bearer + Replay محلية؛ بانتظار مفتاح CEQUENS الحي</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">Telegram Bot API</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">اختبارات Secret-Token محلية؛ بانتظار Bot Token الحي</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">Email SMTP Bridge (Nodemailer TLS)</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">تم اختباره أمام خادم STARTTLS محلي؛ قبول الترحيل لا يعني تأكيد صندوق الوارد</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">SIP REGISTER (RFC 3261 + Digest)</td>
+                <td className="py-2 px-3 text-sky-300 font-mono">IMPLEMENTED / DISABLED</td>
+                <td className="py-2 px-3 text-cyan-300 font-mono">LOCAL_PROTOCOL_FIXTURE_TESTED</td>
+                <td className="py-2 px-3 text-slate-400">يفصل TCP_REACHABLE عن REGISTERED؛ لا يعني وجود مكالمات أو وسائط حية</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 font-medium">SIP Outbound INVITE / SDP / RTP</td>
+                <td className="py-2 px-3 text-rose-300 font-mono">NOT_IMPLEMENTED</td>
+                <td className="py-2 px-3 text-amber-300 font-mono">SIMULATED</td>
+                <td className="py-2 px-3 text-slate-400">يرفض المكالمات الحية بـ HTTP 501؛ متاح فقط في وضع SIMULATED المحلي</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 };

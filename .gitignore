@@ -4,11 +4,16 @@ dist/
 dev-dist/
 coverage/
 data/
+data-*/
 *.lock
 bun.lock
 .DS_Store
 *.log
+*.zip
 .env*
 !.env.example
 .aistudio/
 dist-server/
+release/**/dist/
+release/**/dist-server/
+.npmrc

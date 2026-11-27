@@ -1374,9 +1374,15 @@ export async function runFirestoreEmulatorSecuritySuite(): Promise<EmulatorSuite
   } else {
     const jarPath = findFirestoreEmulatorJar();
     port = await getFreeTcpPort();
-    spawnedProc = spawn(javaRuntime.binary, ['-jar', jarPath, '--host', host, '--port', String(port)], {
-      stdio: 'ignore',
-    });
+    spawnedProc = spawn(
+      javaRuntime.binary,
+      ['-Duser.language=en', '-Duser.country=US', '-jar', jarPath, '--host', host, '--port', String(port)],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+    spawnedProc.stdout?.on('data', (d) => process.stdout.write(`[FirestoreEmulator stdout] ${d}`));
+    spawnedProc.stderr?.on('data', (d) => process.stderr.write(`[FirestoreEmulator stderr] ${d}`));
     await waitForTcpPort(host, port, 20000);
   }
 
@@ -2464,6 +2470,7 @@ if (process.argv[1]?.endsWith('firestore-rules-audit.ts')) {
       console.log(`     • [${r.id}] (${r.category}) ${r.name} -> ${r.status}`);
     }
     console.log('================================================================================');
+    process.exit(0);
   })().catch((err) => {
     console.error('❌ FIRESTORE SECURITY GATE / EMULATOR SUITE FAILED:', err);
     process.exit(1);

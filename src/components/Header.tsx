@@ -746,6 +746,7 @@ export const Header: React.FC<HeaderProps> = ({
           <select
             value={currentRole}
             onChange={(e) => onRoleChange(e.target.value)}
+            aria-label="تبديل الدور الوظيفي للمستخدم"
             className="bg-transparent text-xs font-semibold text-slate-100 focus:outline-none cursor-pointer"
           >
             {roles.map((r) => (

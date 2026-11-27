@@ -30,6 +30,7 @@ import {
 import type { Permission } from '../core/rbac.ts';
 import {
   authenticateApiRequest,
+  isExplicitProviderWebhookPath,
   currentActor,
   issueSessionToken,
   revokeSessionToken,
@@ -40,9 +41,38 @@ import {
 } from '../core/identity.ts';
 import { execSync } from 'child_process';
 import { AIGateway } from '../modules/ai/gateway.ts';
-import { UnifiedMessage, UUID, Ticket, CallSession } from '../core/types.ts';
+import {
+  UnifiedMessage,
+  UUID,
+  Ticket,
+  CallSession,
+  Customer,
+  Conversation,
+  CustomerNote,
+  CustomerFollowUp,
+  TicketComment,
+  AutomationRuleExecution,
+} from '../core/types.ts';
 import { EventBus } from '../core/events.ts';
 import { ensurePwaIconsGenerated, PWA_ICON_TMP_DIR } from '../core/pwaAssets.ts';
+import { initializeIntegrationAdapters } from '../modules/integrations/init.ts';
+import { IntegrationRegistry } from '../modules/integrations/registry.ts';
+import {
+  reserveDurableIdempotencyKeys,
+  transitionDurableIdempotencyState,
+  commitDurableIdempotencyKeys,
+  releaseDurableIdempotencyKeys,
+} from '../core/durableIdempotency.ts';
+
+// Initialize integration adapters subsystem
+initializeIntegrationAdapters();
+import {
+  initLocalOwnerAuth,
+  completeLocalOwnerBootstrap,
+  authenticateLocalOwner,
+  completeLocalOwnerBootstrapAsync,
+  authenticateLocalOwnerAsync,
+} from '../core/localAuth.ts';
 
 export const apiRouter = Router();
 
@@ -124,7 +154,11 @@ apiRouter.use(authenticateApiRequest);
 // Organization context is derived exclusively from the verified session. Any request body attempting
 // to pass an empty/invalid/unregistered organizationId (400) or a cross-tenant organizationId (403) is rejected.
 apiRouter.use((req: Request, res: Response, next) => {
-  if (req.path === '/system/restore') {
+  if (
+    req.path === '/system/restore' ||
+    req.path.startsWith('/auth/') ||
+    isExplicitProviderWebhookPath(req.path)
+  ) {
     next();
     return;
   }
@@ -300,6 +334,107 @@ apiRouter.get('/admin/profile', (req: Request, res: Response) => {
   });
 });
 
+apiRouter.get('/auth/local-owner/status', (_req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const status = initLocalOwnerAuth(dataDir);
+  res.json({ success: true, data: status });
+});
+
+apiRouter.post('/auth/local-owner/bootstrap', async (req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const { bootstrapToken, username, password, email, fullName, phoneNumber } = req.body || {};
+  const clientIp = String(req.ip || req.socket?.remoteAddress || '127.0.0.1');
+  if (!bootstrapToken || !username || !password) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MISSING_REQUIRED_FIELDS', message: 'bootstrapToken, username, and password are required.' },
+    });
+    return;
+  }
+  const outcome = await completeLocalOwnerBootstrapAsync(dataDir, {
+    bootstrapToken,
+    username,
+    password,
+    email,
+    fullName,
+    phoneNumber: phoneNumber ? String(phoneNumber).trim() : null,
+    ip: clientIp,
+  });
+  if (!outcome.ok) {
+    const isRateLimited = outcome.errorCode === 'TOO_MANY_FAILED_ATTEMPTS';
+    const isUnavailable = outcome.errorCode === 'AUTH_SUBSYSTEM_BUSY' || outcome.errorCode === 'AUTH_SUBSYSTEM_UNAVAILABLE';
+    res.status(isRateLimited ? 429 : isUnavailable ? 503 : 400).json({
+      success: false,
+      error: { code: outcome.errorCode, message: outcome.errorMessage },
+    });
+    return;
+  }
+  res.json({
+    success: true,
+    data: { message: 'Local Owner account successfully provisioned. You can now login.' },
+  });
+});
+
+apiRouter.post('/auth/local-owner/login', async (req: Request, res: Response) => {
+  const dataDir = path.dirname(db.getPersistFilePath());
+  const { username, password, ttlMs } = req.body || {};
+  const clientIp = String(req.ip || req.socket?.remoteAddress || '127.0.0.1');
+
+  if (!username || !password) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'CREDENTIALS_REQUIRED', message: 'username and password are required.' },
+    });
+    return;
+  }
+
+  const authOutcome = await authenticateLocalOwnerAsync(dataDir, { username, password, ip: clientIp });
+  if (!authOutcome.ok) {
+    const isRateLimited = authOutcome.errorCode === 'TOO_MANY_FAILED_ATTEMPTS';
+    const isUnavailable = authOutcome.errorCode === 'AUTH_SUBSYSTEM_BUSY' || authOutcome.errorCode === 'AUTH_SUBSYSTEM_UNAVAILABLE';
+    res.status(isRateLimited ? 429 : isUnavailable ? 503 : 401).json({
+      success: false,
+      error: { code: authOutcome.errorCode, message: authOutcome.errorMessage },
+    });
+    return;
+  }
+
+  const user = authOutcome.user;
+  const { token, csrfToken, session, actor } = issueSessionToken({
+    userId: user.id,
+    activeRoleOverride: 'Owner',
+    ttlMs: typeof ttlMs === 'number' ? ttlMs : undefined,
+  });
+
+  AuditLogger.log({
+    organizationId: actor.organizationId,
+    actorId: actor.userId,
+    actorType: 'user',
+    action: 'auth.local_owner_session_issued',
+    entityType: 'session',
+    entityId: session.jti,
+    afterState: {
+      userId: actor.userId,
+      baseRole: actor.baseRole,
+      activeRole: actor.role,
+      method: 'local_scrypt_password',
+    },
+  });
+
+  res.setHeader('Set-Cookie', formatSessionCookie(req, token));
+  res.setHeader('X-CSRF-Token', csrfToken);
+  res.json({
+    success: true,
+    data: {
+      token,
+      csrfToken,
+      sessionId: session.jti,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      actor,
+    },
+  });
+});
+
 apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   const secretCheck = validateSessionSecretConfig();
   if (!secretCheck.valid) {
@@ -320,6 +455,7 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
     process.env.NODE_ENV === 'production' ||
     process.env.OMNIFLOW_REQUIRE_FIREBASE_AUTH === 'true';
   const allowLocalTestLogin =
+    process.env.NODE_ENV === 'test' &&
     !isProductionOrLocked &&
     process.env.OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN === 'true' &&
     isLoopbackRequest;
@@ -586,6 +722,37 @@ apiRouter.get('/agents', (req: Request, res: Response) => {
   res.json({ success: true, data: agentsList });
 });
 
+apiRouter.put('/agents/:id/presence', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const agent = db.agents.get(req.params.id);
+  if (!agent || agent.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Agent not found' } });
+  }
+  const { status } = req.body || {};
+  const validStatuses = ['online', 'busy', 'break', 'offline'] as const;
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'Valid status required: online, busy, break, offline' },
+    });
+  }
+  agent.status = status;
+  agent.updatedAt = new Date().toISOString();
+  db.agents.set(agent.id, agent);
+  db.schedulePersist();
+  EventBus.publish('agent:presence_changed', { agentId: agent.id, status: agent.status });
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'agent.presence_update',
+    entityType: 'agent',
+    entityId: agent.id,
+    afterState: { status: agent.status },
+  });
+  res.json({ success: true, data: agent });
+});
+
 apiRouter.get('/teams', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
   const teamsList = Array.from(db.teams.values()).filter((t) => t.organizationId === currentActor.organizationId);
@@ -677,6 +844,273 @@ apiRouter.get('/customers/:id/timeline', (req: Request, res: Response) => {
   ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
   res.json({ success: true, data: timeline });
+});
+
+apiRouter.post('/customers', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.create');
+  const { name, email, phone, customerTier, city, tags, customFields, assignedAgentId, forceCreate } = req.body || {};
+  if (!name || typeof name !== 'string' || name.trim().length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'Customer name is required and must be a non-empty string' },
+    });
+  }
+
+  const normalizedPhone = phone ? String(phone).replace(/\s+/g, '') : undefined;
+  if (!forceCreate) {
+    const existing = Array.from(db.customers.values()).find(
+      (c) =>
+        c.organizationId === currentActor.organizationId &&
+        ((normalizedPhone && c.phone && c.phone.replace(/\s+/g, '') === normalizedPhone) ||
+          (email && c.email && c.email.toLowerCase() === String(email).trim().toLowerCase()))
+    );
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: 'CUSTOMER_ALREADY_EXISTS',
+          message: 'A customer with this phone or email already exists in this organization',
+          duplicateCustomerId: existing.id,
+        },
+      });
+    }
+  }
+
+  const id: UUID = crypto.randomUUID();
+  const validTier = ['standard', 'priority', 'vip'].includes(customerTier) ? customerTier : 'standard';
+  const newCustomer: Customer = {
+    id,
+    organizationId: currentActor.organizationId,
+    name: name.trim(),
+    email: email ? String(email).trim().toLowerCase() : undefined,
+    phone: normalizedPhone,
+    customerTier: validTier,
+    lifetimeValue: 0,
+    assignedAgentId: assignedAgentId || undefined,
+    tags: Array.isArray(tags) ? tags.map(String) : [],
+    customFields: {
+      ...(typeof customFields === 'object' && customFields !== null ? customFields : {}),
+      city: city || 'القاهرة',
+    },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  db.customers.set(id, newCustomer);
+  db.schedulePersist();
+  EventBus.publish('customer:created', newCustomer);
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.create',
+    entityType: 'customer',
+    entityId: id,
+    afterState: { name: newCustomer.name, phone: newCustomer.phone, customerTier: newCustomer.customerTier },
+  });
+
+  res.status(201).json({ success: true, data: newCustomer });
+});
+
+apiRouter.put('/customers/:id', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.update');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const { name, email, phone, customerTier, city, tags, customFields, assignedAgentId } = req.body || {};
+  if (name !== undefined) customer.name = String(name).trim();
+  if (email !== undefined) customer.email = String(email).trim().toLowerCase();
+  if (phone !== undefined) customer.phone = String(phone).replace(/\s+/g, '');
+  if (customerTier && ['standard', 'priority', 'vip'].includes(customerTier)) customer.customerTier = customerTier;
+  if (assignedAgentId !== undefined) customer.assignedAgentId = assignedAgentId || undefined;
+  if (Array.isArray(tags)) customer.tags = tags.map(String);
+  if (city !== undefined || customFields !== undefined) {
+    customer.customFields = {
+      ...(customer.customFields || {}),
+      ...(typeof customFields === 'object' && customFields !== null ? customFields : {}),
+      ...(city !== undefined ? { city } : {}),
+    };
+  }
+  customer.updatedAt = new Date().toISOString();
+
+  db.customers.set(customer.id, customer);
+  db.schedulePersist();
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.update',
+    entityType: 'customer',
+    entityId: customer.id,
+    afterState: { name: customer.name, customerTier: customer.customerTier },
+  });
+
+  res.json({ success: true, data: customer });
+});
+
+apiRouter.post('/customers/:id/notes', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.update');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const { content } = req.body || {};
+  if (!content || typeof content !== 'string' || content.trim().length === 0) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Note content is required' } });
+  }
+
+  const author = db.users.get(currentActor.userId);
+  const note = db.saveCustomerNote({
+    id: crypto.randomUUID(),
+    organizationId: currentActor.organizationId,
+    customerId: customer.id,
+    authorId: currentActor.userId,
+    authorName: author?.fullName || 'الموظف المسؤول',
+    content: content.trim(),
+    createdAt: new Date().toISOString(),
+  });
+
+  EventBus.publish('customer:note_added', { customerId: customer.id, noteId: note.id });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.note_add',
+    entityType: 'customer',
+    entityId: customer.id,
+    afterState: { noteId: note.id },
+  });
+
+  res.status(201).json({ success: true, data: note });
+});
+
+apiRouter.get('/customers/:id/notes', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+  const notes = db.getCustomerNotes(currentActor.organizationId, customer.id);
+  res.json({ success: true, data: notes });
+});
+
+apiRouter.post('/customers/detect-duplicates', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const { name, phone, email } = req.body || {};
+  const allCustomers = db.getCustomers(currentActor.organizationId);
+  const cleanPhone = phone ? String(phone).replace(/[^0-9]/g, '') : '';
+  const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+  const cleanName = name ? String(name).trim().toLowerCase() : '';
+
+  const matches = allCustomers
+    .map((cust) => {
+      let score = 0;
+      const reasons: string[] = [];
+      const custPhoneClean = cust.phone ? cust.phone.replace(/[^0-9]/g, '') : '';
+      if (cleanPhone && custPhoneClean) {
+        if (cleanPhone === custPhoneClean || (cleanPhone.length >= 9 && custPhoneClean.endsWith(cleanPhone.slice(-9)))) {
+          score += 60;
+          reasons.push('تطابق رقم الهاتف (Phone match)');
+        }
+      }
+      if (cleanEmail && cust.email && cust.email.toLowerCase() === cleanEmail) {
+        score += 40;
+        reasons.push('تطابق البريد الإلكتروني (Email match)');
+      }
+      if (cleanName && cust.name.toLowerCase() === cleanName) {
+        score += 30;
+        reasons.push('تطابق الاسم بالكامل (Full name match)');
+      } else if (cleanName && (cust.name.toLowerCase().includes(cleanName) || cleanName.includes(cust.name.toLowerCase()))) {
+        score += 15;
+        reasons.push('تشابه جزئي في الاسم (Partial name match)');
+      }
+      return { customer: cust, score: Math.min(100, score), reasons };
+    })
+    .filter((m) => m.score >= 30)
+    .sort((a, b) => b.score - a.score);
+
+  res.json({ success: true, data: matches, count: matches.length });
+});
+
+apiRouter.post('/customers/:id/follow-up', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.update');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const { dueAt, reason, priority, assignedAgentId } = req.body || {};
+  if (!dueAt || !reason) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'dueAt and reason are required' } });
+  }
+
+  const followUp = db.saveCustomerFollowUp({
+    id: crypto.randomUUID(),
+    organizationId: currentActor.organizationId,
+    customerId: customer.id,
+    assignedAgentId: assignedAgentId || customer.assignedAgentId,
+    dueAt: new Date(dueAt).toISOString(),
+    priority: ['low', 'medium', 'high', 'urgent'].includes(priority) ? priority : 'medium',
+    reason: String(reason).trim(),
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  });
+
+  EventBus.publish('customer:follow_up_scheduled', followUp);
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'customer.follow_up_create',
+    entityType: 'customer',
+    entityId: customer.id,
+    afterState: { followUpId: followUp.id, dueAt: followUp.dueAt },
+  });
+
+  res.status(201).json({ success: true, data: followUp });
+});
+
+apiRouter.get('/customers/:id/follow-ups', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const customer = db.customers.get(req.params.id);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+  const followUps = db.getCustomerFollowUps(currentActor.organizationId, customer.id);
+  res.json({ success: true, data: followUps });
+});
+
+apiRouter.get('/customers-export', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'customer.read');
+  const customers = db.getCustomers(currentActor.organizationId);
+  const format = req.query.format === 'csv' ? 'csv' : 'json';
+
+  if (format === 'csv') {
+    const headers = ['المعرف', 'الاسم', 'الهاتف', 'البريد', 'الفئة', 'المدينة', 'القيمة التاريخية', 'تاريخ الإنشاء'];
+    const rows = customers.map((c) => [
+      c.id,
+      `"${c.name.replace(/"/g, '""')}"`,
+      `"${c.phone || ''}"`,
+      `"${c.email || ''}"`,
+      c.customerTier,
+      `"${(c.customFields as any)?.city || ''}"`,
+      c.lifetimeValue,
+      c.createdAt,
+    ]);
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="customers-export.csv"');
+    return res.send(csvContent);
+  }
+
+  res.json({ success: true, data: customers, count: customers.length, exportedAt: new Date().toISOString() });
 });
 
 // ----------------------------------------------------
@@ -788,6 +1222,193 @@ const handleConversationReply = async (req: Request, res: Response) => {
 apiRouter.post('/conversations/:id/reply', handleConversationReply);
 apiRouter.post('/conversations/:id/messages', handleConversationReply);
 
+// In-memory collision prevention state (TTL 15 seconds)
+interface ViewerInfo {
+  agentId: string;
+  agentName: string;
+  lastSeenAt: number;
+  isTyping: boolean;
+}
+const activeConversationViewers = new Map<string, ViewerInfo[]>();
+
+apiRouter.post('/conversations', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.reply');
+  const { customerId, channel, subject, priority } = req.body || {};
+  if (!customerId) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'customerId is required' } });
+  }
+  const customer = db.customers.get(customerId);
+  if (!customer || customer.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found' } });
+  }
+
+  const validChannels = ['whatsapp', 'webchat', 'voice', 'email', 'messenger', 'instagram', 'sms', 'telegram'];
+  const chn = validChannels.includes(channel) ? channel : 'webchat';
+  const convId: UUID = crypto.randomUUID();
+  const newConv: Conversation = {
+    id: convId,
+    organizationId: currentActor.organizationId,
+    customerId: customer.id,
+    channel: chn as any,
+    status: 'open',
+    priority: ['low', 'medium', 'high', 'urgent'].includes(priority) ? priority : 'medium',
+    subject: subject || `محادثة جديدة عبر ${chn.toUpperCase()}`,
+    sentiment: 'neutral',
+    lastMessageAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  db.conversations.set(convId, newConv);
+  db.schedulePersist();
+  EventBus.publish('conversation:created', newConv);
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'conversation.create',
+    entityType: 'conversation',
+    entityId: convId,
+    afterState: { customerId: customer.id, channel: chn },
+  });
+
+  res.status(201).json({ success: true, data: newConv });
+});
+
+apiRouter.put('/conversations/:id/status', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.close');
+  const conv = db.conversations.get(req.params.id);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { status } = req.body || {};
+  const validStatuses = ['queued', 'open', 'pending', 'resolved', 'closed'] as const;
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'Valid status required: queued, open, pending, resolved, closed' },
+    });
+  }
+
+  const previousStatus = conv.status;
+  conv.status = status;
+  conv.updatedAt = new Date().toISOString();
+  db.conversations.set(conv.id, conv);
+  db.schedulePersist();
+
+  EventBus.publish('conversation:status_changed', { conversationId: conv.id, status, previousStatus });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'conversation.status_change',
+    entityType: 'conversation',
+    entityId: conv.id,
+    beforeState: { status: previousStatus },
+    afterState: { status },
+  });
+
+  res.json({ success: true, data: conv });
+});
+
+apiRouter.put('/conversations/:id/assign', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.assign');
+  const conv = db.conversations.get(req.params.id);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { agentId, teamId } = req.body || {};
+  conv.assignedAgentId = agentId || undefined;
+  conv.assignedTeamId = teamId || undefined;
+  conv.updatedAt = new Date().toISOString();
+  db.conversations.set(conv.id, conv);
+  db.schedulePersist();
+
+  EventBus.publish('conversation:assigned', { conversationId: conv.id, agentId, teamId });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'conversation.assign',
+    entityType: 'conversation',
+    entityId: conv.id,
+    afterState: { assignedAgentId: conv.assignedAgentId, assignedTeamId: conv.assignedTeamId },
+  });
+
+  res.json({ success: true, data: conv });
+});
+
+apiRouter.post('/conversations/:id/heartbeat', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const convId = req.params.id;
+  const conv = db.conversations.get(convId);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { isTyping } = req.body || {};
+  const now = Date.now();
+  const currentAgentId = currentActor.userId;
+  const currentAgentName = currentActor.name;
+
+  // Clean stale viewers (> 15 seconds)
+  const viewers = (activeConversationViewers.get(convId) || []).filter((v) => now - v.lastSeenAt < 15000);
+
+  // Upsert current agent
+  const idx = viewers.findIndex((v) => v.agentId === currentAgentId);
+  if (idx >= 0) {
+    viewers[idx].lastSeenAt = now;
+    viewers[idx].isTyping = !!isTyping;
+  } else {
+    viewers.push({
+      agentId: currentAgentId,
+      agentName: currentAgentName,
+      lastSeenAt: now,
+      isTyping: !!isTyping,
+    });
+  }
+  activeConversationViewers.set(convId, viewers);
+
+  const otherViewers = viewers.filter((v) => v.agentId !== currentAgentId);
+  const isCollisionRisk = otherViewers.length > 0;
+  const typingAgents = otherViewers.filter((v) => v.isTyping).map((v) => v.agentName);
+
+  res.json({
+    success: true,
+    data: {
+      activeViewersCount: viewers.length,
+      isCollisionRisk,
+      otherViewers: otherViewers.map((v) => ({ agentId: v.agentId, agentName: v.agentName, isTyping: v.isTyping })),
+      typingAgents,
+    },
+  });
+});
+
+apiRouter.put('/conversations/:id/tags', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.reply');
+  const conv = db.conversations.get(req.params.id);
+  if (!conv || conv.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  }
+
+  const { tags } = req.body || {};
+  if (!Array.isArray(tags)) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Tags must be an array' } });
+  }
+
+  (conv as any).tags = tags.map(String);
+  conv.updatedAt = new Date().toISOString();
+  db.conversations.set(conv.id, conv);
+  db.schedulePersist();
+
+  res.json({ success: true, data: conv });
+});
+
 // ----------------------------------------------------
 // 4. Voice & Telephony Engine
 // ----------------------------------------------------
@@ -806,73 +1427,412 @@ apiRouter.get('/calls', (req: Request, res: Response) => {
 
 apiRouter.post('/calls/dial', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'call.make');
-  const { phoneNumber, customerName, customerId } = req.body;
+  const { phoneNumber, customerName, customerId, simulate } = req.body || {};
   const targetNumber = phoneNumber || '01018108979';
-  const isAdminTarget = targetNumber.includes('01018108979');
-  const targetName = customerName || (isAdminTarget ? 'م. أحمد شتا (مدير النظام - Admin)' : 'عميل هاتف');
+  const orgId = currentActor.organizationId;
+  const voiceConfig = db.getChannelConfig(orgId, 'chan-voice');
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceConfig, simulate === true);
+  const adapterState = sipAdapter.getState();
 
-  const callId = `call-${Date.now().toString(36)}`;
-  const newCall: CallSession = {
-    id: callId,
-    organizationId: currentActor.organizationId,
-    direction: 'outbound',
-    status: 'in_progress',
-    callerNumber: targetNumber,
-    calleeNumber: '01018108979',
-    customerName: targetName,
+  if (adapterState === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'agent',
+      action: 'call.dial_rejected_disabled',
+      entityType: 'call',
+      entityId: 'chan-voice',
+      afterState: { adapterState, phoneNumber: targetNumber },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: 'بوابة الاتصال الصوتي SIP غير مهيأة (DISABLED). يرجى تهيئة بيانات السنترال أو تفعيل المحاكاة المحلية صراحة.',
+      },
+    });
+    return;
+  }
+
+  if (adapterState !== 'SIMULATED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'agent',
+      action: 'call.dial_rejected_not_implemented',
+      entityType: 'call',
+      entityId: 'chan-voice',
+      afterState: { adapterState, phoneNumber: targetNumber },
+    });
+    res.status(501).json({
+      success: false,
+      adapterState,
+      error: {
+        code: 'LIVE_SIP_INVITE_NOT_IMPLEMENTED',
+        message:
+          'إجراء المكالمات الصوتية الحية عبر SIP INVITE/SDP/RTP غير مفعّل بعد بدون بوابة وسائط PBX حية (NOT_IMPLEMENTED). استخدم المحاكاة المحلية (simulate=true) للتجربة الآمنة.',
+      },
+    });
+    return;
+  }
+
+  const session = await sipAdapter.initiateOutboundCall({
+    organizationId: orgId,
+    from: voiceConfig?.defaultCallerId || '+20220000000',
+    to: targetNumber,
     agentId: currentActor.userId,
-    customerId: customerId || (isAdminTarget ? 'cust-admin-ahmed' : undefined),
-    startedAt: new Date().toISOString(),
-    durationSeconds: 1,
-    aiSentiment: 'positive',
-    transcript: `[بدء الاتصال الصوتي WebRTC / SIP مع ${targetName} على الرقم ${targetNumber}]`,
-    aiSummary: `مكالمة صادرة من مدير النظام (م. أحمد شتا - 01018108979). جاهزة للاستماع والتحليل.`,
-  };
-  db.calls.set(callId, newCall);
+  });
+
+  if (customerName) {
+    session.customerName = customerName;
+  }
+  if (customerId) {
+    session.customerId = customerId;
+  }
+  db.calls.set(session.id, session);
   db.schedulePersist();
-  EventBus.publish('call:event', { action: 'dial', call: newCall });
+  EventBus.publish('call:event', { action: 'dial', call: session, adapterState });
 
   await AuditLogger.log({
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'agent',
     action: 'call.outbound_dial',
     entityType: 'call',
-    entityId: callId,
-    afterState: { phoneNumber: targetNumber, customerName: targetName, isAdminTarget },
+    entityId: session.id,
+    afterState: {
+      phoneNumber: targetNumber,
+      customerName: session.customerName,
+      status: session.status,
+      disposition: session.disposition,
+      adapterState,
+    },
   });
 
-  res.json({ success: true, data: newCall, message: `تم تأسيس قناة الاتصال الصوتي للرقم ${targetNumber}` });
+  res.json({
+    success: true,
+    data: session,
+    adapterState,
+    message:
+      adapterState === 'SIMULATED'
+        ? `تم بدء طلب مكالمة محاكاة للرقم ${targetNumber} (بانتظار تأكيد الجلسة)`
+        : `تم إرسال طلب الاتصال عبر SIP للرقم ${targetNumber} (بانتظار تأكيد المزود)`,
+  });
 });
 
-apiRouter.post('/calls/:id/end', async (req: Request, res: Response) => {
+// User-initiated /calls/:id/confirm is strictly forbidden — call connection requires a cryptographically signed provider callback
+apiRouter.post('/calls/:id/confirm', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'call.make');
+  const orgId = currentActor.organizationId;
   const call = db.calls.get(req.params.id);
-  if (!call || call.organizationId !== currentActor.organizationId) {
+  if (!call || call.organizationId !== orgId) {
     res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
     return;
   }
-  call.status = 'completed';
-  call.endedAt = new Date().toISOString();
-
-  db.schedulePersist();
-  EventBus.publish('call:event', { action: 'end', call });
 
   await AuditLogger.log({
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'call.forged_confirm_rejected',
+    entityType: 'call',
+    entityId: call.id,
+    afterState: { reason: 'PROVIDER_CONFIRMATION_REQUIRED' },
+  });
+
+  res.status(403).json({
+    success: false,
+    error: {
+      code: 'PROVIDER_CONFIRMATION_REQUIRED',
+      message: 'Forbidden: Call connection cannot be confirmed by a user session; a cryptographically signed provider callback (/api/v1/webhooks/sip/call-confirm) is required.',
+    },
+  });
+});
+
+// Explicit Simulation-only answer transition (never marks a call as provider_confirmed)
+apiRouter.post('/calls/:id/simulate-answer', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'call.make');
+  const orgId = currentActor.organizationId;
+  const call = db.calls.get(req.params.id);
+  if (!call || call.organizationId !== orgId) {
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
+    return;
+  }
+  if (!String(call.disposition || '').startsWith('simulated')) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'SIMULATED_CALL_REQUIRED',
+        message: 'Only explicitly simulated calls may use /simulate-answer.',
+      },
+    });
+    return;
+  }
+  if (call.status !== 'ringing') {
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'INVALID_CALL_STATE_TRANSITION',
+        message: `Cannot answer simulated call from status '${call.status}'.`,
+      },
+    });
+    return;
+  }
+
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(db.getChannelConfig(orgId, 'chan-voice'), true);
+  const confirmedCall = sipAdapter.confirmCallConnected
+    ? await sipAdapter.confirmCallConnected(call.id, `sim-ack-${Date.now()}`)
+    : call;
+
+  EventBus.publish('call:event', { action: 'simulate_answer', call: confirmedCall });
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'call.simulated_answer',
+    entityType: 'call',
+    entityId: confirmedCall.id,
+    afterState: { status: confirmedCall.status, disposition: confirmedCall.disposition },
+  });
+
+  res.json({ success: true, data: confirmedCall });
+});
+
+// Provider-Originated Cryptographically Authenticated SIP Call Confirmation Callback
+apiRouter.post(
+  ['/webhooks/sip/call-confirm', '/integrations/voice/call-confirm', '/integrations/sip/call-confirm'],
+  async (req: Request, res: Response) => {
+    const rawBodyBuf: Buffer | string | undefined = (req as any).rawBody;
+    if (!rawBodyBuf || (typeof rawBodyBuf === 'string' ? rawBodyBuf.length === 0 : rawBodyBuf.byteLength === 0)) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'MALFORMED_RAW_BODY', message: 'Provider callback must include a non-empty raw JSON body.' },
+      });
+      return;
+    }
+
+    let payload: any;
+    try {
+      const rawStr = typeof rawBodyBuf === 'string' ? rawBodyBuf : rawBodyBuf.toString('utf-8');
+      payload = JSON.parse(rawStr);
+    } catch {
+      res.status(400).json({
+        success: false,
+        error: { code: 'MALFORMED_WEBHOOK_PAYLOAD', message: 'Malformed JSON in SIP confirmation callback.' },
+      });
+      return;
+    }
+
+    const callId = typeof payload?.callId === 'string' ? payload.callId.trim() : '';
+    const providerSessionId = typeof payload?.providerSessionId === 'string' ? payload.providerSessionId.trim() : '';
+    if (!callId || !providerSessionId || providerSessionId.length < 4) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_PROVIDER_PAYLOAD', message: 'Valid callId and providerSessionId are required.' },
+      });
+      return;
+    }
+
+    const call = db.calls.get(callId);
+    if (!call) {
+      res.status(404).json({ success: false, error: { code: 'CALL_NOT_FOUND', message: 'Call session not found.' } });
+      return;
+    }
+
+    const orgId = call.organizationId;
+    if ('organizationId' in payload && payload.organizationId !== orgId) {
+      res.status(403).json({
+        success: false,
+        error: { code: 'TENANT_SPOOFING_REJECTED', message: 'organizationId does not match call tenant.' },
+      });
+      return;
+    }
+
+    if (String(call.disposition || '').startsWith('simulated')) {
+      res.status(409).json({
+        success: false,
+        error: {
+          code: 'SIMULATED_CALL_CANNOT_BE_PROVIDER_CONFIRMED',
+          message: 'Simulated calls cannot be promoted to provider_confirmed.',
+        },
+      });
+      return;
+    }
+
+    const voiceConfig = db.getChannelConfig(orgId, 'chan-voice') || db.getChannelConfig(orgId, 'chan-sip');
+    const webhookSecret = typeof voiceConfig?.webhookSecret === 'string' ? voiceConfig.webhookSecret : '';
+    if (!webhookSecret) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'PROVIDER_WEBHOOK_SECRET_UNCONFIGURED',
+          message: 'SIP webhookSecret is not configured for this tenant.',
+        },
+      });
+      return;
+    }
+
+    const sigHeader = String(req.headers['x-sip-signature'] || req.headers['x-webhook-signature'] || '');
+    const expectedHex = crypto.createHmac('sha256', webhookSecret).update(rawBodyBuf).digest('hex');
+    const expectedSig = `sha256=${expectedHex}`;
+    if (!safeEqualStrings(sigHeader, expectedSig)) {
+      await AuditLogger.log({
+        organizationId: orgId,
+        actorId: 'sip-provider-webhook',
+        actorType: 'system',
+        action: 'call.provider_confirm_signature_rejected',
+        entityType: 'call',
+        entityId: call.id,
+        afterState: { callId: call.id },
+      });
+      res.status(401).json({
+        success: false,
+        error: { code: 'INVALID_PROVIDER_SIGNATURE', message: 'Invalid or missing SIP provider HMAC-SHA256 signature.' },
+      });
+      return;
+    }
+
+    if (!call.providerTransactionId || call.disposition !== 'awaiting_provider_confirmation') {
+      res.status(409).json({
+        success: false,
+        error: {
+          code: 'NO_PENDING_PROVIDER_TRANSACTION',
+          message: 'Call does not have an active persisted pending SIP provider transaction.',
+        },
+      });
+      return;
+    }
+
+    if (call.status !== 'ringing') {
+      res.status(409).json({
+        success: false,
+        error: {
+          code: 'INVALID_CALL_STATE_TRANSITION',
+          message: `Call '${call.id}' is in status '${call.status}' and cannot transition to in_progress.`,
+        },
+      });
+      return;
+    }
+
+    const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
+    const eventId = typeof payload?.eventId === 'string' ? payload.eventId.trim() : '';
+    const accountId = String(voiceConfig?.sipUsername || 'default');
+    const replayKeys = [
+      `sip_confirm:${orgId}:${accountId}:sha256:${rawDigest}`,
+      `sip_confirm:${orgId}:${accountId}:call:${call.id}:${providerSessionId}`,
+    ];
+    if (eventId) replayKeys.push(`sip_confirm:${orgId}:${accountId}:evt:${eventId}`);
+
+    const sipTxId = crypto.randomUUID();
+    const reserve = reserveDurableIdempotencyKeys(replayKeys, { kind: 'sip_confirm', txId: sipTxId });
+    if (!reserve.ok) {
+      if (reserve.reason === 'STORAGE_UNTRUSTED') {
+        res.status(503).json({
+          success: false,
+          error: { code: 'IDEMPOTENCY_STORAGE_UNTRUSTED', message: reserve.message },
+        });
+        return;
+      }
+      res.status(409).json({
+        success: false,
+        error: { code: 'REPLAYED_PROVIDER_CALLBACK', message: 'Replayed SIP provider confirmation rejected.' },
+      });
+      return;
+    }
+
+    const prevStatus = call.status;
+    const prevDisposition = call.disposition;
+    const prevTranscript = call.transcript;
+    const prevProviderSessionId = call.providerSessionId;
+    let sipDbPersisted = false;
+
+    try {
+      transitionDurableIdempotencyState(replayKeys, 'PROCESSING');
+      const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceConfig, false);
+      if (sipAdapter.getState() === 'DISABLED') {
+        releaseDurableIdempotencyKeys(replayKeys);
+        res.status(409).json({
+          success: false,
+          error: { code: 'ADAPTER_DISABLED', message: 'SIP Telephony adapter is DISABLED.' },
+        });
+        return;
+      }
+
+      const confirmedCall = sipAdapter.confirmCallConnected
+        ? await sipAdapter.confirmCallConnected(call.id, providerSessionId)
+        : call;
+
+      db.recordCommittedWebhookTx(sipTxId);
+      const persisted = db.saveToDisk();
+      if (!persisted) {
+        throw new Error('Failed to persist confirmed call state to disk.');
+      }
+      sipDbPersisted = true;
+      commitDurableIdempotencyKeys(replayKeys, { metadata: { callId: call.id, providerSessionId } });
+
+      EventBus.publish('call:event', { action: 'confirm', call: confirmedCall });
+      await AuditLogger.log({
+        organizationId: orgId,
+        actorId: 'sip-provider-webhook',
+        actorType: 'system',
+        action: 'call.provider_confirmed',
+        entityType: 'call',
+        entityId: confirmedCall.id,
+        afterState: {
+          status: confirmedCall.status,
+          disposition: confirmedCall.disposition,
+          providerSessionId,
+        },
+      });
+
+      res.json({ success: true, data: confirmedCall });
+    } catch (err: any) {
+      if (!sipDbPersisted) {
+        db.removeCommittedWebhookTx(sipTxId);
+        call.status = prevStatus;
+        call.disposition = prevDisposition;
+        call.transcript = prevTranscript;
+        call.providerSessionId = prevProviderSessionId;
+        db.calls.set(call.id, call);
+        releaseDurableIdempotencyKeys(replayKeys);
+      }
+      res.status(503).json({
+        success: false,
+        error: { code: 'PERSISTENCE_FAILED', message: err?.message || 'Failed to persist confirmation.' },
+      });
+    }
+  }
+);
+
+apiRouter.post('/calls/:id/end', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'call.make');
+  const orgId = currentActor.organizationId;
+  const call = db.calls.get(req.params.id);
+  if (!call || call.organizationId !== orgId) {
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
+    return;
+  }
+
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(db.getChannelConfig(orgId, 'chan-voice'), true);
+  const endedCall = await sipAdapter.terminateCall(call.id, req.body?.disposition || 'completed_normal');
+
+  EventBus.publish('call:event', { action: 'end', call: endedCall });
+
+  await AuditLogger.log({
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'user',
     action: 'call.hangup',
     entityType: 'call',
-    entityId: call.id,
-    afterState: { status: 'completed' },
+    entityId: endedCall.id,
+    afterState: { status: endedCall.status, disposition: endedCall.disposition },
   });
 
-  res.json({ success: true, data: call });
+  res.json({ success: true, data: endedCall });
 });
 
 apiRouter.post('/calls/:id/control', async (req: Request, res: Response) => {
-  const { action, supervisorMode } = req.body || {}; // 'hold' | 'unhold' | 'mute' | 'hangup' | 'whisper' | 'barge'
+  const { action, supervisorMode } = req.body || {}; // 'hold' | 'unhold' | 'mute' | 'unmute' | 'hangup' | 'whisper' | 'barge'
   const allowedActions = ['hold', 'unhold', 'mute', 'unmute', 'hangup', 'whisper', 'barge'];
   if (!action || typeof action !== 'string' || !allowedActions.includes(action)) {
     res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Valid call control action is required' } });
@@ -885,33 +1845,49 @@ apiRouter.post('/calls/:id/control', async (req: Request, res: Response) => {
     assertPermission(currentActor.role, [], 'call.make');
   }
 
+  const orgId = currentActor.organizationId;
   const call = db.calls.get(req.params.id);
-  if (!call || call.organizationId !== currentActor.organizationId) {
+  if (!call || call.organizationId !== orgId) {
     res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Call not found' } });
     return;
   }
 
-  if (action === 'hold') call.status = 'hold';
-  else if (action === 'unhold') call.status = 'in_progress';
-  else if (action === 'hangup') {
-    call.status = 'completed';
-    call.endedAt = new Date().toISOString();
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(db.getChannelConfig(orgId, 'chan-voice'), true);
+  try {
+    if (action === 'hold') await sipAdapter.toggleHold(call.id, true);
+    else if (action === 'unhold') await sipAdapter.toggleHold(call.id, false);
+    else if (action === 'mute') await sipAdapter.toggleMute(call.id, true);
+    else if (action === 'unmute') await sipAdapter.toggleMute(call.id, false);
+    else if (action === 'whisper' || action === 'barge') {
+      await sipAdapter.bargeOrWhisperCall(call.id, currentActor.userId, action);
+    } else if (action === 'hangup') {
+      await sipAdapter.terminateCall(call.id, 'completed_by_operator');
+    }
+  } catch (err: any) {
+    if (String(err?.message || '').includes('INVALID_CALL_STATE_TRANSITION')) {
+      res.status(409).json({
+        success: false,
+        error: { code: 'INVALID_CALL_STATE_TRANSITION', message: err.message },
+      });
+      return;
+    }
+    throw err;
   }
 
-  db.schedulePersist();
-  EventBus.publish('call:event', { action, call });
+  const updatedCall = db.calls.get(call.id) || call;
+  EventBus.publish('call:event', { action, call: updatedCall });
 
   await AuditLogger.log({
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'user',
     action: `call.${action}`,
     entityType: 'call',
-    entityId: call.id,
-    afterState: { status: call.status, supervisorMode },
+    entityId: updatedCall.id,
+    afterState: { status: updatedCall.status, supervisorMode },
   });
 
-  res.json({ success: true, data: call });
+  res.json({ success: true, data: updatedCall });
 });
 
 // ----------------------------------------------------
@@ -1081,6 +2057,144 @@ const handleTicketUpdate = async (req: Request, res: Response) => {
 apiRouter.put('/tickets/:id', handleTicketUpdate);
 apiRouter.put('/tickets/:id/status', handleTicketUpdate);
 
+apiRouter.post('/tickets/:id/comments', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { content, isInternal } = req.body || {};
+  if (!content || typeof content !== 'string' || content.trim().length === 0) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Comment content is required' } });
+  }
+
+  const author = db.users.get(currentActor.userId);
+  const comment = db.saveTicketComment({
+    id: crypto.randomUUID(),
+    organizationId: currentActor.organizationId,
+    ticketId: ticket.id,
+    authorId: currentActor.userId,
+    authorName: author?.fullName || 'الموظف المسجل',
+    isInternal: isInternal !== false,
+    content: content.trim(),
+    createdAt: new Date().toISOString(),
+  });
+
+  EventBus.publish('ticket:comment_added', { ticketId: ticket.id, commentId: comment.id });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.comment_add',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    afterState: { commentId: comment.id, isInternal: comment.isInternal },
+  });
+
+  res.status(201).json({ success: true, data: comment });
+});
+
+apiRouter.get('/tickets/:id/comments', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.read');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const comments = db.getTicketComments(currentActor.organizationId, ticket.id);
+  res.json({ success: true, data: comments });
+});
+
+apiRouter.post('/tickets/:id/assign', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { agentId, teamId } = req.body || {};
+  ticket.assignedAgentId = agentId || undefined;
+  ticket.teamId = teamId || undefined;
+  ticket.updatedAt = new Date().toISOString();
+  db.tickets.set(ticket.id, ticket);
+  db.schedulePersist();
+
+  EventBus.publish('ticket:assigned', { ticketId: ticket.id, agentId, teamId });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.assign',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    afterState: { assignedAgentId: ticket.assignedAgentId, teamId: ticket.teamId },
+  });
+
+  res.json({ success: true, data: ticket });
+});
+
+apiRouter.post('/tickets/:id/resolve', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { resolutionSummary, disposition } = req.body || {};
+  ticket.status = 'resolved';
+  ticket.resolvedAt = new Date().toISOString();
+  ticket.updatedAt = new Date().toISOString();
+  db.tickets.set(ticket.id, ticket);
+  db.schedulePersist();
+
+  EventBus.publish('ticket:resolved', { ticketId: ticket.id, resolutionSummary, disposition });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.resolve',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    afterState: { status: 'resolved', resolutionSummary },
+  });
+
+  res.json({ success: true, data: ticket });
+});
+
+apiRouter.post('/tickets/:id/reopen', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ticket.update');
+  const ticket = db.tickets.get(req.params.id);
+  if (!ticket || ticket.organizationId !== currentActor.organizationId) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Ticket not found' } });
+  }
+
+  const { justification } = req.body || {};
+  ticket.status = 'in_progress';
+  ticket.resolvedAt = undefined;
+  ticket.updatedAt = new Date().toISOString();
+  db.tickets.set(ticket.id, ticket);
+  db.schedulePersist();
+
+  EventBus.publish('ticket:reopened', { ticketId: ticket.id, justification });
+
+  await AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'ticket.reopen',
+    entityType: 'ticket',
+    entityId: ticket.id,
+    reason: justification || 'Customer or supervisor requested ticket reopening',
+    afterState: { status: 'in_progress' },
+  });
+
+  res.json({ success: true, data: ticket });
+});
+
 // ----------------------------------------------------
 // 6. AI Gateway & Copilot
 // ----------------------------------------------------
@@ -1171,8 +2285,19 @@ apiRouter.get('/operations/live', (req: Request, res: Response) => {
   const agents = Array.from(db.agents.values()).filter((a) => a.organizationId === currentActor.organizationId);
 
   const activeConvs = convs.filter((c) => c.status === 'open').length;
+  const waitingQueue = convs.filter((c) => c.status === 'queued' || !c.assignedAgentId).length;
   const activeCalls = calls.filter((c) => c.status === 'in_progress' || c.status === 'ringing').length;
+  const completedCalls = calls.filter((c) => c.status === 'completed');
+  const avgCallDuration =
+    completedCalls.length > 0
+      ? Math.round(completedCalls.reduce((sum, c) => sum + (c.durationSeconds || 0), 0) / completedCalls.length)
+      : 185;
+
   const slaAtRisk = tickets.filter((t) => t.slaStatus === 'at_risk' || t.slaStatus === 'warning').length;
+  const breachedCount = tickets.filter((t) => t.slaStatus === 'breached').length;
+  const slaCompliancePercent =
+    tickets.length > 0 ? Number((((tickets.length - breachedCount) / tickets.length) * 100).toFixed(1)) : 99.4;
+
   const agentsOnline = agents.filter((a) => a.status === 'online' || a.status === 'busy').length;
   const agentsBusy = agents.filter((a) => a.status === 'busy').length;
 
@@ -1182,20 +2307,55 @@ apiRouter.get('/operations/live', (req: Request, res: Response) => {
       liveMetrics: {
         activeConversations: activeConvs,
         activeCalls: activeCalls,
-        waitingQueue: 2,
+        waitingQueue,
         slaAtRiskCount: slaAtRisk,
-        agentsOnline: agentsOnline,
-        agentsBusy: agentsBusy,
-        serviceAvailabilityPercent: 99.8,
-        aiComplianceAlerts: 1,
+        slaCompliancePercent,
+        averageHandlingTimeSeconds: avgCallDuration,
+        agentsOnline,
+        agentsBusy,
+        serviceAvailabilityPercent: 99.9,
+        aiComplianceAlerts: 0,
         openTicketsCount: tickets.filter((t) => t.status !== 'resolved' && t.status !== 'closed').length,
       },
       aiBudget: {
         monthlyLimitUsd: org?.settings?.aiMonthlyBudgetUsd ?? 250,
-        currentSpendUsd: org?.settings?.aiCurrentMonthSpendUsd ?? 18.45,
+        currentSpendUsd: org?.settings?.aiCurrentMonthSpendUsd ?? 0,
         zeroCostMode: org?.settings?.zeroCostMode ?? true,
         aiExecutionMode: AIGateway.resolveExecutionMode(org?.settings),
       },
+    },
+  });
+});
+
+apiRouter.get('/operations/workload', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const agents = Array.from(db.agents.values()).filter((a) => a.organizationId === currentActor.organizationId);
+  const convs = db.getConversations(currentActor.organizationId);
+  const tickets = db.getTickets(currentActor.organizationId);
+
+  const agentWorkloads = agents.map((agent) => {
+    const user = db.users.get(agent.userId);
+    const assignedConversations = convs.filter((c) => c.assignedAgentId === agent.id && c.status === 'open');
+    const assignedTickets = tickets.filter((t) => t.assignedAgentId === agent.id && t.status !== 'resolved' && t.status !== 'closed');
+    const utilization = agent.maxConcurrency > 0 ? Math.min(100, Math.round((assignedConversations.length / agent.maxConcurrency) * 100)) : 0;
+
+    return {
+      agentId: agent.id,
+      agentName: user?.fullName || 'موظف خدمة',
+      status: agent.status,
+      activeChatsCount: assignedConversations.length,
+      activeTicketsCount: assignedTickets.length,
+      maxConcurrency: agent.maxConcurrency,
+      utilizationPercent: utilization,
+    };
+  });
+
+  res.json({
+    success: true,
+    data: {
+      totalAgents: agents.length,
+      onlineAgents: agents.filter((a) => a.status === 'online' || a.status === 'busy').length,
+      workloads: agentWorkloads,
     },
   });
 });
@@ -1560,9 +2720,150 @@ apiRouter.post('/kb/test-rag', (req: Request, res: Response) => {
   });
 });
 
+function normalizeArabicText(str: string): string {
+  return str
+    .replace(/[\u064B-\u065F\u0670]/g, '') // Remove diacritics
+    .replace(/[إأآا]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .toLowerCase();
+}
+
+apiRouter.post('/kb/articles/search', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const { query, category } = req.body || {};
+  if (!query || typeof query !== 'string') {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Query is required' } });
+  }
+
+  const normQuery = normalizeArabicText(query);
+  const queryTokens = normQuery.split(/\s+/).filter((t) => t.length > 1);
+  const docs = Array.from(db.knowledgeDocuments.values()).filter(
+    (d) => d.organizationId === currentActor.organizationId && (!category || d.category === category)
+  );
+
+  const scoredDocs = docs
+    .map((doc) => {
+      let score = 0;
+      const normTitle = normalizeArabicText(doc.title);
+      const normContent = normalizeArabicText(doc.content);
+      const normTags = doc.tags.map(normalizeArabicText);
+
+      for (const token of queryTokens) {
+        if (normTitle.includes(token)) score += 40;
+        if (normTags.some((t) => t.includes(token))) score += 30;
+        if (normContent.includes(token)) score += 15;
+      }
+
+      // Find best snippet
+      let snippet = doc.content.slice(0, 160) + '...';
+      const firstTokenIdx = normContent.indexOf(queryTokens[0] || '');
+      if (firstTokenIdx >= 0) {
+        const start = Math.max(0, firstTokenIdx - 40);
+        const end = Math.min(doc.content.length, firstTokenIdx + 120);
+        snippet = (start > 0 ? '...' : '') + doc.content.slice(start, end) + (end < doc.content.length ? '...' : '');
+      }
+
+      return {
+        id: doc.id,
+        title: doc.title,
+        category: doc.category,
+        tags: doc.tags,
+        snippet,
+        score: Math.min(100, score),
+        confidence: Number((Math.min(0.99, 0.4 + score * 0.01)).toFixed(2)),
+        citation: `[المصدر: ${doc.title} - تصنيف ${doc.category}]`,
+        updatedAt: doc.updatedAt,
+      };
+    })
+    .filter((d) => d.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  res.json({
+    success: true,
+    data: {
+      query,
+      resultsCount: scoredDocs.length,
+      articles: scoredDocs,
+    },
+  });
+});
+
+apiRouter.post('/ai/summarize', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'ai.suggest');
+  const { conversationId, messages } = req.body || {};
+
+  let textToSummarize = '';
+  let sentiment: 'positive' | 'neutral' | 'negative' = 'neutral';
+  let convSubject = 'استفسار عميل';
+
+  if (conversationId) {
+    const conv = db.conversations.get(conversationId);
+    if (!conv || conv.organizationId !== currentActor.organizationId) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+    }
+    convSubject = conv.subject || 'محادثة عميل';
+    sentiment = conv.sentiment;
+    const msgs = db.getMessages(currentActor.organizationId, conv.id);
+    textToSummarize = msgs.map((m) => `${m.sender.name || m.sender.type}: ${m.body}`).join('\n');
+  } else if (Array.isArray(messages)) {
+    textToSummarize = messages.map((m: any) => `${m.sender?.name || m.sender?.type || 'طرف'}: ${m.body || m.text || ''}`).join('\n');
+  }
+
+  // Local structured deterministic summarizer (0 paid API dependency, 100% Zero-Cost safe)
+  const lines = textToSummarize.split('\n').filter(Boolean);
+  const summaryPoints = lines.length > 0 ? lines.slice(-4) : ['لا توجد رسائل كافية للتلخيص'];
+
+  const structuredSummary = {
+    conversationSubject: convSubject,
+    overallSentiment: sentiment,
+    customerIntent: convSubject,
+    summaryText: `ملخص التفاعل: العميل تواصل بشأن "${convSubject}". تم تقديم الدعم المطلوب ومتابعة حالة التذكرة.`,
+    keyPoints: summaryPoints,
+    actionItems: [
+      'التأكد من التزام موعد الـ SLA المحدد للعميل',
+      'إرسال استبيان قياس رضا العميل CSAT بعد انتهاء المعالجة',
+    ],
+    status: 'completed',
+    generatedAt: new Date().toISOString(),
+  };
+
+  res.json({ success: true, data: structuredSummary });
+});
+
 // ----------------------------------------------------
-// 12. Omnichannel Integrations & Meta WhatsApp Cloud API
+// 12. Omnichannel Integrations & Adapter Registry Wiring
 // ----------------------------------------------------
+function mapAdapterStateToUiStatus(
+  state: 'DISABLED' | 'CONFIGURED' | 'TCP_REACHABLE' | 'REGISTERED' | 'CONNECTED' | 'SIMULATED' | 'FAILED',
+  storedConfig?: Record<string, any>
+): { status: string; adapterState: string } {
+  if (state === 'CONNECTED') {
+    return { status: 'online', adapterState: 'CONNECTED' };
+  }
+  if (state === 'REGISTERED') {
+    return { status: 'registered', adapterState: 'REGISTERED' };
+  }
+  if (state === 'TCP_REACHABLE') {
+    return { status: 'tcp_reachable', adapterState: 'TCP_REACHABLE' };
+  }
+  if (state === 'CONFIGURED') {
+    const lastProven = storedConfig?.lastHealthState;
+    if (lastProven === 'CONNECTED') return { status: 'online', adapterState: 'CONNECTED' };
+    if (lastProven === 'REGISTERED') return { status: 'registered', adapterState: 'REGISTERED' };
+    if (lastProven === 'TCP_REACHABLE') return { status: 'tcp_reachable', adapterState: 'TCP_REACHABLE' };
+    if (lastProven === 'FAILED') return { status: 'degraded', adapterState: 'FAILED' };
+    return { status: 'configured', adapterState: 'CONFIGURED' };
+  }
+  if (state === 'SIMULATED') {
+    return { status: 'simulated', adapterState: 'SIMULATED' };
+  }
+  if (state === 'FAILED') {
+    return { status: 'failed', adapterState: 'FAILED' };
+  }
+  return { status: 'disabled', adapterState: 'DISABLED' };
+}
+
 apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
   const orgId = db.assertValidOrganizationId(currentActor.organizationId);
@@ -1573,32 +2874,37 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
   const voiceStored = db.getChannelConfig(orgId, 'chan-voice');
   const emailStored = db.getChannelConfig(orgId, 'chan-email');
   const messengerStored = db.getChannelConfig(orgId, 'chan-messenger');
+  const smsStored = db.getChannelConfig(orgId, 'chan-cequens');
+  const tgStored = db.getChannelConfig(orgId, 'chan-telegram');
 
-  const isConfigured = (stored: Record<string, any> | undefined) =>
-    Boolean(stored && stored.credentialsConfigured !== false && stored.verified !== false);
+  const waAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('whatsapp_cloud', waStored, false);
+  const webchatAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('webchat', webchatStored, false);
+  const sipAdapter = IntegrationRegistry.resolveTelephonyAdapterForTenant(voiceStored, false);
+  const emailAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('email', emailStored, false);
+  const messengerAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('messenger', messengerStored, false);
+  const cequensAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('cequens_sms', smsStored, false);
+  const tgAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('telegram', tgStored, false);
+
+  const waStateInfo = mapAdapterStateToUiStatus(waAdapter.getState(), waStored);
+  const webStateInfo = mapAdapterStateToUiStatus(webchatAdapter.getState(), webchatStored);
+  const voiceStateInfo = mapAdapterStateToUiStatus(sipAdapter.getState(), voiceStored);
+  const emailStateInfo = mapAdapterStateToUiStatus(emailAdapter.getState(), emailStored);
+  const msgStateInfo = mapAdapterStateToUiStatus(messengerAdapter.getState(), messengerStored);
+  const smsStateInfo = mapAdapterStateToUiStatus(cequensAdapter.getState(), smsStored);
+  const tgStateInfo = mapAdapterStateToUiStatus(tgAdapter.getState(), tgStored);
 
   const defaultChannels = [
     {
       id: 'chan-whatsapp',
       type: 'whatsapp',
-      name: 'WhatsApp Business Cloud API (Official)',
-      badge: 'موثق ومعتمد من Meta',
-      status: (isDemoTenant && (!waStored || isConfigured(waStored))) || isConfigured(waStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            wabaId: 'WABA-902184920194',
-            phoneNumberId: 'PNID-8820194829',
-            displayNumber: '+20 101 810 8979 (م. أحمد شتا - Admin)',
-            verifiedName: 'مدار كير - م. أحمد شتا (01018108979)',
-            qualityRating: 'High',
-            messagingLimitTier: 'Tier 2 (10,000 محادثة / 24 ساعة)',
-            ...(waStored || {}),
-          }
-        : { ...(waStored || {}) },
+      name: waAdapter.name,
+      badge: waStateInfo.adapterState === 'CONNECTED' ? 'متصل فعلياً (Meta Cloud)' : waStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ (بانتظار فحص الاتصال)' : 'غير مفعّل (يتطلب بيانات الاعتماد)',
+      status: waStateInfo.status,
+      adapterState: waStateInfo.adapterState,
+      accountInfo: { ...(waStored || {}) },
       metrics: {
-        latencyMs: 42,
+        latencyMs: waStored?.lastLatencyMs ?? 0,
         messagesSent24h: isDemoTenant ? 3842 : 0,
-        deliveryRatePercent: 99.4,
         webhookUrl: '/api/v1/integrations/whatsapp/webhook',
       },
       compliance: {
@@ -1610,18 +2916,13 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
     {
       id: 'chan-webchat',
       type: 'webchat',
-      name: 'Live Web Chat Widget (Portal & Mobile App)',
-      badge: 'WebSockets نشط',
-      status: isDemoTenant || webchatStored ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            widgetId: 'widget-madar-portal-v2',
-            sslEnabled: true,
-            ...(webchatStored || {}),
-          }
-        : { ...(webchatStored || {}) },
+      name: webchatAdapter.name,
+      badge: 'قناة محلية نشطة ($0.00)',
+      status: webStateInfo.status,
+      adapterState: webStateInfo.adapterState,
+      accountInfo: { widgetId: 'widget-omniflow-local', sslEnabled: true, ...(webchatStored || {}) },
       metrics: {
-        latencyMs: 14,
+        latencyMs: 1,
         messagesSent24h: isDemoTenant ? 1240 : 0,
         deliveryRatePercent: 100,
         webhookUrl: '/api/v1/integrations/webchat/webhook',
@@ -1630,59 +2931,76 @@ apiRouter.get('/integrations/channels', (req: Request, res: Response) => {
     {
       id: 'chan-voice',
       type: 'voice',
-      name: 'Cloud SIP Trunk & WebRTC (Asterisk/FreeSWITCH)',
-      badge: 'سنترال سحابي نشط',
-      status: (isDemoTenant && (!voiceStored || isConfigured(voiceStored))) || isConfigured(voiceStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            trunkName: 'STC-SIP-TRUNK-RIYADH-01',
-            concurrentLines: 32,
-            codecs: 'Opus, G.711u',
-            ...(voiceStored || {}),
-          }
-        : { ...(voiceStored || {}) },
+      name: sipAdapter.name,
+      badge:
+        voiceStateInfo.adapterState === 'CONNECTED'
+          ? 'SIP Connected (Verified Session)'
+          : voiceStateInfo.adapterState === 'REGISTERED'
+          ? 'SIP Registered (Authenticated PBX)'
+          : voiceStateInfo.adapterState === 'TCP_REACHABLE'
+          ? 'منفذ TCP متاح (غير مسجل SIP)'
+          : voiceStateInfo.adapterState === 'CONFIGURED'
+          ? 'SIP Configured (Unverified Reachability)'
+          : 'غير مفعّل (يتطلب بوابة SIP)',
+      status: voiceStateInfo.status,
+      adapterState: voiceStateInfo.adapterState,
+      accountInfo: { ...(voiceStored || {}) },
       metrics: {
-        latencyMs: 24,
-        callsHandled24h: isDemoTenant ? 340 : 0,
-        averageMOSScore: 4.4,
+        latencyMs: voiceStored?.lastLatencyMs ?? 0,
+        callsHandled24h: db.getCalls(orgId).length,
         webhookUrl: '/api/v1/integrations/voice/webhook',
       },
     },
     {
       id: 'chan-email',
       type: 'email',
-      name: 'Enterprise Email Gate (support@madar.sa)',
-      badge: 'TLS 1.3 مشفر',
-      status: (isDemoTenant && (!emailStored || isConfigured(emailStored))) || isConfigured(emailStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            smtpHost: 'smtp.madar.sa',
-            pollingIntervalSec: 30,
-            ...(emailStored || {}),
-          }
-        : { ...(emailStored || {}) },
+      name: emailAdapter.name,
+      badge: emailStateInfo.adapterState === 'CONNECTED' ? 'SMTP متصل' : emailStateInfo.adapterState === 'CONFIGURED' ? 'SMTP مهيأ' : 'غير مفعّل (يتطلب SMTP)',
+      status: emailStateInfo.status,
+      adapterState: emailStateInfo.adapterState,
+      accountInfo: { ...(emailStored || {}) },
       metrics: {
-        latencyMs: 120,
-        emailsProcessed24h: isDemoTenant ? 185 : 0,
+        latencyMs: emailStored?.lastLatencyMs ?? 0,
+        emailsProcessed24h: 0,
         webhookUrl: '/api/v1/integrations/email/webhook',
+      },
+    },
+    {
+      id: 'chan-cequens',
+      type: 'sms',
+      name: cequensAdapter.name,
+      badge: smsStateInfo.adapterState === 'CONNECTED' ? 'CEQUENS Connected' : smsStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ (CEQUENS Egypt)' : 'غير مفعّل (يتطلب API Key)',
+      status: smsStateInfo.status,
+      adapterState: smsStateInfo.adapterState,
+      accountInfo: { ...(smsStored || {}) },
+      metrics: {
+        latencyMs: smsStored?.lastLatencyMs ?? 0,
+        webhookUrl: '/api/v1/integrations/sms/webhook',
+      },
+    },
+    {
+      id: 'chan-telegram',
+      type: 'telegram',
+      name: tgAdapter.name,
+      badge: tgStateInfo.adapterState === 'CONNECTED' ? 'Bot API Connected' : tgStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ' : 'غير مفعّل (يتطلب Bot Token)',
+      status: tgStateInfo.status,
+      adapterState: tgStateInfo.adapterState,
+      accountInfo: { ...(tgStored || {}) },
+      metrics: {
+        latencyMs: tgStored?.lastLatencyMs ?? 0,
+        webhookUrl: '/api/v1/integrations/telegram/webhook',
       },
     },
     {
       id: 'chan-messenger',
       type: 'messenger',
       name: 'Meta Messenger & Instagram Direct',
-      badge: 'Graph API v21',
-      status: (isDemoTenant && (!messengerStored || isConfigured(messengerStored))) || isConfigured(messengerStored) ? 'online' : 'unconfigured',
-      accountInfo: isDemoTenant
-        ? {
-            pageName: 'Madar Telecom Official',
-            igHandle: '@madar_sa',
-            ...(messengerStored || {}),
-          }
-        : { ...(messengerStored || {}) },
+      badge: msgStateInfo.adapterState === 'CONNECTED' ? 'Graph API Verified' : msgStateInfo.adapterState === 'CONFIGURED' ? 'مهيأ' : 'غير مفعّل',
+      status: msgStateInfo.status,
+      adapterState: msgStateInfo.adapterState,
+      accountInfo: { ...(messengerStored || {}) },
       metrics: {
-        latencyMs: 65,
-        messagesSent24h: isDemoTenant ? 520 : 0,
+        latencyMs: messengerStored?.lastLatencyMs ?? 0,
         webhookUrl: '/api/v1/integrations/messenger/webhook',
       },
     },
@@ -1702,7 +3020,11 @@ apiRouter.put('/integrations/channels/:id/config', (req: Request, res: Response)
   const channelId = req.params.id;
   const config = req.body || {};
 
-  const savedRecord = db.setChannelConfig(currentActor.organizationId, channelId, config);
+  const savedRecord = db.setChannelConfig(currentActor.organizationId, channelId, {
+    ...config,
+    lastHealthState: 'CONFIGURED',
+    verified: false,
+  });
 
   AuditLogger.log({
     organizationId: currentActor.organizationId,
@@ -1717,195 +3039,707 @@ apiRouter.put('/integrations/channels/:id/config', (req: Request, res: Response)
   res.json({
     success: true,
     data: redactSensitiveValue(savedRecord.config),
-    message: 'تم حفظ إعدادات القناة والاعتمادات بنجاح',
+    message: 'تم حفظ إعدادات القناة والاعتمادات المشفرة بنجاح (يرجى إجراء فحص الاتصال لإثبات الجاهزية)',
   });
 });
 
-// Test channel connection live
+// Genuine provider health check via IntegrationRegistry
 apiRouter.post('/integrations/channels/:id/test-connection', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.read');
+  const orgId = currentActor.organizationId;
   const channelId = req.params.id;
-  const simulatedDelay = Math.floor(20 + Math.random() * 30);
-  await new Promise((r) => setTimeout(r, simulatedDelay));
+  const storedConfig = db.getChannelConfig(orgId, channelId);
+  const allowSimulation = req.body?.simulate === true;
 
-  const config = redactSensitiveValue(db.getChannelConfig(currentActor.organizationId, channelId) || {}) as Record<string, any>;
+  const isVoice = channelId === 'chan-voice' || channelId === 'voice' || channelId === 'sip_egypt';
+  const health = isVoice
+    ? await IntegrationRegistry.resolveTelephonyAdapterForTenant(storedConfig, allowSimulation).fetchHealthStatus()
+    : await IntegrationRegistry.resolveChannelAdapterForTenant(channelId, storedConfig, allowSimulation).fetchHealthStatus();
+
+  const uiStatus = mapAdapterStateToUiStatus(health.state).status;
+
+  if (storedConfig) {
+    db.setChannelConfig(orgId, channelId, {
+      lastHealthState: health.state,
+      lastLatencyMs: health.latencyMs,
+      verified: health.state === 'CONNECTED' || health.state === 'REGISTERED',
+    });
+  }
+
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'channel.health_check',
+    entityType: 'channel',
+    entityId: channelId,
+    afterState: { adapterState: health.state, isHealthy: health.isHealthy, latencyMs: health.latencyMs },
+  });
 
   res.json({
     success: true,
     data: {
       channelId,
-      status: 'online',
-      latencyMs: simulatedDelay,
-      handshake: 'TLS 1.3 - Verified',
-      endpoint: `/api/v1/integrations/${channelId.replace('chan-', '')}/webhook`,
+      status: uiStatus,
+      adapterState: health.state,
+      isHealthy: health.isHealthy,
+      isSimulated: Boolean(health.isSimulated),
+      latencyMs: health.latencyMs,
+      endpoint: `/api/v1/integrations/${channelId.replace(/^chan-/, '')}/webhook`,
       testedAt: new Date().toISOString(),
       details: {
-        optInCompliant: true,
-        credentialsValid: true,
-        ...config,
+        healthMessage: health.details,
+        ...(redactSensitiveValue(storedConfig || {}) as Record<string, any>),
       },
     },
   });
 });
 
-// Meta WhatsApp Webhook Verification Endpoint (hub.challenge)
+function resolveWebhookAccountKey(channelType: string, cfg: Record<string, any>): string {
+  const norm = String(channelType).toLowerCase();
+  if (norm === 'whatsapp' || norm === 'messenger') {
+    return String(cfg.phoneNumberId || cfg.wabaId || cfg.pageId || 'default');
+  }
+  if (norm === 'cequens' || norm === 'sms') {
+    return String(cfg.senderName || cfg.accountId || 'default');
+  }
+  if (norm === 'telegram') {
+    return String(cfg.botToken ? String(cfg.botToken).split(':')[0] : 'default');
+  }
+  if (norm === 'email') {
+    return String(cfg.smtpUser || cfg.fromAddress || 'default');
+  }
+  return 'default';
+}
+
+function extractWebhookBatchItems(channelType: string, parsedPayload: any): Array<{ eventId: string; itemPayload: any }> {
+  const norm = String(channelType).toLowerCase();
+  if ((norm === 'whatsapp' || norm === 'messenger') && Array.isArray(parsedPayload?.entry)) {
+    const items: Array<{ eventId: string; itemPayload: any }> = [];
+    for (const entry of parsedPayload.entry) {
+      if (Array.isArray(entry?.changes)) {
+        for (const change of entry.changes) {
+          const val = change?.value;
+          if (Array.isArray(val?.messages) && val.messages.length > 0) {
+            for (const m of val.messages) {
+              items.push({
+                eventId: String(m?.id || ''),
+                itemPayload: {
+                  entry: [
+                    {
+                      id: entry.id,
+                      changes: [{ value: { ...val, messages: [m] } }],
+                    },
+                  ],
+                },
+              });
+            }
+          }
+        }
+      }
+    }
+    if (items.length > 0) return items;
+  }
+
+  const singleId =
+    parsedPayload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.id ||
+    parsedPayload?.update_id ||
+    parsedPayload?.messageId ||
+    parsedPayload?.id ||
+    '';
+  return [{ eventId: singleId ? String(singleId) : '', itemPayload: parsedPayload }];
+}
+
+function safeEqualStrings(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function getChannelConfigAliases(channelType: string): string[] {
+  const norm = channelType.replace(/^chan-/, '').toLowerCase();
+  if (norm === 'cequens' || norm === 'sms') return ['chan-cequens', 'chan-sms', 'cequens', 'sms'];
+  if (norm === 'voice' || norm === 'sip') return ['chan-voice', 'chan-sip', 'voice', 'sip'];
+  return [`chan-${norm}`, norm];
+}
+
+function findAllChannelConfigsForType(channelType: string) {
+  const aliases = new Set(getChannelConfigAliases(channelType));
+  return Array.from(db.channelConfigs.values()).filter(
+    (rec) => aliases.has(rec.channelId) && db.organizations.has(rec.organizationId)
+  );
+}
+
+// Meta / Provider Webhook Verification Endpoint (hub.challenge) — Works without user session, enforces tenant-specific verifyToken
 apiRouter.get(['/integrations/:channel/webhook', '/webhooks/:channel'], (req: Request, res: Response) => {
   const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
+  const token = typeof req.query['hub.verify_token'] === 'string' ? req.query['hub.verify_token'] : '';
   const challenge = req.query['hub.challenge'];
+  const channelParam = req.params.channel;
+  const requestedPhoneNumberId =
+    typeof req.query['phone_number_id'] === 'string' ? req.query['phone_number_id'] : '';
+  const requestedWabaId = typeof req.query['waba_id'] === 'string' ? req.query['waba_id'] : '';
 
   if (mode === 'subscribe') {
-    if (token === 'madar_verify_token_2026' || !token) {
+    if (!token) {
+      res.status(403).send('Forbidden: Verify token unconfigured or mismatched');
+      return;
+    }
+
+    const candidates = findAllChannelConfigsForType(channelParam);
+    const matched = candidates.find((rec) => {
+      const cfg = rec.config || {};
+      if (requestedPhoneNumberId && cfg.phoneNumberId !== requestedPhoneNumberId) return false;
+      if (requestedWabaId && cfg.wabaId !== requestedWabaId) return false;
+      const expected = typeof cfg.verifyToken === 'string' ? cfg.verifyToken : '';
+      return safeEqualStrings(token, expected);
+    });
+
+    if (matched) {
       res.status(200).send(challenge || 'VERIFIED');
       return;
     }
-    res.status(403).send('Forbidden: Verify token mismatch');
+
+    const envToken = process.env.WHATSAPP_VERIFY_TOKEN || process.env.WEBHOOK_VERIFY_TOKEN || '';
+    if (envToken && safeEqualStrings(token, envToken)) {
+      res.status(200).send(challenge || 'VERIFIED');
+      return;
+    }
+
+    res.status(403).send('Forbidden: Verify token unconfigured or mismatched');
     return;
   }
 
-  res.status(200).json({ status: 'active', channel: req.params.channel });
+  if (
+    currentActor.userId === 'anonymous' ||
+    currentActor.userId === 'unauthenticated' ||
+    currentActor.organizationId === 'unauthenticated'
+  ) {
+    res.status(401).json({
+      success: false,
+      error: { code: 'AUTH_TOKEN_REQUIRED', message: 'Authentication required for webhook status inspection.' },
+    });
+    return;
+  }
+
+  const orgId = currentActor.organizationId;
+  const storedConfig = db.getChannelConfig(orgId, `chan-${channelParam}`) || db.getChannelConfig(orgId, channelParam);
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelParam, storedConfig, false);
+  res.status(200).json({ status: adapter.getState().toLowerCase(), adapterState: adapter.getState(), channel: channelParam });
 });
 
-// Universal Inbound Webhook Processor (Meta WhatsApp, Twilio, Generic HTTP Webhooks)
+// Universal Inbound Webhook Processor — Supports unauthenticated provider callbacks via server-controlled tenant mapping & rawBody signature verification
 const handleIncomingWebhook = async (req: Request, res: Response) => {
   const channelType = (req.params.channel || 'whatsapp') as UnifiedMessage['channel'];
-  const payload = req.body || {};
-
-  // Extract from Meta WhatsApp Cloud API format or generic JSON
-  let text = '';
-  let phone = '';
-  let name = 'عميل عبر Webhook';
-
-  if (payload.object === 'whatsapp_business_account') {
-    const entry = payload.entry?.[0];
-    const change = entry?.changes?.[0]?.value;
-    const msg = change?.messages?.[0];
-    const contact = change?.contacts?.[0];
-
-    text = msg?.text?.body || 'رسالة وسائط واردة';
-    phone = msg?.from ? `+${msg.from}` : '+966500112233';
-    name = contact?.profile?.name || 'عميل واتساب';
-  } else if (payload.From || payload.Body) {
-    // Twilio SMS/Voice webhook format
-    text = payload.Body || payload.TranscriptionText || 'مكالمة أو رسالة واردة';
-    phone = payload.From || '+966500112233';
-    name = payload.CallerName || 'متصل عبر الهاتف';
-  } else {
-    // Generic JSON payload
-    text = payload.messageText || payload.text || payload.body || 'استفسار وارد جديد';
-    phone = payload.senderPhone || payload.phone || payload.from || '+966500112233';
-    name = payload.senderName || payload.customerName || payload.name || 'عميل تجريبي';
-  }
-
-  // 1. Find or create Customer
-  let customer = Array.from(db.customers.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.phone === phone
-  );
-
-  if (!customer) {
-    const custId = `cust-wh-${Date.now().toString(36)}`;
-    customer = {
-      id: custId,
-      organizationId: currentActor.organizationId,
-      name,
-      phone,
-      email: `${custId}@madar.sa`,
-      customerTier: 'standard',
-      lifetimeValue: 1500,
-      tags: [`webhook_${channelType}`, 'عميل_مباشر'],
-      customFields: { source: 'webhook', channel: channelType },
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    db.customers.set(custId, customer);
-  }
-
-  // 2. Find or create Conversation
-  let conv = Array.from(db.conversations.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.customerId === customer!.id && c.status === 'open'
-  );
-
-  const now = new Date().toISOString();
-  if (!conv) {
-    const convId = `conv-wh-${Date.now().toString(36)}`;
-    conv = {
-      id: convId,
-      organizationId: currentActor.organizationId,
-      customerId: customer.id,
-      channel: channelType,
-      status: 'open',
-      priority: customer.customerTier === 'vip' ? 'urgent' : 'medium',
-      sentiment: 'neutral',
-      intent: 'general_inquiry',
-      lastMessageAt: now,
-      createdAt: now,
-      updatedAt: now,
-    };
-    db.conversations.set(convId, conv);
-  }
-
-  // 3. Create Unified Message
-  const msgId = `msg-wh-${Date.now().toString(36)}`;
-  const msg: UnifiedMessage = {
-    id: msgId,
-    organizationId: currentActor.organizationId,
-    conversationId: conv.id,
-    customerId: customer.id,
-    channel: channelType,
-    direction: 'inbound',
-    type: 'text',
-    body: text,
-    sender: {
-      id: customer.id,
-      type: 'customer',
-      name: customer.name,
-    },
-    status: 'delivered',
-    metadata: { webhook: true, receivedAt: now },
-    createdAt: now,
-  };
-  db.messages.set(msgId, msg);
-
-  // 4. Run AI Sentiment & Intent analysis
-  try {
-    const aiResult = await AIGateway.execute({
-      organizationId: currentActor.organizationId,
-      task: 'sentiment_intent_analysis',
-      input: text,
-      privacy: 'confidential',
-      forceLocal: true,
+  const rawBodyBuf: Buffer | string | undefined = (req as any).rawBody;
+  if (!rawBodyBuf || (typeof rawBodyBuf === 'string' ? rawBodyBuf.length === 0 : rawBodyBuf.byteLength === 0)) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MALFORMED_RAW_BODY', message: 'Webhook request must include a valid non-empty raw JSON body.' },
     });
-    const parsed = JSON.parse(aiResult.content);
-    if (parsed.intent) conv.intent = parsed.intent;
-    if (parsed.sentiment) conv.sentiment = parsed.sentiment;
-  } catch {
-    // fallback
+    return;
   }
 
-  // 5. Persist & Broadcast
-  db.schedulePersist();
-  EventBus.publish('message:new', { conversationId: conv.id, message: msg });
-  EventBus.publish('conversation:updated', conv);
+  let parsedPayload: any;
+  try {
+    const rawStr = typeof rawBodyBuf === 'string' ? rawBodyBuf : rawBodyBuf.toString('utf-8');
+    parsedPayload = JSON.parse(rawStr);
+  } catch {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MALFORMED_WEBHOOK_PAYLOAD', message: 'Malformed JSON in webhook request body.' },
+    });
+    return;
+  }
 
-  AuditLogger.log({
-    organizationId: currentActor.organizationId,
-    actorId: customer.id,
-    actorType: 'system',
-    action: 'webhook.inbound_processed',
-    entityType: 'message',
-    entityId: msgId,
-    afterState: { channel: channelType, phone, textSnippet: text.slice(0, 30) },
-  });
+  if (!parsedPayload || typeof parsedPayload !== 'object' || Array.isArray(parsedPayload)) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'MALFORMED_WEBHOOK_PAYLOAD', message: 'Webhook JSON payload must be an object.' },
+    });
+    return;
+  }
 
-  res.status(200).json({
-    success: true,
-    data: {
-      messageId: msg.id,
-      conversationId: conv.id,
-      customerId: customer.id,
-      status: 'received_and_broadcasted',
-    },
-  });
+  const normalizedHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (typeof v === 'string') normalizedHeaders[k.toLowerCase()] = v;
+    else if (Array.isArray(v) && v[0]) normalizedHeaders[k.toLowerCase()] = v[0];
+  }
+
+  const candidates = findAllChannelConfigsForType(channelType);
+  if (candidates.length === 0) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: `Webhook rejected: adapter '${channelType}' is DISABLED (no configured tenant credentials).`,
+      },
+    });
+    return;
+  }
+
+  let matchedRecord: (typeof candidates)[number] | undefined;
+  const normChannel = String(channelType).toLowerCase();
+
+  if (normChannel === 'whatsapp' || normChannel === 'messenger') {
+    const entry = parsedPayload?.entry?.[0];
+    const changeVal = entry?.changes?.[0]?.value;
+    const phoneNumberId = changeVal?.metadata?.phone_number_id || parsedPayload?.phoneNumberId;
+    const wabaId = entry?.id || parsedPayload?.wabaId;
+    const pageId = entry?.id || parsedPayload?.pageId;
+
+    if (!phoneNumberId && !wabaId && !pageId) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'UNKNOWN_TENANT_MAPPING',
+          message: 'Webhook rejected: missing Meta account/phone_number_id mapping identifier.',
+        },
+      });
+      return;
+    }
+
+    matchedRecord = candidates.find((rec) => {
+      const cfg = rec.config || {};
+      if (phoneNumberId && cfg.phoneNumberId === phoneNumberId) return true;
+      if (wabaId && cfg.wabaId === wabaId) return true;
+      if (pageId && cfg.pageId === pageId) return true;
+      return false;
+    });
+  } else if (normChannel === 'cequens' || normChannel === 'sms') {
+    const senderName = parsedPayload?.senderName || parsedPayload?.sender_name || parsedPayload?.accountId;
+    if (senderName) {
+      matchedRecord = candidates.find((rec) => {
+        const cfg = rec.config || {};
+        return cfg.senderName === senderName || cfg.accountId === senderName;
+      });
+    } else {
+      const authHeader = normalizedHeaders['authorization'] || '';
+      matchedRecord = candidates.find((rec) => {
+        const secret = rec.config?.webhookSecret || '';
+        return secret ? safeEqualStrings(authHeader, `Bearer ${secret}`) : false;
+      });
+      if (!matchedRecord) {
+        res.status(401).json({
+          success: false,
+          error: {
+            code: 'WEBHOOK_VERIFICATION_FAILED',
+            message: 'Invalid or missing CEQUENS webhook authorization or senderName mapping.',
+          },
+        });
+        return;
+      }
+    }
+  } else if (normChannel === 'telegram') {
+    const botId = parsedPayload?.bot_id || parsedPayload?.botId;
+    const secretHeader = normalizedHeaders['x-telegram-bot-api-secret-token'] || '';
+    const botFiltered = botId
+      ? candidates.filter((rec) => String(rec.config?.botToken || '').split(':')[0] === String(botId))
+      : candidates;
+    if (botId && botFiltered.length === 0) {
+      res.status(403).json({
+        success: false,
+        error: { code: 'UNKNOWN_TENANT_MAPPING', message: 'Webhook rejected: unknown Telegram bot_id mapping.' },
+      });
+      return;
+    }
+    matchedRecord = botFiltered.find((rec) => {
+      const expected = rec.config?.webhookSecretToken || rec.config?.webhookSecret || '';
+      return safeEqualStrings(secretHeader, expected);
+    });
+    if (!matchedRecord) {
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'WEBHOOK_VERIFICATION_FAILED',
+          message: 'Invalid or missing X-Telegram-Bot-Api-Secret-Token.',
+        },
+      });
+      return;
+    }
+  } else if (normChannel === 'email') {
+    const recipient = parsedPayload?.to || parsedPayload?.recipient;
+    matchedRecord = recipient
+      ? candidates.find((rec) => {
+          const cfg = rec.config || {};
+          return cfg.smtpUser === recipient || cfg.fromAddress === recipient;
+        })
+      : undefined;
+    if (!matchedRecord && !recipient) {
+      const authHeader = normalizedHeaders['authorization'] || normalizedHeaders['x-email-webhook-secret'] || '';
+      matchedRecord = candidates.find((rec) => {
+        const expected = rec.config?.webhookSecret || '';
+        return safeEqualStrings(authHeader, expected);
+      });
+    }
+  }
+
+  if (!matchedRecord) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'UNKNOWN_TENANT_MAPPING',
+        message: `Webhook rejected: no server-verified tenant mapping found for channel '${channelType}'.`,
+      },
+    });
+    return;
+  }
+
+  const orgId = matchedRecord.organizationId;
+
+  // Reject any attempt to spoof organizationId in the webhook payload
+  if ('organizationId' in parsedPayload && parsedPayload.organizationId !== orgId) {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.tenant_spoofing_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { spoofedOrgId: parsedPayload.organizationId, resolvedOrgId: orgId },
+    });
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'TENANT_SPOOFING_REJECTED',
+        message: 'Spoofed organizationId in webhook payload does not match server-controlled provider mapping.',
+      },
+    });
+    return;
+  }
+
+  const storedConfig = matchedRecord.config;
+  const isAuthenticatedSession =
+    currentActor.userId !== 'anonymous' &&
+    currentActor.userId !== 'unauthenticated' &&
+    currentActor.organizationId === orgId;
+  const allowSim = isAuthenticatedSession && (req.query.simulate === 'true' || parsedPayload.simulate === true);
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelType, storedConfig, allowSim);
+
+  if (adapter.getState() === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.rejected_disabled',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { adapterState: 'DISABLED' },
+    });
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: `Webhook rejected: adapter '${channelType}' is DISABLED (missing verified credentials).`,
+      },
+    });
+    return;
+  }
+
+  const verification = await adapter.verifyWebhook(normalizedHeaders, rawBodyBuf);
+
+  if (!verification.isValid) {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.signature_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { error: verification.error },
+    });
+    res.status(401).json({
+      success: false,
+      error: {
+        code: 'WEBHOOK_VERIFICATION_FAILED',
+        message: verification.error || 'Webhook signature/secret verification failed.',
+      },
+    });
+    return;
+  }
+
+  // Durable, tenant- and account-namespaced replay protection with batch deduplication
+  const accountKey = resolveWebhookAccountKey(channelType, storedConfig || {});
+  const rawDigest = crypto.createHash('sha256').update(rawBodyBuf).digest('hex');
+  const rawDigestKey = `wh:${orgId}:${channelType}:${accountKey}:sha256:${rawDigest}`;
+  const txId = crypto.randomUUID();
+
+  // First check raw payload digest (exact duplicate payload replay)
+  const rawReserve = reserveDurableIdempotencyKeys([rawDigestKey], { kind: 'webhook', txId });
+  if (!rawReserve.ok) {
+    if (rawReserve.reason === 'STORAGE_UNTRUSTED') {
+      res.status(503).json({
+        success: false,
+        error: { code: 'IDEMPOTENCY_STORAGE_UNTRUSTED', message: rawReserve.message },
+      });
+      return;
+    }
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.replay_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { rawDigest, reason: rawReserve.reason },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'REPLAYED_WEBHOOK_EVENT',
+        message: 'Duplicate or replayed webhook event rejected.',
+      },
+    });
+    return;
+  }
+
+  const batchItems = extractWebhookBatchItems(channelType, verification.rawPayload);
+  const acceptedItems: Array<{ eventId: string; itemPayload: any; keys: string[] }> = [];
+  const skippedDuplicateIds: string[] = [];
+
+  for (const item of batchItems) {
+    if (!item.eventId) {
+      acceptedItems.push({ ...item, keys: [] });
+      continue;
+    }
+    const evtKey = `wh:${orgId}:${channelType}:${accountKey}:evt:${item.eventId}`;
+    const itemRes = reserveDurableIdempotencyKeys([evtKey], { kind: 'webhook', txId });
+    if (!itemRes.ok) {
+      if (itemRes.reason === 'STORAGE_UNTRUSTED') {
+        releaseDurableIdempotencyKeys([rawDigestKey, ...acceptedItems.flatMap((a) => a.keys)]);
+        res.status(503).json({
+          success: false,
+          error: { code: 'IDEMPOTENCY_STORAGE_UNTRUSTED', message: itemRes.message },
+        });
+        return;
+      }
+      skippedDuplicateIds.push(item.eventId);
+      continue;
+    }
+    acceptedItems.push({ ...item, keys: [evtKey] });
+  }
+
+  if (acceptedItems.length === 0) {
+    releaseDurableIdempotencyKeys([rawDigestKey]);
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: 'external-webhook',
+      actorType: 'system',
+      action: 'webhook.replay_rejected',
+      entityType: 'channel',
+      entityId: channelType,
+      afterState: { skippedDuplicateIds, rawDigest },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'REPLAYED_WEBHOOK_EVENT',
+        message: 'All events in webhook payload are duplicates or replayed.',
+      },
+    });
+    return;
+  }
+
+  const allReservedKeys = [rawDigestKey, ...acceptedItems.flatMap((a) => a.keys)];
+  const faultInject = process.env.NODE_ENV === 'test' ? process.env.OMNIFLOW_TEST_FAULT_INJECT : undefined;
+  const processedResults: Array<{ messageId: string; conversationId: string; customerId: string; messageStatus: string }> = [];
+  const createdCustomerIds: string[] = [];
+  const createdConvIds: string[] = [];
+  const prevConvSnapshots: Array<{ id: string; lastMessageAt: string; intent: any; sentiment: any }> = [];
+  const createdMsgIds: string[] = [];
+  const pendingEvents: Array<{ conv: Conversation; msg: UnifiedMessage; phone: string; text: string }> = [];
+  let dbPersisted = false;
+
+  try {
+    if (faultInject === 'CRASH_AFTER_RESERVE') {
+      throw new Error('FAULT_INJECT: CRASH_AFTER_RESERVE');
+    }
+
+    transitionDurableIdempotencyState(allReservedKeys, 'PROCESSING');
+    for (const item of acceptedItems) {
+      const normalizedMsg = await adapter.normalizeInboundMessage(item.itemPayload, orgId);
+      const phone = normalizedMsg.sender?.id?.replace(/^cust-[^-]+-/, '') || verification.senderIdentifier || normalizedMsg.customerId;
+      const text = normalizedMsg.body;
+      const name = normalizedMsg.sender?.name || 'عميل عبر Webhook';
+
+      let customer = Array.from(db.customers.values()).find(
+        (c) => c.organizationId === orgId && (c.phone === phone || c.id === `${orgId}::${normalizedMsg.customerId}`)
+      );
+
+      if (!customer) {
+        const baseCustId = normalizedMsg.customerId || `cust-wh-${Date.now().toString(36)}`;
+        // Tenant-namespace deterministic IDs so another tenant can never overwrite an existing record
+        const custId = db.customers.has(baseCustId) ? `${orgId}::${baseCustId}` : baseCustId;
+        customer = {
+          id: custId,
+          organizationId: orgId,
+          name,
+          phone,
+          email: `${custId.replace(/[^a-zA-Z0-9_-]/g, '_')}@omniflow.local`,
+          customerTier: 'standard',
+          lifetimeValue: 0,
+          tags: [`webhook_${channelType}`],
+          customFields: { source: 'webhook', channel: channelType, adapterState: adapter.getState() },
+          createdAt: normalizedMsg.createdAt,
+          updatedAt: normalizedMsg.createdAt,
+        };
+        db.customers.set(custId, customer);
+        createdCustomerIds.push(custId);
+      }
+
+      let conv = Array.from(db.conversations.values()).find(
+        (c) => c.organizationId === orgId && c.customerId === customer!.id && c.status === 'open'
+      );
+
+      const now = new Date().toISOString();
+      if (!conv) {
+        const baseConvId = normalizedMsg.conversationId || `conv-wh-${Date.now().toString(36)}`;
+        const convId = db.conversations.has(baseConvId) ? `${orgId}::${baseConvId}` : baseConvId;
+        conv = {
+          id: convId,
+          organizationId: orgId,
+          customerId: customer.id,
+          channel: normalizedMsg.channel,
+          status: 'open',
+          priority: customer.customerTier === 'vip' ? 'urgent' : 'medium',
+          sentiment: 'neutral',
+          intent: 'general_inquiry',
+          lastMessageAt: now,
+          createdAt: now,
+          updatedAt: now,
+        };
+        db.conversations.set(convId, conv);
+        createdConvIds.push(convId);
+      } else {
+        prevConvSnapshots.push({
+          id: conv.id,
+          lastMessageAt: conv.lastMessageAt,
+          intent: conv.intent,
+          sentiment: conv.sentiment,
+        });
+        conv.lastMessageAt = now;
+      }
+
+      const msg: UnifiedMessage = {
+        ...normalizedMsg,
+        conversationId: conv.id,
+        customerId: customer.id,
+        metadata: {
+          ...(normalizedMsg.metadata || {}),
+          webhook: true,
+          adapterState: adapter.getState(),
+          receivedAt: now,
+        },
+      };
+      db.messages.set(msg.id, msg);
+      createdMsgIds.push(msg.id);
+
+      try {
+        const aiResult = await AIGateway.execute({
+          organizationId: orgId,
+          task: 'sentiment_intent_analysis',
+          input: text,
+          privacy: 'confidential',
+          forceLocal: true,
+        });
+        const parsed = JSON.parse(aiResult.content);
+        if (parsed.intent) conv.intent = parsed.intent;
+        if (parsed.sentiment) conv.sentiment = parsed.sentiment;
+      } catch {
+        // fallback
+      }
+
+      pendingEvents.push({ conv, msg, phone, text });
+      processedResults.push({
+        messageId: msg.id,
+        conversationId: conv.id,
+        customerId: customer.id,
+        messageStatus: msg.status,
+      });
+    }
+
+    if (faultInject === 'CRASH_AFTER_MEMORY_MUTATE' || faultInject === 'CRASH_BEFORE_DB_SAVE') {
+      throw new Error(`FAULT_INJECT: ${faultInject}`);
+    }
+
+    db.recordCommittedWebhookTx(txId);
+    const persisted = db.saveToDisk();
+    if (!persisted) {
+      throw new Error('Failed to persist webhook messages to durable storage.');
+    }
+    dbPersisted = true;
+
+    if (faultInject === 'CRASH_AFTER_DB_SAVE' || faultInject === 'FAIL_IDEMPOTENCY_COMMIT') {
+      throw new Error(`FAULT_INJECT: ${faultInject}`);
+    }
+
+    commitDurableIdempotencyKeys(allReservedKeys, {
+      metadata: { channel: channelType, processedCount: processedResults.length },
+    });
+
+    // Publish SSE & audit events only after durable persistence succeeds
+    for (const evt of pendingEvents) {
+      EventBus.publish('message:new', { conversationId: evt.conv.id, message: evt.msg });
+      EventBus.publish('conversation:updated', evt.conv);
+      await AuditLogger.log({
+        organizationId: orgId,
+        actorId: evt.msg.customerId,
+        actorType: 'system',
+        action: 'webhook.inbound_processed',
+        entityType: 'message',
+        entityId: evt.msg.id,
+        afterState: {
+          channel: channelType,
+          adapterState: adapter.getState(),
+          status: evt.msg.status,
+          phone: evt.phone,
+          textSnippet: evt.text.slice(0, 30),
+        },
+      });
+    }
+
+    const first = processedResults[0];
+    res.status(200).json({
+      success: true,
+      data: {
+        messageId: first.messageId,
+        conversationId: first.conversationId,
+        customerId: first.customerId,
+        adapterState: adapter.getState(),
+        messageStatus: first.messageStatus,
+        processedCount: processedResults.length,
+        skippedDuplicates: skippedDuplicateIds,
+        processedMessages: processedResults,
+        status: 'received_and_broadcasted',
+      },
+    });
+  } catch (err: any) {
+    if (!dbPersisted) {
+      // Rollback in-memory mutations only when DB snapshot was NOT durably persisted
+      db.removeCommittedWebhookTx(txId);
+      for (const mid of createdMsgIds) db.messages.delete(mid);
+      for (const cid of createdConvIds) db.conversations.delete(cid);
+      for (const snap of prevConvSnapshots) {
+        const c = db.conversations.get(snap.id);
+        if (c) {
+          c.lastMessageAt = snap.lastMessageAt;
+          c.intent = snap.intent;
+          c.sentiment = snap.sentiment;
+        }
+      }
+      for (const cuid of createdCustomerIds) db.customers.delete(cuid);
+      releaseDurableIdempotencyKeys(allReservedKeys);
+    }
+    res.status(503).json({
+      success: false,
+      error: {
+        code: 'WEBHOOK_PERSISTENCE_FAILED',
+        message: err?.message || 'Failed to persist inbound webhook event; replay key not committed.',
+      },
+    });
+  }
 };
 
 apiRouter.post('/integrations/:channel/webhook', handleIncomingWebhook);
@@ -1963,140 +3797,261 @@ apiRouter.get('/integrations/whatsapp/templates', (req: Request, res: Response) 
   res.json({ success: true, data: templates });
 });
 
+// Unified authenticated outbound dispatch through IntegrationRegistry (used by both whatsapp/send-template and general channel dispatch)
 apiRouter.post('/integrations/whatsapp/send-template', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.reply');
-  const { templateName, recipientPhone, parameters, customerId } = req.body;
+  const { templateName, recipientPhone, parameters, customerId, simulate } = req.body || {};
+  const orgId = currentActor.organizationId;
 
   if (!recipientPhone || !templateName) {
     res.status(400).json({ success: false, error: { message: 'Template name and phone required' } });
     return;
   }
 
-  const isAdmin = recipientPhone.includes('01018108979');
-  const cleanPhone = recipientPhone.replace(/[^0-9]/g, '');
-
-  // Look up customer scoped strictly to currentActor.organizationId
   let targetCustomer = customerId ? db.customers.get(customerId) : undefined;
-  if (targetCustomer && targetCustomer.organizationId !== currentActor.organizationId) {
+  if (targetCustomer && targetCustomer.organizationId !== orgId) {
     res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Customer not found in organization' } });
     return;
   }
-  if (!targetCustomer) {
-    targetCustomer = Array.from(db.customers.values()).find(
-      (c) => c.organizationId === currentActor.organizationId && c.phone === recipientPhone
-    );
+
+  const waConfig = db.getChannelConfig(orgId, 'chan-whatsapp');
+  const waAdapter = IntegrationRegistry.resolveChannelAdapterForTenant('whatsapp_cloud', waConfig, simulate === true);
+  const adapterState = waAdapter.getState();
+
+  if (adapterState === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'user',
+      action: 'whatsapp.send_rejected_disabled',
+      entityType: 'whatsapp_message',
+      entityId: 'chan-whatsapp',
+      afterState: { adapterState, templateName, recipientPhone },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: 'قناة WhatsApp Cloud API غير مفعلة (DISABLED). يرجى ضبط مفاتيح Meta أو تمرير simulate=true للتجربة المحلية.',
+      },
+    });
+    return;
   }
 
-  const waConfig = db.getChannelConfig(currentActor.organizationId, 'chan-whatsapp') || {};
-  const metaToken = waConfig.apiToken || process.env.META_WHATSAPP_TOKEN;
-  const phoneNumberId = waConfig.phoneNumberId || process.env.META_PHONE_NUMBER_ID;
+  const cleanPhone = recipientPhone.replace(/[^0-9]/g, '');
+  const formattedRecipient = cleanPhone.startsWith('0') && !cleanPhone.startsWith('20') ? `20${cleanPhone.slice(1)}` : cleanPhone;
 
-  let liveMetaStatus = 'simulated_ready';
-  let metaApiResponse: any = null;
+  const outboundMsg: UnifiedMessage = {
+    id: crypto.randomUUID(),
+    organizationId: orgId,
+    customerId: targetCustomer?.id || `cust-wa-${formattedRecipient}`,
+    conversationId: `conv-wa-${formattedRecipient}`,
+    channel: 'whatsapp',
+    direction: 'outbound',
+    type: 'template',
+    body: `[Template: ${templateName}] ${Array.isArray(parameters) ? parameters.join(' | ') : ''}`,
+    sender: {
+      id: currentActor.userId,
+      type: 'agent',
+      name: currentActor.name,
+    },
+    status: adapterState === 'SIMULATED' ? 'simulated' : 'pending',
+    metadata: {
+      templateName,
+      recipient: formattedRecipient,
+      parameters,
+    },
+    createdAt: new Date().toISOString(),
+  };
 
-  // Real Meta WhatsApp Cloud API Call if valid token exists
-  if (metaToken && phoneNumberId && !metaToken.includes('sec_meta_token') && !phoneNumberId.includes('PNID-')) {
-    try {
-      const metaUrl = `https://graph.facebook.com/v18.0/${phoneNumberId}/messages`;
-      const metaBody = {
-        messaging_product: 'whatsapp',
-        to: cleanPhone.startsWith('0') && !cleanPhone.startsWith('20') ? `20${cleanPhone.slice(1)}` : cleanPhone,
-        type: 'template',
-        template: {
-          name: templateName,
-          language: { code: 'ar' },
-          components: parameters && parameters.length > 0 ? [
-            {
-              type: 'body',
-              parameters: parameters.map((param: string) => ({ type: 'text', text: param })),
-            }
-          ] : [],
-        },
-      };
+  const dispatchOutcome = await waAdapter.dispatchOutboundMessage(outboundMsg);
+  outboundMsg.status = dispatchOutcome.status === 'disabled' ? 'failed' : dispatchOutcome.status;
+  db.messages.set(outboundMsg.id, outboundMsg);
+  db.schedulePersist();
 
-      const metaRes = await fetch(metaUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${metaToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(metaBody),
-      });
-
-      metaApiResponse = await metaRes.json();
-      liveMetaStatus = metaRes.ok ? 'meta_cloud_sent' : 'meta_cloud_rejected';
-    } catch (err: any) {
-      liveMetaStatus = 'meta_network_error';
-      metaApiResponse = { error: err.message };
-    }
-  }
-
-  const generatedMsgId = metaApiResponse?.messages?.[0]?.id || `wamid-${Date.now()}`;
-
-  // Log audit
-  AuditLogger.log({
-    organizationId: currentActor.organizationId,
+  await AuditLogger.log({
+    organizationId: orgId,
     actorId: currentActor.userId,
     actorType: 'user',
     action: 'whatsapp.send_template',
     entityType: 'whatsapp_message',
-    entityId: generatedMsgId,
-    afterState: { templateName, recipientPhone, parameters, liveMetaStatus, isAdmin },
+    entityId: dispatchOutcome.externalMessageId || outboundMsg.id,
+    afterState: {
+      templateName,
+      recipientPhone,
+      adapterState,
+      deliveryStatus: dispatchOutcome.status,
+      externalMessageId: dispatchOutcome.externalMessageId,
+    },
   });
 
-  res.json({
-    success: true,
+  res.status(dispatchOutcome.status === 'failed' ? 502 : 200).json({
+    success: dispatchOutcome.status !== 'failed',
     data: {
-      messageId: generatedMsgId,
-      status: liveMetaStatus === 'meta_cloud_sent' ? 'delivered' : 'queued',
-      deliveryMode: liveMetaStatus,
+      messageId: dispatchOutcome.externalMessageId || outboundMsg.id,
+      internalMessageId: outboundMsg.id,
+      status: dispatchOutcome.status,
+      adapterState,
       channel: 'whatsapp',
       recipientPhone,
-      isAdminRecipient: isAdmin,
-      adminContact: isAdmin ? 'م. أحمد شتا (01018108979)' : undefined,
-      metaApiResponse,
-      timestamp: new Date().toISOString(),
+      timestamp: outboundMsg.createdAt,
     },
-    message: liveMetaStatus === 'meta_cloud_sent'
-      ? `تم إرسال الرسالة فعلياً عبر Meta WhatsApp Cloud API إلى ${recipientPhone}`
-      : `تم توثيق إرسال القالب بنجاح إلى ${recipientPhone} (جاهز للمطابقة مع Meta Cloud API)`,
+    message:
+      dispatchOutcome.status === 'simulated'
+        ? `تم توثيق إرسال القالب في وضع المحاكاة الصفرية (SIMULATED) إلى ${recipientPhone}`
+        : dispatchOutcome.status === 'sent'
+        ? `تم إرسال الرسالة فعلياً عبر Meta WhatsApp Cloud API إلى ${recipientPhone}`
+        : `تعذر إرسال القالب عبر البوابة (${dispatchOutcome.status})`,
+  });
+});
+
+// Unified channel outbound dispatch endpoint wired via IntegrationRegistry
+apiRouter.post('/integrations/:channel/dispatch', async (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.reply');
+  const orgId = currentActor.organizationId;
+  const channelParam = req.params.channel;
+  const { recipient, body, conversationId, customerId, simulate } = req.body || {};
+
+  if (!body || typeof body !== 'string' || body.trim().length === 0) {
+    res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Message body is required' } });
+    return;
+  }
+
+  const storedConfig =
+    db.getChannelConfig(orgId, `chan-${channelParam}`) || db.getChannelConfig(orgId, channelParam);
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelParam, storedConfig, simulate === true);
+  const adapterState = adapter.getState();
+
+  if (adapterState === 'DISABLED') {
+    await AuditLogger.log({
+      organizationId: orgId,
+      actorId: currentActor.userId,
+      actorType: 'user',
+      action: 'channel.dispatch_rejected_disabled',
+      entityType: 'channel',
+      entityId: channelParam,
+      afterState: { adapterState },
+    });
+    res.status(409).json({
+      success: false,
+      error: {
+        code: 'ADAPTER_DISABLED',
+        message: `Adapter '${channelParam}' is DISABLED (unconfigured). Configure credentials or set simulate=true.`,
+      },
+    });
+    return;
+  }
+
+  const outboundMsg: UnifiedMessage = {
+    id: crypto.randomUUID(),
+    organizationId: orgId,
+    customerId: customerId || `cust-${channelParam}-outbound`,
+    conversationId: conversationId || `conv-${channelParam}-${recipient || 'default'}`,
+    channel: adapter.channelType,
+    direction: 'outbound',
+    type: 'text',
+    body: body.trim(),
+    sender: {
+      id: currentActor.userId,
+      type: 'agent',
+      name: currentActor.name,
+    },
+    status: adapterState === 'SIMULATED' ? 'simulated' : 'pending',
+    metadata: {
+      recipient,
+      adapterState,
+    },
+    createdAt: new Date().toISOString(),
+  };
+
+  const dispatchRes = await adapter.dispatchOutboundMessage(outboundMsg);
+  outboundMsg.status = dispatchRes.status === 'disabled' ? 'failed' : dispatchRes.status;
+  db.messages.set(outboundMsg.id, outboundMsg);
+  db.schedulePersist();
+  EventBus.publish('message:new', { conversationId: outboundMsg.conversationId, message: outboundMsg });
+
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'channel.outbound_dispatch',
+    entityType: 'message',
+    entityId: outboundMsg.id,
+    afterState: {
+      channel: channelParam,
+      adapterState,
+      deliveryStatus: dispatchRes.status,
+      externalMessageId: dispatchRes.externalMessageId,
+    },
+  });
+
+  res.status(dispatchRes.status === 'failed' ? 502 : 200).json({
+    success: dispatchRes.status !== 'failed',
+    data: {
+      messageId: outboundMsg.id,
+      externalMessageId: dispatchRes.externalMessageId,
+      status: dispatchRes.status,
+      adapterState,
+      channel: adapter.channelType,
+    },
   });
 });
 
 apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Response) => {
   assertPermission(currentActor.role, [], 'conversation.reply');
+  const orgId = currentActor.organizationId;
   const { channel, senderName, senderPhone, customerName, phoneNumber, messageText } = req.body || {};
   const channelType = channel || 'whatsapp';
   const text = messageText || 'السلام عليكم، أود الاستفسار عن ترقية باقتي الحالية';
   const phone = senderPhone || phoneNumber || '+966500998877';
   const name = senderName || customerName || 'عميل تجريبي';
 
-  // 1. Find or create Customer
+  const storedConfig = db.getChannelConfig(orgId, `chan-${channelType}`);
+  const adapter = IntegrationRegistry.resolveChannelAdapterForTenant(channelType, storedConfig, true);
+  const simulatedPayload =
+    channelType === 'whatsapp'
+      ? {
+          entry: [
+            {
+              changes: [
+                {
+                  value: {
+                    contacts: [{ wa_id: phone.replace(/[^0-9]/g, ''), profile: { name } }],
+                    messages: [{ id: `sim-${Date.now()}`, from: phone.replace(/[^0-9]/g, ''), text: { body: text } }],
+                  },
+                },
+              ],
+            },
+          ],
+        }
+      : { from: phone, sender: phone, visitorId: phone, visitorName: name, message: text, text, body: text };
+
+  const normalized = await adapter.normalizeInboundMessage(simulatedPayload, orgId);
+
   let customer = Array.from(db.customers.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.phone === phone
+    (c) => c.organizationId === orgId && c.phone === phone
   );
 
   if (!customer) {
     const custId = `cust-sim-${Date.now().toString(36)}`;
     customer = {
       id: custId,
-      organizationId: currentActor.organizationId,
+      organizationId: orgId,
       name,
       phone,
-      email: `${custId}@demo.sa`,
+      email: `${custId}@demo.local`,
       customerTier: 'standard',
       lifetimeValue: 1200,
-      tags: ['تطبيق_واتساب', 'عميل_جديد'],
-      customFields: { channel: channelType },
+      tags: ['محاكاة_محلية', `channel_${channelType}`],
+      customFields: { channel: channelType, simulated: true },
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     db.customers.set(custId, customer);
   }
 
-  // 2. Find or create Conversation
   let conv = Array.from(db.conversations.values()).find(
-    (c) => c.organizationId === currentActor.organizationId && c.customerId === customer!.id && c.status === 'open'
+    (c) => c.organizationId === orgId && c.customerId === customer!.id && c.status === 'open'
   );
 
   const now = new Date().toISOString();
@@ -2104,7 +4059,7 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
     const convId = `conv-sim-${Date.now().toString(36)}`;
     conv = {
       id: convId,
-      organizationId: currentActor.organizationId,
+      organizationId: orgId,
       customerId: customer.id,
       channel: channelType,
       status: 'open',
@@ -2121,11 +4076,11 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
     conv.lastMessageAt = now;
   }
 
-  // 3. Create Unified Message
   const msgId = `msg-sim-${Date.now().toString(36)}`;
   const msg: UnifiedMessage = {
+    ...normalized,
     id: msgId,
-    organizationId: currentActor.organizationId,
+    organizationId: orgId,
     conversationId: conv.id,
     customerId: customer.id,
     channel: channelType,
@@ -2137,11 +4092,21 @@ apiRouter.post('/integrations/simulate-inbound', async (req: Request, res: Respo
       type: 'customer',
       name: customer.name,
     },
-    status: 'delivered',
-    metadata: { simulated: true, simulatedAt: now },
+    status: 'simulated',
+    metadata: { ...(normalized.metadata || {}), simulated: true, adapterState: adapter.getState(), simulatedAt: now },
     createdAt: now,
   };
   db.messages.set(msgId, msg);
+
+  await AuditLogger.log({
+    organizationId: orgId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'integration.simulate_inbound',
+    entityType: 'message',
+    entityId: msgId,
+    afterState: { channel: channelType, adapterState: adapter.getState(), status: 'simulated' },
+  });
 
   // 4. Run AI Sentiment & Intent analysis
   try {
@@ -2446,6 +4411,86 @@ apiRouter.post('/automation/simulate', (req: Request, res: Response) => {
     },
   });
 });
+
+apiRouter.get('/automation/executions', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'conversation.read');
+  const ruleId = req.query.ruleId as string;
+  const list = db.getAutomationExecutions(currentActor.organizationId, ruleId);
+  res.json({ success: true, data: list, count: list.length });
+});
+
+function executeLiveAutomation(eventType: string, payload: any) {
+  try {
+    const orgId = payload?.organizationId;
+    if (!orgId) return;
+    const activeRules = Array.from(db.automationRules.values()).filter(
+      (r) => r.organizationId === orgId && r.isActive
+    );
+
+    for (const rule of activeRules) {
+      if (rule.trigger !== eventType && rule.trigger !== 'all_events') continue;
+      let matches = true;
+      const matchedConds: string[] = [];
+
+      for (const cond of rule.conditions) {
+        const [obj, key] = cond.field.split('.');
+        const val = payload[obj] ? payload[obj][key] : payload[key || obj];
+        if (cond.operator === 'equals' && String(val).toLowerCase() === String(cond.value).toLowerCase()) {
+          matchedConds.push(`${cond.field} == ${cond.value}`);
+        } else if (cond.operator === 'contains' && String(val).toLowerCase().includes(String(cond.value).toLowerCase())) {
+          matchedConds.push(`${cond.field} contains ${cond.value}`);
+        } else {
+          matches = false;
+          break;
+        }
+      }
+
+      if (matches) {
+        rule.executionCount += 1;
+        rule.lastExecutedAt = new Date().toISOString();
+
+        for (const action of rule.actions) {
+          if (action.type === 'assign_team' && action.payload?.teamName && payload.id) {
+            const ticket = db.tickets.get(payload.id);
+            if (ticket) {
+              const team = Array.from(db.teams.values()).find((t) => t.name.includes(String(action.payload.teamName)));
+              if (team) {
+                ticket.teamId = team.id;
+                db.tickets.set(ticket.id, ticket);
+              }
+            }
+          } else if (action.type === 'escalate_priority' && payload.id) {
+            const ticket = db.tickets.get(payload.id);
+            if (ticket) {
+              ticket.priority = 'urgent';
+              ticket.slaStatus = 'at_risk';
+              db.tickets.set(ticket.id, ticket);
+            }
+          }
+        }
+
+        db.recordAutomationExecution({
+          id: crypto.randomUUID(),
+          organizationId: orgId,
+          ruleId: rule.id,
+          ruleName: rule.name,
+          triggerEvent: eventType,
+          matchedConditions: matchedConds,
+          executedActions: rule.actions,
+          status: 'success',
+          executedAt: new Date().toISOString(),
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[Live Automation Execution Error]:', err);
+  }
+}
+
+// Wire EventBus listeners for live event-driven automation
+EventBus.subscribe('ticket:created', (payload) => executeLiveAutomation('ticket_created', payload));
+EventBus.subscribe('conversation:created', (payload) => executeLiveAutomation('conversation_created', payload));
+EventBus.subscribe('ticket:escalated', (payload) => executeLiveAutomation('ticket_escalated', payload));
 
 // ----------------------------------------------------
 // 15. Intelligent Recommendations & Next-Best-Action Engine
@@ -3349,9 +5394,10 @@ const ALLOWED_WORKSPACE_ROOT_FILES = [
 ];
 
 const ALLOWED_WORKSPACE_DIRS = ['src', 'server', 'docs', 'scripts', '.github/workflows'];
-const ALLOWED_WORKSPACE_EXTENSIONS = /\.(ts|tsx|js|jsx|json|css|html|md|rules|yml|yaml|sql)$/;
+const ALLOWED_WORKSPACE_EXTENSIONS = /\.(ts|tsx|js|jsx|json|css|html|md|rules|yml|yaml|sql|ps1)$/;
 const ALLOWED_EXACT_WORKSPACE_FILE_PATHS = new Set([
   'docs/roadmap/OMNIFLOW_PHASE_P1_3_2_EVIDENCE.sha256',
+  'scripts/windows/prepare_ntfs_acl_hardening.ps1',
 ]);
 const EXCLUDED_DIR_NAMES = new Set([
   'node_modules',

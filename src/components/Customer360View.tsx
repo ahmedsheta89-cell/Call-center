@@ -1,6 +1,6 @@
 /**
  * @file src/components/Customer360View.tsx
- * Customer 360 CRM Hub with Unified Omnichannel Timeline Aggregator
+ * Customer 360 CRM Hub with Unified Omnichannel Timeline Aggregator, Notes & Follow-ups
  */
 
 import React, { useState, useEffect } from 'react';
@@ -23,6 +23,14 @@ import {
   AlertTriangle,
   TrendingUp,
   Check,
+  Plus,
+  StickyNote,
+  CalendarCheck,
+  UserCheck,
+  Copy,
+  AlertCircle,
+  FileText,
+  X,
 } from 'lucide-react';
 import { Customer } from '../types.ts';
 
@@ -31,30 +39,251 @@ interface Customer360ViewProps {
   selectedCustomerId?: string;
   onSelectCustomer: (id: string) => void;
   onInitiateCall: (customerPhone: string) => void;
+  onCustomerCreated?: (customer: Customer) => void;
+}
+
+interface NoteItem {
+  id: string;
+  authorName: string;
+  content: string;
+  pinned: boolean;
+  createdAt: string;
+}
+
+interface FollowUpItem {
+  id: string;
+  title: string;
+  dueAt: string;
+  priority: string;
+  assignedAgentName?: string;
+  status: string;
+  createdAt: string;
 }
 
 export const Customer360View: React.FC<Customer360ViewProps> = ({
-  customers,
+  customers: initialCustomers,
   selectedCustomerId,
   onSelectCustomer,
   onInitiateCall,
+  onCustomerCreated,
 }) => {
+  const [localCustomers, setLocalCustomers] = useState<Customer[]>(initialCustomers);
   const [search, setSearch] = useState('');
   const [tierFilter, setTierFilter] = useState<string>('all');
   const [timeline, setTimeline] = useState<any[]>([]);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  // Notes & Follow-ups state
+  const [notes, setNotes] = useState<NoteItem[]>([]);
+  const [followUps, setFollowUps] = useState<FollowUpItem[]>([]);
+
+  // Modals state
+  const [showNewCustomerModal, setShowNewCustomerModal] = useState(false);
+  const [showDuplicateCheckModal, setShowDuplicateCheckModal] = useState(false);
+  const [showAddNoteModal, setShowAddNoteModal] = useState(false);
+  const [showScheduleFollowUpModal, setShowScheduleFollowUpModal] = useState(false);
+
+  // New Customer Form State
+  const [newCustName, setNewCustName] = useState('');
+  const [newCustPhone, setNewCustPhone] = useState('');
+  const [newCustEmail, setNewCustEmail] = useState('');
+  const [newCustTier, setNewCustTier] = useState<'standard' | 'priority' | 'vip'>('standard');
+  const [newCustCity, setNewCustCity] = useState('القاهرة');
+  const [newCustLTV, setNewCustLTV] = useState(500);
+  const [isSubmittingCustomer, setIsSubmittingCustomer] = useState(false);
+
+  // Duplicate Check Form State
+  const [dupPhone, setDupPhone] = useState('');
+  const [dupEmail, setDupEmail] = useState('');
+  const [dupName, setDupName] = useState('');
+  const [dupResults, setDupResults] = useState<any[] | null>(null);
+  const [dupLoading, setDupLoading] = useState(false);
+
+  // Add Note Form State
+  const [noteContent, setNoteContent] = useState('');
+  const [notePinned, setNotePinned] = useState(false);
+  const [noteSubmitting, setNoteSubmitting] = useState(false);
+
+  // Schedule FollowUp Form State
+  const [fuTitle, setFuTitle] = useState('');
+  const [fuDueAt, setFuDueAt] = useState('');
+  const [fuPriority, setFuPriority] = useState('medium');
+  const [fuAgentName, setFuAgentName] = useState('سارة أحمد');
+  const [fuSubmitting, setFuSubmitting] = useState(false);
+
+  useEffect(() => {
+    setLocalCustomers(initialCustomers);
+  }, [initialCustomers]);
+
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3500);
   };
 
-  const activeCustomer = customers.find((c) => c.id === selectedCustomerId) || customers[0];
+  const activeCustomer = localCustomers.find((c) => c.id === selectedCustomerId) || localCustomers[0];
+
+  // Fetch timeline, notes, and followups when activeCustomer changes
+  useEffect(() => {
+    if (!activeCustomer) return;
+    setTimelineLoading(true);
+
+    fetch(`/api/v1/customers/${activeCustomer.id}/timeline`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success) setTimeline(data.data);
+      })
+      .catch(() => {})
+      .finally(() => setTimelineLoading(false));
+
+    fetch(`/api/v1/customers/${activeCustomer.id}/notes`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && Array.isArray(data.data)) setNotes(data.data);
+      })
+      .catch(() => {});
+
+    fetch(`/api/v1/customers/${activeCustomer.id}/follow-ups`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && Array.isArray(data.data)) setFollowUps(data.data);
+      })
+      .catch(() => {});
+  }, [activeCustomer?.id]);
+
+  const handleCreateCustomer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newCustName.trim() || !newCustPhone.trim()) {
+      showToast('يرجى ملء الاسم ورقم الهاتف.');
+      return;
+    }
+    setIsSubmittingCustomer(true);
+    try {
+      const res = await fetch('/api/v1/customers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newCustName.trim(),
+          phone: newCustPhone.trim(),
+          email: newCustEmail.trim() || undefined,
+          customerTier: newCustTier,
+          lifetimeValue: Number(newCustLTV) || 0,
+          customFields: { city: newCustCity, source: 'CRM Manual Entry' },
+        }),
+      });
+      const data = await res.json();
+      if (data.success && data.data) {
+        setLocalCustomers((prev) => [data.data, ...prev]);
+        onSelectCustomer(data.data.id);
+        if (onCustomerCreated) onCustomerCreated(data.data);
+        showToast(`تم إنشاء العميل بنجاح: ${data.data.name}`);
+        setShowNewCustomerModal(false);
+        setNewCustName('');
+        setNewCustPhone('');
+        setNewCustEmail('');
+      } else {
+        showToast(data.error?.message || 'تعذر إنشاء العميل');
+      }
+    } catch {
+      showToast('حدث خطأ أثناء حفظ بيانات العميل');
+    } finally {
+      setIsSubmittingCustomer(false);
+    }
+  };
+
+  const handleCheckDuplicates = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setDupLoading(true);
+    try {
+      const res = await fetch('/api/v1/customers/detect-duplicates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: dupPhone.trim() || undefined,
+          email: dupEmail.trim() || undefined,
+          name: dupName.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setDupResults(data.data?.matches || []);
+      } else {
+        showToast(data.error?.message || 'فشل فحص التكرار');
+      }
+    } catch {
+      showToast('حدث خطأ أثناء فحص السجلات المكررة');
+    } finally {
+      setDupLoading(false);
+    }
+  };
+
+  const handleAddNote = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCustomer || !noteContent.trim()) return;
+    setNoteSubmitting(true);
+    try {
+      const res = await fetch(`/api/v1/customers/${activeCustomer.id}/notes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: noteContent.trim(),
+          pinned: notePinned,
+        }),
+      });
+      const data = await res.json();
+      if (data.success && data.data) {
+        setNotes((prev) => [data.data, ...prev]);
+        showToast('تمت إضافة الملاحظة بنجاح');
+        setShowAddNoteModal(false);
+        setNoteContent('');
+        setNotePinned(false);
+      } else {
+        showToast(data.error?.message || 'فشل حفظ الملاحظة');
+      }
+    } catch {
+      showToast('حدث خطأ أثناء حفظ الملاحظة');
+    } finally {
+      setNoteSubmitting(false);
+    }
+  };
+
+  const handleScheduleFollowUp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCustomer || !fuTitle.trim()) return;
+    setFuSubmitting(true);
+    try {
+      const res = await fetch(`/api/v1/customers/${activeCustomer.id}/follow-up`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: fuTitle.trim(),
+          dueAt: fuDueAt || new Date(Date.now() + 86400000).toISOString(),
+          priority: fuPriority,
+          assignedAgentName: fuAgentName,
+        }),
+      });
+      const data = await res.json();
+      if (data.success && data.data) {
+        setFollowUps((prev) => [data.data, ...prev]);
+        showToast('تمت جدولة المتابعة بنجاح');
+        setShowScheduleFollowUpModal(false);
+        setFuTitle('');
+        setFuDueAt('');
+      } else {
+        showToast(data.error?.message || 'فشل جدولة المتابعة');
+      }
+    } catch {
+      showToast('حدث خطأ أثناء جدولة المتابعة');
+    } finally {
+      setFuSubmitting(false);
+    }
+  };
 
   const exportCustomerDossier = (cust: Customer) => {
     const data = {
       customer: cust,
+      notes,
+      followUps,
       timelineEvents: timeline,
       exportedAt: new Date().toISOString(),
       organization: 'شركة مدار لخدمات العملاء والاتصالات',
@@ -71,18 +300,7 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  useEffect(() => {
-    if (!activeCustomer) return;
-    setTimelineLoading(true);
-    fetch(`/api/v1/customers/${activeCustomer.id}/timeline`)
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.success) setTimeline(data.data);
-      })
-      .finally(() => setTimelineLoading(false));
-  }, [activeCustomer?.id]);
-
-  const filteredCustomers = customers.filter((c) => {
+  const filteredCustomers = localCustomers.filter((c) => {
     const matchesSearch =
       c.name.toLowerCase().includes(search.toLowerCase()) ||
       (c.phone && c.phone.includes(search)) ||
@@ -96,6 +314,28 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
       {/* 1. Left: Customer Directory */}
       <div className="w-80 border-l border-slate-800 bg-slate-900/90 flex flex-col">
         <div className="p-3 border-b border-slate-800 space-y-2">
+          {/* Action buttons: New Customer + Duplicate Check */}
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowNewCustomerModal(true)}
+              className="flex-1 px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 transition shadow-sm"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>عميل جديد</span>
+            </button>
+            <button
+              onClick={() => {
+                setShowDuplicateCheckModal(true);
+                setDupResults(null);
+              }}
+              className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1 transition"
+              title="فحص واكتشاف السجلات المكررة"
+            >
+              <Copy className="w-3.5 h-3.5 text-cyan-400" />
+              <span>فحص التكرار</span>
+            </button>
+          </div>
+
           <div className="relative">
             <Search className="w-3.5 h-3.5 absolute right-3 top-3 text-slate-400" />
             <input
@@ -190,21 +430,37 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
                     <div className="text-xs text-slate-400 mt-1 flex items-center gap-3">
                       <span>الهاتف: <span className="font-mono text-slate-200">{activeCustomer.phone}</span></span>
                       <span>•</span>
-                      <span>البريد: <span className="font-mono text-slate-200">{activeCustomer.email}</span></span>
+                      <span>البريد: <span className="font-mono text-slate-200">{activeCustomer.email || 'غير مسجل'}</span></span>
                       <span>•</span>
                       <span>رقم الحساب: <span className="font-mono text-slate-200">{(activeCustomer.customFields as any)?.accountNumber || 'ACC-9001'}</span></span>
                     </div>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    onClick={() => setShowAddNoteModal(true)}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 transition"
+                  >
+                    <StickyNote className="w-3.5 h-3.5 text-amber-400" />
+                    <span>إضافة ملاحظة</span>
+                  </button>
+
+                  <button
+                    onClick={() => setShowScheduleFollowUpModal(true)}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 transition"
+                  >
+                    <CalendarCheck className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>جدولة متابعة</span>
+                  </button>
+
                   <button
                     onClick={() => exportCustomerDossier(activeCustomer)}
-                    className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
                     title="تصدير ملف العميل الموحد وسجل العمليات التاريخية بصيغة JSON"
                   >
                     <Download className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>تصدير الملف الموحد</span>
+                    <span>تصدير الملف</span>
                   </button>
 
                   <button
@@ -257,6 +513,91 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
                   <div className="text-xs font-bold text-white mt-1 truncate">
                     {activeCustomer.assignedAgentName || 'فريق VIP الموحد'}
                   </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Customer Notes & Scheduled Follow-ups Row */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Notes Box */}
+              <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 shadow-sm space-y-3">
+                <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+                  <h4 className="text-xs font-bold text-white flex items-center gap-1.5">
+                    <StickyNote className="w-4 h-4 text-amber-400" />
+                    <span>ملاحظات الحساب الداخلية ({notes.length})</span>
+                  </h4>
+                  <button
+                    onClick={() => setShowAddNoteModal(true)}
+                    className="text-[11px] text-amber-400 hover:text-amber-300 font-bold flex items-center gap-1"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>إضافة</span>
+                  </button>
+                </div>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {notes.length > 0 ? (
+                    notes.map((n) => (
+                      <div
+                        key={n.id}
+                        className={`p-3 rounded-2xl text-xs border ${
+                          n.pinned ? 'bg-amber-950/20 border-amber-500/30' : 'bg-slate-950 border-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                          <span className="font-bold text-slate-200">{n.authorName}</span>
+                          <span className="font-mono">{new Date(n.createdAt).toLocaleDateString('ar-SA')}</span>
+                        </div>
+                        <p className="text-slate-300 leading-relaxed">{n.content}</p>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="py-4 text-center text-xs text-slate-500">لا توجد ملاحظات مسجلة لهذا العميل</div>
+                  )}
+                </div>
+              </div>
+
+              {/* Follow-ups Box */}
+              <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 shadow-sm space-y-3">
+                <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+                  <h4 className="text-xs font-bold text-white flex items-center gap-1.5">
+                    <CalendarCheck className="w-4 h-4 text-cyan-400" />
+                    <span>المتابعات المجدولة والمهام ({followUps.length})</span>
+                  </h4>
+                  <button
+                    onClick={() => setShowScheduleFollowUpModal(true)}
+                    className="text-[11px] text-cyan-400 hover:text-cyan-300 font-bold flex items-center gap-1"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>جدولة</span>
+                  </button>
+                </div>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {followUps.length > 0 ? (
+                    followUps.map((fu) => (
+                      <div key={fu.id} className="p-3 rounded-2xl text-xs bg-slate-950 border border-slate-800 space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-white">{fu.title}</span>
+                          <span
+                            className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
+                              fu.priority === 'urgent'
+                                ? 'bg-rose-500/20 text-rose-300'
+                                : fu.priority === 'high'
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : 'bg-slate-800 text-slate-300'
+                            }`}
+                          >
+                            {fu.priority}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                          <span>المسند إليه: {fu.assignedAgentName || 'فريق الخدمة'}</span>
+                          <span>الموعد: {new Date(fu.dueAt).toLocaleString('ar-SA')}</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="py-4 text-center text-xs text-slate-500">لا توجد مهام متابعة مجدولة</div>
+                  )}
                 </div>
               </div>
             </div>
@@ -382,6 +723,352 @@ export const Customer360View: React.FC<Customer360ViewProps> = ({
           <div className="text-center text-xs text-slate-500 py-20">اختر عميلاً لعرض ملفه الشامل</div>
         )}
       </div>
+
+      {/* MODAL 1: New Customer Modal */}
+      {showNewCustomerModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 w-full max-w-lg shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Users className="w-4 h-4 text-emerald-400" />
+                <span>إضافة عميل جديد في قاعدة بيانات CRM</span>
+              </h3>
+              <button data-close-modal onClick={() => setShowNewCustomerModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateCustomer} className="space-y-3 text-xs">
+              <div>
+                <label className="block text-slate-400 mb-1">الاسم الكامل *:</label>
+                <input
+                  type="text"
+                  required
+                  value={newCustName}
+                  onChange={(e) => setNewCustName(e.target.value)}
+                  placeholder="مثال: أحمد محمد علي"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-400 mb-1">رقم الهاتف (مصر / دولي) *:</label>
+                  <input
+                    type="text"
+                    required
+                    value={newCustPhone}
+                    onChange={(e) => setNewCustPhone(e.target.value)}
+                    placeholder="01012345678 أو +201..."
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white font-mono focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">البريد الإلكتروني:</label>
+                  <input
+                    type="email"
+                    value={newCustEmail}
+                    onChange={(e) => setNewCustEmail(e.target.value)}
+                    placeholder="ahmed@example.com"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label htmlFor="new-cust-tier" className="block text-slate-400 mb-1">الفئة (Tier):</label>
+                  <select
+                    id="new-cust-tier"
+                    value={newCustTier}
+                    onChange={(e) => setNewCustTier(e.target.value as any)}
+                    aria-label="فئة العميل"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-emerald-500 font-mono"
+                  >
+                    <option value="standard">Standard</option>
+                    <option value="priority">Priority</option>
+                    <option value="vip">VIP</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">المدينة / المحافظة:</label>
+                  <input
+                    type="text"
+                    value={newCustCity}
+                    onChange={(e) => setNewCustCity(e.target.value)}
+                    placeholder="القاهرة / الرياض"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">القيمة المبدئية (LTV):</label>
+                  <input
+                    type="number"
+                    value={newCustLTV}
+                    onChange={(e) => setNewCustLTV(Number(e.target.value))}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white font-mono focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowNewCustomerModal(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold"
+                >
+                  إلغاء
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingCustomer}
+                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold disabled:opacity-50"
+                >
+                  {isSubmittingCustomer ? 'جارٍ الحفظ...' : 'حفظ العميل الجديد'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 2: Duplicate Detection Modal */}
+      {showDuplicateCheckModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 w-full max-w-lg shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Copy className="w-4 h-4 text-cyan-400" />
+                <span>محرك كشف وتفادي تكرار العملاء (Duplicate Detection)</span>
+              </h3>
+              <button data-close-modal onClick={() => setShowDuplicateCheckModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCheckDuplicates} className="space-y-3 text-xs">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-400 mb-1">رقم الهاتف:</label>
+                  <input
+                    type="text"
+                    value={dupPhone}
+                    onChange={(e) => setDupPhone(e.target.value)}
+                    placeholder="010..."
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white font-mono focus:outline-none focus:border-cyan-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">البريد:</label>
+                  <input
+                    type="text"
+                    value={dupEmail}
+                    onChange={(e) => setDupEmail(e.target.value)}
+                    placeholder="example@..."
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-slate-400 mb-1">الاسم:</label>
+                <input
+                  type="text"
+                  value={dupName}
+                  onChange={(e) => setDupName(e.target.value)}
+                  placeholder="الاسم الكامل أو جزء منه"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div className="flex justify-end pt-1">
+                <button
+                  type="submit"
+                  disabled={dupLoading}
+                  className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs disabled:opacity-50"
+                >
+                  {dupLoading ? 'جارٍ الفحص...' : 'بدء فحص السجلات'}
+                </button>
+              </div>
+            </form>
+
+            {/* Results */}
+            {dupResults && (
+              <div className="border-t border-slate-800 pt-3 space-y-2">
+                <div className="text-xs font-bold text-white flex items-center justify-between">
+                  <span>نتائج المطابقة:</span>
+                  <span className="font-mono text-cyan-400">{dupResults.length} سجل مطابق</span>
+                </div>
+                <div className="max-h-48 overflow-y-auto space-y-2">
+                  {dupResults.length > 0 ? (
+                    dupResults.map((r) => (
+                      <div key={r.customer?.id} className="p-3 bg-slate-950 rounded-2xl border border-slate-800 text-xs flex items-center justify-between">
+                        <div>
+                          <div className="font-bold text-white">{r.customer?.name}</div>
+                          <div className="text-[10px] text-slate-400 font-mono">{r.customer?.phone} • {r.customer?.email}</div>
+                          <div className="text-[10px] text-amber-400 mt-0.5">سبب المطابقة: {r.matchedOn?.join(', ')}</div>
+                        </div>
+                        <div className="text-right">
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-bold">
+                            تطابق: {r.score}%
+                          </span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="py-4 text-center text-xs text-emerald-400 bg-emerald-950/20 rounded-xl border border-emerald-500/30">
+                      ✓ لا يوجد سجل مكرر! الرقم والبيانات فريدة تماماً.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 3: Add Note Modal */}
+      {showAddNoteModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 w-full max-w-md shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <StickyNote className="w-4 h-4 text-amber-400" />
+                <span>إضافة ملاحظة على ملف العميل</span>
+              </h3>
+              <button data-close-modal onClick={() => setShowAddNoteModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleAddNote} className="space-y-3 text-xs">
+              <div>
+                <label className="block text-slate-400 mb-1">الملاحظة *:</label>
+                <textarea
+                  rows={4}
+                  required
+                  value={noteContent}
+                  onChange={(e) => setNoteContent(e.target.value)}
+                  placeholder="اكتب الملاحظة الفنية أو الإدارية هنا..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-amber-500"
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="notePin"
+                  checked={notePinned}
+                  onChange={(e) => setNotePinned(e.target.checked)}
+                  className="rounded bg-slate-950 border-slate-800 text-amber-500 focus:ring-0"
+                />
+                <label htmlFor="notePin" className="text-slate-300 text-xs">تثبيت الملاحظة في أعلى الملف (Pin)</label>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowAddNoteModal(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold"
+                >
+                  إلغاء
+                </button>
+                <button
+                  type="submit"
+                  disabled={noteSubmitting}
+                  className="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold disabled:opacity-50"
+                >
+                  {noteSubmitting ? 'جارٍ الحفظ...' : 'حفظ الملاحظة'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 4: Schedule Follow-Up Modal */}
+      {showScheduleFollowUpModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 w-full max-w-md shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <CalendarCheck className="w-4 h-4 text-cyan-400" />
+                <span>جدولة متابعة لاحقة مع العميل</span>
+              </h3>
+              <button data-close-modal onClick={() => setShowScheduleFollowUpModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleScheduleFollowUp} className="space-y-3 text-xs">
+              <div>
+                <label className="block text-slate-400 mb-1">موضوع المتابعة *:</label>
+                <input
+                  type="text"
+                  required
+                  value={fuTitle}
+                  onChange={(e) => setFuTitle(e.target.value)}
+                  placeholder="مثال: الاتصال للتحقق من تركيب الراوتر"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-400 mb-1">تاريخ وموعد الاستحقاق:</label>
+                  <input
+                    type="datetime-local"
+                    value={fuDueAt}
+                    onChange={(e) => setFuDueAt(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-white focus:outline-none focus:border-cyan-500 font-mono"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="fu-priority" className="block text-slate-400 mb-1">الأولوية:</label>
+                  <select
+                    id="fu-priority"
+                    value={fuPriority}
+                    onChange={(e) => setFuPriority(e.target.value)}
+                    aria-label="أولوية المتابعة"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500 font-mono"
+                  >
+                    <option value="low">منخفضة</option>
+                    <option value="medium">متوسطة</option>
+                    <option value="high">عالية</option>
+                    <option value="urgent">طارئة</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-400 mb-1">الموظف المسؤول:</label>
+                <input
+                  type="text"
+                  value={fuAgentName}
+                  onChange={(e) => setFuAgentName(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowScheduleFollowUpModal(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold"
+                >
+                  إلغاء
+                </button>
+                <button
+                  type="submit"
+                  disabled={fuSubmitting}
+                  className="px-5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold disabled:opacity-50"
+                >
+                  {fuSubmitting ? 'جارٍ الحفظ...' : 'حفظ وجدولة'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {toastMessage && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 border border-emerald-500/50 text-white px-5 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 text-xs font-bold z-50 animate-fade-in">

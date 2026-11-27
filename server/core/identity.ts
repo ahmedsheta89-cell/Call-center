@@ -86,8 +86,12 @@ export function validateSessionSecretConfig(
     if (trimmed.length < 32) {
       return { valid: false, reason: 'SESSION_SECRET must be at least 32 characters in production' };
     }
-    if (WEAK_SECRETS.has(trimmed.toLowerCase())) {
-      return { valid: false, reason: 'SESSION_SECRET uses a forbidden weak/default value' };
+    if (
+      WEAK_SECRETS.has(trimmed.toLowerCase()) ||
+      /^(REPLACE_WITH|YOUR_|CHANGEME|MY_|DEFAULT|EXAMPLE|TEMPLATE)/i.test(trimmed) ||
+      /(REPLACE_WITH|CHANGEME|PLACEHOLDER)/i.test(trimmed)
+    ) {
+      return { valid: false, reason: 'SESSION_SECRET uses a forbidden weak, default, or unresolved placeholder value' };
     }
   }
   return { valid: true };
@@ -460,7 +464,7 @@ export function issueSessionToken(options: {
     baseRole,
     name: user.fullName,
     email: user.email,
-    phoneNumber: user.phoneNumber || '01018108979',
+    phoneNumber: user.phoneNumber || null,
     csrfToken,
     authenticated: true,
     authMethod: 'session_token',
@@ -618,7 +622,7 @@ export function verifySessionToken(
     baseRole: currentBaseRole,
     name: user.fullName,
     email: user.email,
-    phoneNumber: user.phoneNumber || '01018108979',
+    phoneNumber: user.phoneNumber || null,
     csrfToken: sessionRecord.csrfToken,
     authenticated: true,
     authMethod,
@@ -811,9 +815,43 @@ function verifyCsrfForCookieMutation(
 
 const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
   '/auth/login',
+  '/auth/local-owner/status',
+  '/auth/local-owner/bootstrap',
+  '/auth/local-owner/login',
   '/platforms/download/android',
   '/platforms/download/windows',
 ]);
+
+const EXPLICIT_PROVIDER_WEBHOOK_CHANNELS = new Set([
+  'whatsapp',
+  'messenger',
+  'cequens',
+  'sms',
+  'telegram',
+  'email',
+  'sip',
+  'voice',
+]);
+
+/**
+ * Explicitly enumerates external provider callback routes that authenticate via
+ * provider-specific cryptographic signatures/tokens rather than OmniFlow user sessions.
+ * Never permits wildcards or interactive management routes.
+ */
+export function isExplicitProviderWebhookPath(reqPath: string): boolean {
+  const m1 = /^\/(?:integrations|webhooks)\/([a-z]+)\/webhook$/.exec(reqPath);
+  if (m1 && EXPLICIT_PROVIDER_WEBHOOK_CHANNELS.has(m1[1])) return true;
+  const m2 = /^\/webhooks\/([a-z]+)$/.exec(reqPath);
+  if (m2 && EXPLICIT_PROVIDER_WEBHOOK_CHANNELS.has(m2[1])) return true;
+  if (
+    reqPath === '/webhooks/sip/call-confirm' ||
+    reqPath === '/integrations/voice/call-confirm' ||
+    reqPath === '/integrations/sip/call-confirm'
+  ) {
+    return true;
+  }
+  return false;
+}
 
 /**
  * Express Middleware enforcing Cryptographic Session Authentication, CSRF protection for cookies,
@@ -822,6 +860,10 @@ const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
 export function authenticateApiRequest(req: Request, res: Response, next: NextFunction): void {
   if (PUBLIC_UNAUTHENTICATED_PATHS.has(req.path)) {
     next();
+    return;
+  }
+  if (isExplicitProviderWebhookPath(req.path)) {
+    actorContextStorage.run({ ...unauthenticatedFallbackContext }, () => next());
     return;
   }
 

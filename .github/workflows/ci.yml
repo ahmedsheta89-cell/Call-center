@@ -1,42 +1,31 @@
-name: Enterprise CI, Security Gate & Firestore Rules Verification Pipeline
+name: Enterprise CI, Security Gate, Packaging & Multi-OS Verification Pipeline
 
 on:
   push:
-    branches: [main, master, 'fix/**']
+    branches: [main, master, 'feat/**', 'fix/**']
   pull_request:
-    branches: [main, master, 'fix/**']
+    branches: [main, master, 'feat/**', 'fix/**']
 
 permissions:
   contents: read
 
 jobs:
-  verify-build-and-audit:
-    name: TypeScript Lint, Production Build, Static Firestore AST & E2E Audit
+  security-and-contracts:
+    name: TypeScript, Rate-Limit Checkpoint Integrity, Adapters & Security Audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
-
-      - name: Setup Java 21 Runtime (Temurin — Required by Firebase Firestore Emulator v1.22+)
-        uses: actions/setup-java@v6
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - name: Verify Java 21 Runtime Selection
-        run: |
-          which java
-          java -version
+        uses: actions/checkout@v4
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Install Dependencies (Lockfile-Free Workspace Strategy)
-        run: npm install --no-audit --no-fund
+      - name: Install Dependencies with Exact Lockfile Verification
+        run: npm ci --no-audit --no-fund
 
       - name: TypeScript Strict Typecheck (Zero Errors)
         run: npm run lint
@@ -44,8 +33,60 @@ jobs:
       - name: Build Production Frontend & Backend Bundle
         run: npm run build
 
+      - name: Run Rate-Limit Cold-Restart & Checkpoint Crypto Integrity Suite
+        run: npm run test:cold-restart
+
+      - name: Run Deep Persistent Rate-Limiting & Fail-Secure Recovery Suites
+        run: |
+          npx tsx scripts/test_rate_limiting_deep.ts
+          npx tsx scripts/test_rate_limiting_failures.ts
+
+      - name: Run Disaster Recovery & Backup Integrity Suite
+        run: npm run test:dr
+
+      - name: Run Omnichannel & Telephony Adapter Contract + Authenticated API Wiring Suite
+        run: npm run test:adapters
+
+      - name: Run External Webhook Auth, Real SMTP & SIP Lifecycle Security Suite
+        run: npm run test:external-security
+
+      - name: Run Crash-Consistent Idempotency, Webhook & SMTP Recovery Suite
+        run: npm run test:crash-consistency
+
+      - name: Run Phase 2 Security & Auth Lockdown Suite
+        run: npm run test:security
+
+      - name: Run Workspace Isolation & Canary Verification Suite
+        run: npm run test:isolation
+
+      - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
+        run: npm run test:audit
+
+  firestore-rules-verification:
+    name: Firestore Rules AST, Red Team & Real JVM Emulator Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 Runtime (Temurin — Required by Firebase Firestore Emulator v1.22+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
       - name: Cache Firebase Emulators
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: ~/.cache/firebase/emulators
           key: firebase-emulators-${{ runner.os }}-v1
@@ -57,12 +98,32 @@ jobs:
       - name: Run Firestore Rules AST, Red Team & Real JVM Emulator Suite (@firebase/rules-unit-testing)
         run: npm run test:firestore
 
-      - name: Run Independent Enterprise Security, Identity, CSRF, Storage & 150-Req Load Suite
-        run: npm run test:audit
+  operations-e2e:
+    name: Full End-to-End Operations Suite (Independent of Packaging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
 
       - name: Run End-to-End Operations Suite
         run: |
-          OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true PORT=3000 NODE_ENV=development npx tsx server.ts > /tmp/ci-omniflow-server.log 2>&1 &
+          CHANNEL_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+          AUDIT_CHECKPOINT_HMAC_KEY="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" \
+          SESSION_SECRET="ci-session-secret-must-be-at-least-32-chars-long-123456789" \
+          OMNIFLOW_ALLOW_LOCAL_TEST_LOGIN=true \
+          PORT=3000 \
+          NODE_ENV=test \
+          npx tsx server.ts > /tmp/ci-omniflow-server.log 2>&1 &
           SERVER_PID=$!
           trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
           READY=0
@@ -79,3 +140,115 @@ jobs:
             exit 1
           fi
           npx tsx scripts/test_all_operations.ts
+
+  playwright-e2e-and-a11y:
+    name: Playwright 9-Scenario User Journey & axe-core WCAG 2.2 AA
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build Production Bundle
+        run: npm run build
+
+      - name: Install Playwright Chromium & System Dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright 9-Scenario Human User Journey & WCAG 2.2 AA Accessibility Suite
+        env:
+          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}/audit-artifacts
+        run: npm run test:e2e:browser
+
+      - name: Upload Playwright E2E Screenshots & Audit Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-e2e-artifacts
+          path: |
+            audit-artifacts/screenshots/
+            audit-artifacts/playwright_e2e_results.json
+          retention-days: 14
+
+  package-and-release-verify:
+    name: Cross-Platform ZIP Release Packaging, SHA-256 Re-Verify & Clean Install
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Package Cross-Platform Release ZIP, Extract & Recompute Every SHA-256
+        env:
+          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}/audit-artifacts
+        run: npm run package:release
+
+      - name: Run Clean Isolated Release Installation Suite (Zero node_modules)
+        run: npm run test:release:clean
+
+      - name: Upload Standalone Release Distribution Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniflow-release-package
+          path: |
+            release/v*.zip
+            release/v1.0.2-windows-local/RELEASE_MANIFEST.json
+          retention-days: 14
+
+  windows-ntfs-and-launchers:
+    name: Windows NTFS Hardening, Rollback & Real Launchers Execution
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run Windows NTFS Hardening & Rollback Harness (Isolated Temp Root)
+        shell: powershell
+        env:
+          OMNIFLOW_NTFS_TEST_ROOT: ${{ runner.temp }}
+        run: npm run test:ntfs
+
+      - name: Package Release Archive & Verify Windows Launchers (BAT & PS1)
+        shell: powershell
+        env:
+          OMNIFLOW_AUDIT_DIR: ${{ github.workspace }}\audit-artifacts
+        run: |
+          npm run package:release
+          npm run test:launchers
+
+      - name: Upload Windows Release Package & Manifest Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-package
+          path: |
+            release/v*.zip
+            release/v1.0.2-windows-local/RELEASE_MANIFEST.json
+          retention-days: 14

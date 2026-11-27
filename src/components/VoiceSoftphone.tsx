@@ -175,24 +175,28 @@ export const VoiceSoftphone: React.FC<VoiceSoftphoneProps> = ({
 
   const handleStartCall = async () => {
     if (!dialNumber) return;
-    setDialFeedback(`جارٍ الاتصال بالرقم ${dialNumber}...`);
+    setDialFeedback(`جارٍ بدء مكالمة محاكاة للرقم ${dialNumber}...`);
     try {
       const res = await fetch('/api/v1/calls/dial', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phoneNumber: dialNumber }),
+        body: JSON.stringify({ phoneNumber: dialNumber, simulate: true }),
       });
       const d = await res.json();
       if (d.success) {
         setSelectedCallId(d.data.id);
-        setDialFeedback(`تم الاتصال بنجاح وتأسيس قناة WebRTC صوتية للرقم ${dialNumber}`);
+        setDialFeedback(
+          d.adapterState === 'SIMULATED'
+            ? `تم بدء مكالمة محاكاة محلية للرقم ${dialNumber} (SIMULATED - RINGING)`
+            : `تم إرسال طلب الاتصال للرقم ${dialNumber} (بانتظار تأكيد المزود)`
+        );
         setDialNumber('');
         setTimeout(() => setDialFeedback(null), 4000);
       } else {
         setDialFeedback(d.error?.message || 'تعذر إجراء المكالمة');
       }
     } catch {
-      setDialFeedback('تعذر الاتصال بالسنترال السحابي');
+      setDialFeedback('تعذر الاتصال بالخادم');
     }
   };
 
@@ -207,7 +211,7 @@ export const VoiceSoftphone: React.FC<VoiceSoftphoneProps> = ({
               <h2 className="text-sm font-bold text-white">الهاتف الرقمي (Softphone Core)</h2>
             </div>
             <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-              WebRTC Ready
+              Local SIMULATED Mode (Live SIP INVITE: NOT_IMPLEMENTED)
             </span>
           </div>
 
@@ -215,7 +219,11 @@ export const VoiceSoftphone: React.FC<VoiceSoftphoneProps> = ({
           {activeCall && activeCall.status !== 'completed' ? (
             <div className="bg-slate-950 border border-emerald-500/40 rounded-2xl p-4 mb-5 text-center space-y-2">
               <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 animate-pulse">
-                {activeCall.status === 'hold' ? 'المكالمة قيد الانتظار (HOLD)' : 'مكالمة جارية الآن'}
+                {activeCall.status === 'hold'
+                  ? 'المكالمة قيد الانتظار (HOLD)'
+                  : activeCall.status === 'ringing'
+                  ? 'جاري الرنين / بانتظار تأكيد المزود (RINGING)'
+                  : 'مكالمة جارية الآن'}
               </span>
               <div className="text-lg font-bold text-white font-mono">{activeCall.callerNumber}</div>
               <div className="text-xs text-slate-400 font-medium">العميل: {activeCall.customerName || 'عميل مسجل'}</div>

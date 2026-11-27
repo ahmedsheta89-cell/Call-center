@@ -69,4 +69,14 @@ export interface TelephonyAdapter {
   stopRecording(callId: string): Promise<RecordingMetadata>;
 }
 ```
-In **Zero-Cost / Local Mode**, the system provides a robust **Simulation Telephony Adapter** that emits true WebRTC-style audio state events, recording timestamps, and real audio synthesis for comprehensive local testing without SIP trunk billing.
+In **Zero-Cost / Local Mode**, the system provides a robust **Simulation Telephony Adapter** (`SIMULATED`) that emits local call state events and recording timestamps for free CI and pilot testing without SIP trunk billing.
+
+---
+
+## 4. Capability & Verification Truthfulness (تصنيف الجاهزية الحقيقي)
+
+- **WebChat:** `IMPLEMENTED` (local zero-cost runtime).
+- **WhatsApp / CEQUENS / Telegram Webhooks:** `IMPLEMENTED` + `LOCAL_PROTOCOL_FIXTURE_TESTED` (raw-body signature verification, server-controlled tenant mapping, durable idempotency/replay). Default `DISABLED` without real credentials; **not** `PROVIDER_SANDBOX_VERIFIED` or `LIVE_PROVIDER_VERIFIED`.
+- **Email (SMTP):** `IMPLEMENTED` + `LOCAL_PROTOCOL_FIXTURE_TESTED` via Nodemailer with mandatory TLS/STARTTLS, explicit auth, durable idempotency, and relay acceptance (`250 OK`) distinguished from inbox delivery.
+- **SIP REGISTER:** `IMPLEMENTED` + `LOCAL_PROTOCOL_FIXTURE_TESTED` (`CONFIGURED` -> `TCP_REACHABLE` -> `REGISTERED` via RFC 3261 Digest auth). Does **not** imply outbound call or media support.
+- **Live SIP Outbound INVITE / SDP / RTP Media:** `NOT_IMPLEMENTED` (fails closed with HTTP `501 LIVE_SIP_INVITE_NOT_IMPLEMENTED`; local testing uses `SIMULATED`).
