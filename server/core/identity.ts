@@ -17,6 +17,8 @@
  */
 
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { AsyncLocalStorage } from 'async_hooks';
 import type { Request, Response, NextFunction } from 'express';
 import { db } from '../db/store.ts';
@@ -24,6 +26,11 @@ import { ROLE_PERMISSIONS, ROLE_HIERARCHY_RANK, canSwitchToRole } from './rbac.t
 import { AuditLogger } from './audit.ts';
 import { adminAuth } from '../../src/lib/firebase-admin.ts';
 import firebaseConfig from '../../firebase-applet-config.json';
+import {
+  getSessionStore,
+  defaultSessionStore,
+  type ServerSessionRecord,
+} from './sessionStore.ts';
 
 export interface VerifiedActorContext {
   sessionId: string;
@@ -45,20 +52,9 @@ export interface SessionTokenPayload {
   org: string;
   baseRole: string;
   activeRole: string;
+  cv?: number;
   iat: number;
   exp: number;
-}
-
-interface ServerSessionRecord {
-  jti: string;
-  userId: string;
-  organizationId: string;
-  baseRole: string;
-  activeRole: string;
-  csrfToken: string;
-  issuedAt: number;
-  expiresAt: number;
-  revoked: boolean;
 }
 
 const WEAK_SECRETS = new Set([
@@ -98,6 +94,31 @@ export function validateSessionSecretConfig(
 }
 
 const EPHEMERAL_DEV_SECRET = crypto.randomBytes(32).toString('hex');
+const cachedDevSecretsByPath = new Map<string, string>();
+
+function getOrCreateLocalDevSecret(): string {
+  const dataDir = path.dirname(getSessionStore().getStoreFilePath());
+  const secretPath = path.join(dataDir, '.omniflow_dev_session_secret');
+  const cached = cachedDevSecretsByPath.get(secretPath);
+  if (cached) return cached;
+
+  try {
+    if (fs.existsSync(secretPath)) {
+      const existing = fs.readFileSync(secretPath, 'utf-8').trim();
+      if (existing.length >= 32) {
+        cachedDevSecretsByPath.set(secretPath, existing);
+        return existing;
+      }
+    }
+    fs.mkdirSync(dataDir, { recursive: true });
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(secretPath, generated, { mode: 0o600 });
+    cachedDevSecretsByPath.set(secretPath, generated);
+    return generated;
+  } catch {
+    return EPHEMERAL_DEV_SECRET;
+  }
+}
 
 function getActiveHmacSecret(): string {
   const check = validateSessionSecretConfig();
@@ -107,12 +128,10 @@ function getActiveHmacSecret(): string {
       code: 'SESSION_SECRET_MISCONFIGURED',
     });
   }
-  return process.env.SESSION_SECRET?.trim() || EPHEMERAL_DEV_SECRET;
+  return process.env.SESSION_SECRET?.trim() || getOrCreateLocalDevSecret();
 }
 
 const DEFAULT_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
-
-const activeSessions = new Map<string, ServerSessionRecord>();
 
 export const actorContextStorage = new AsyncLocalStorage<VerifiedActorContext>();
 
@@ -381,7 +400,7 @@ export function issueSessionToken(options: {
       });
     }
     const candidateJti = options.existingJti.trim();
-    const existingSession = activeSessions.get(candidateJti);
+    const existingSession = getSessionStore().get(candidateJti);
     if (!existingSession) {
       throw Object.assign(
         new Error('Cannot reuse nonexistent session JTI; arbitrary JTI injection is forbidden'),
@@ -428,6 +447,7 @@ export function issueSessionToken(options: {
 
   const ttl = options.ttlMs !== undefined ? options.ttlMs : DEFAULT_TTL_MS;
   const csrfToken = deriveCsrfToken(jti);
+  const credentialVersion = typeof user.credentialVersion === 'number' ? user.credentialVersion : 1;
 
   const payload: SessionTokenPayload = {
     jti,
@@ -435,6 +455,7 @@ export function issueSessionToken(options: {
     org: user.organizationId,
     baseRole,
     activeRole,
+    cv: credentialVersion,
     iat: now,
     exp: now + ttl,
   };
@@ -450,11 +471,13 @@ export function issueSessionToken(options: {
     baseRole,
     activeRole,
     csrfToken,
+    credentialVersion,
     issuedAt: payload.iat,
     expiresAt: payload.exp,
     revoked: false,
+    ...(options.existingJti ? { lastRotatedAt: now } : {}),
   };
-  activeSessions.set(jti, sessionRecord);
+  getSessionStore().set(sessionRecord);
 
   const actor: VerifiedActorContext = {
     sessionId: jti,
@@ -527,7 +550,8 @@ export function verifySessionToken(
     });
   }
 
-  const sessionRecord = activeSessions.get(payload.jti);
+  const store = getSessionStore();
+  const sessionRecord = store.get(payload.jti);
   if (!sessionRecord || sessionRecord.revoked) {
     throw Object.assign(new Error('Session has been revoked or does not exist on server'), {
       status: 401,
@@ -547,6 +571,19 @@ export function verifySessionToken(
     throw Object.assign(new Error('Authenticated user no longer exists or is disabled'), {
       status: 401,
       code: 'USER_INACTIVE_OR_DELETED',
+    });
+  }
+
+  const authoritativeCredVer = typeof user.credentialVersion === 'number' ? user.credentialVersion : 1;
+  const tokenCredVer = typeof payload.cv === 'number' ? payload.cv : 1;
+  if (
+    sessionRecord.credentialVersion !== authoritativeCredVer ||
+    tokenCredVer !== authoritativeCredVer
+  ) {
+    store.revoke(sessionRecord.jti, 'credential_changed');
+    throw Object.assign(new Error('Session invalidated due to user credential change'), {
+      status: 401,
+      code: 'SESSION_CREDENTIAL_CHANGED',
     });
   }
 
@@ -577,7 +614,7 @@ export function verifySessionToken(
     !Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, sessionActiveRole) ||
     payload.activeRole !== sessionActiveRole
   ) {
-    sessionRecord.revoked = true;
+    store.revoke(sessionRecord.jti, 'role_invalidated_by_demotion');
     throw Object.assign(new Error('Session role is no longer valid in RBAC policy'), {
       status: 403,
       code: 'SESSION_ROLE_INVALIDATED_BY_DEMOTION',
@@ -602,7 +639,7 @@ export function verifySessionToken(
       : canSwitchToRole(currentBaseRole, sessionActiveRole) && hasPermissionContainment;
 
   if (wasBaseRoleDemoted || !isAuthorizedActiveRole) {
-    sessionRecord.revoked = true;
+    store.revoke(sessionRecord.jti, 'role_invalidated_by_demotion');
     throw Object.assign(
       new Error(
         `Session invalidated: current base role [${currentBaseRole}] no longer authorizes active role [${sessionActiveRole}]`
@@ -629,11 +666,46 @@ export function verifySessionToken(
   };
 }
 
-export function revokeSessionToken(jti: string): boolean {
-  const rec = activeSessions.get(jti);
-  if (!rec) return false;
-  rec.revoked = true;
-  return true;
+export function revokeSessionToken(jti: string, reason = 'manual_revoke'): boolean {
+  return getSessionStore().revoke(jti, reason);
+}
+
+export function revokeAllUserSessions(userId: string, reason = 'revoke_all_user_sessions'): number {
+  return getSessionStore().revokeAllForUser(userId, reason);
+}
+
+export function revokeAllOrganizationSessions(organizationId: string, reason = 'organization_revoked'): number {
+  return getSessionStore().revokeAllForOrganization(organizationId, reason);
+}
+
+export function invalidateUserCredentials(
+  userId: string,
+  reason = 'credential_changed'
+): { ok: boolean; credentialVersion?: number; revokedCount: number } {
+  const user = db.users.get(userId);
+  if (!user) {
+    return { ok: false, revokedCount: 0 };
+  }
+  const nextVersion = (typeof user.credentialVersion === 'number' ? user.credentialVersion : 1) + 1;
+  user.credentialVersion = nextVersion;
+  user.updatedAt = new Date().toISOString();
+  db.users.set(user.id, user);
+  db.saveToDisk();
+  const revokedCount = revokeAllUserSessions(user.id, reason);
+  return { ok: true, credentialVersion: nextVersion, revokedCount };
+}
+
+export function cleanupExpiredSessions(now?: number): number {
+  return getSessionStore().cleanupExpired(now);
+}
+
+export function listUserSessions(userId: string, organizationId: string, includeRevoked = false): ServerSessionRecord[] {
+  return getSessionStore().listForUser(userId, organizationId, includeRevoked);
+}
+
+export function loadSessionStoreOnStartup(): void {
+  defaultSessionStore.loadFromDisk();
+  defaultSessionStore.cleanupExpired();
 }
 
 /**

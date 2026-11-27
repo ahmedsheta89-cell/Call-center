@@ -34,11 +34,15 @@ import {
   currentActor,
   issueSessionToken,
   revokeSessionToken,
+  revokeAllUserSessions,
+  invalidateUserCredentials,
+  listUserSessions,
   verifyFirebaseIdToken,
   formatSessionCookie,
   formatClearSessionCookie,
   validateSessionSecretConfig,
 } from '../core/identity.ts';
+import { getSessionStore } from '../core/sessionStore.ts';
 import { execSync } from 'child_process';
 import { AIGateway } from '../modules/ai/gateway.ts';
 import {
@@ -566,6 +570,154 @@ apiRouter.post('/auth/logout', (req: Request, res: Response) => {
     alreadyInactive: !revoked,
     message: revoked ? 'Session revoked successfully' : 'Session already inactive; cookie cleared',
   });
+});
+
+apiRouter.post('/auth/logout-all', (req: Request, res: Response) => {
+  const hasActiveSession =
+    Boolean(currentActor.authenticated) &&
+    typeof currentActor.userId === 'string' &&
+    currentActor.userId !== 'anonymous';
+  if (!hasActiveSession) {
+    res.status(401).json({
+      success: false,
+      error: { code: 'AUTH_TOKEN_REQUIRED', message: 'Authenticated session required.' },
+    });
+    return;
+  }
+  const revokedCount = revokeAllUserSessions(currentActor.userId, 'logout_all');
+  AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'auth.all_sessions_revoked',
+    entityType: 'user',
+    entityId: currentActor.userId,
+    afterState: { revokedCount },
+  });
+  res.setHeader('Set-Cookie', formatClearSessionCookie(req));
+  res.json({
+    success: true,
+    revokedCount,
+    message: `Revoked ${revokedCount} active session(s) for user.`,
+  });
+});
+
+apiRouter.get('/auth/sessions', (_req: Request, res: Response) => {
+  const sessions = listUserSessions(currentActor.userId, currentActor.organizationId, false).map((s) => ({
+    jti: s.jti,
+    userId: s.userId,
+    organizationId: s.organizationId,
+    baseRole: s.baseRole,
+    activeRole: s.activeRole,
+    issuedAt: new Date(s.issuedAt).toISOString(),
+    expiresAt: new Date(s.expiresAt).toISOString(),
+    isCurrent: s.jti === currentActor.sessionId,
+  }));
+  res.json({ success: true, data: sessions });
+});
+
+apiRouter.post('/auth/sessions/:jti/revoke', (req: Request, res: Response) => {
+  const targetJti = String(req.params.jti || '').trim();
+  const targetSession = getSessionStore().get(targetJti);
+  if (!targetSession || targetSession.organizationId !== currentActor.organizationId) {
+    res.status(404).json({
+      success: false,
+      error: { code: 'SESSION_NOT_FOUND', message: 'Session not found in organization.' },
+    });
+    return;
+  }
+  const isSelf = targetSession.userId === currentActor.userId;
+  if (!isSelf) {
+    assertPermission(currentActor.role, [], 'settings.manage');
+  }
+  const revoked = revokeSessionToken(targetJti, isSelf ? 'user_revoked_session' : 'admin_revoked_session');
+  if (revoked) {
+    AuditLogger.log({
+      organizationId: currentActor.organizationId,
+      actorId: currentActor.userId,
+      actorType: 'user',
+      action: 'auth.session_revoked',
+      entityType: 'session',
+      entityId: targetJti,
+      afterState: { targetUserId: targetSession.userId, byAdmin: !isSelf },
+    });
+  }
+  res.json({ success: true, revoked, jti: targetJti });
+});
+
+apiRouter.post('/users/:id/status', (req: Request, res: Response) => {
+  assertPermission(currentActor.role, [], 'settings.manage');
+  const targetUserId = String(req.params.id || '').trim();
+  const targetUser = db.users.get(targetUserId);
+  if (!targetUser || targetUser.organizationId !== currentActor.organizationId) {
+    res.status(404).json({
+      success: false,
+      error: { code: 'USER_NOT_FOUND', message: 'User not found in organization.' },
+    });
+    return;
+  }
+  if (typeof req.body?.isActive !== 'boolean') {
+    res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_STATUS', message: 'isActive boolean is required.' },
+    });
+    return;
+  }
+  if (targetUser.id === currentActor.userId && req.body.isActive === false) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'CANNOT_DISABLE_SELF', message: 'Cannot disable your own active account.' },
+    });
+    return;
+  }
+  const previousActive = targetUser.isActive;
+  targetUser.isActive = req.body.isActive;
+  targetUser.updatedAt = new Date().toISOString();
+  db.users.set(targetUser.id, targetUser);
+  db.saveToDisk();
+
+  let revokedCount = 0;
+  if (!targetUser.isActive) {
+    revokedCount = revokeAllUserSessions(targetUser.id, 'user_disabled');
+  }
+  AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: targetUser.isActive ? 'user.enabled' : 'user.disabled',
+    entityType: 'user',
+    entityId: targetUser.id,
+    beforeState: { isActive: previousActive },
+    afterState: { isActive: targetUser.isActive, revokedCount },
+  });
+  res.json({ success: true, data: { userId: targetUser.id, isActive: targetUser.isActive, revokedCount } });
+});
+
+apiRouter.post('/users/:id/invalidate-sessions', (req: Request, res: Response) => {
+  const targetUserId = String(req.params.id || '').trim();
+  const targetUser = db.users.get(targetUserId);
+  if (!targetUser || targetUser.organizationId !== currentActor.organizationId) {
+    res.status(404).json({
+      success: false,
+      error: { code: 'USER_NOT_FOUND', message: 'User not found in organization.' },
+    });
+    return;
+  }
+  const isSelf = targetUser.id === currentActor.userId;
+  if (!isSelf) {
+    assertPermission(currentActor.role, [], 'settings.manage');
+  }
+  const outcome = invalidateUserCredentials(targetUser.id, 'credential_invalidated');
+  AuditLogger.log({
+    organizationId: currentActor.organizationId,
+    actorId: currentActor.userId,
+    actorType: 'user',
+    action: 'user.credentials_invalidated',
+    entityType: 'user',
+    entityId: targetUser.id,
+    afterState: { credentialVersion: outcome.credentialVersion, revokedCount: outcome.revokedCount },
+  });
+  res.json({ success: true, data: outcome });
 });
 
 apiRouter.post('/auth/switch-role', (req: Request, res: Response) => {

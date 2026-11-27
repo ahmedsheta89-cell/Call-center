@@ -106,3 +106,11 @@ During the forensic audit of OmniFlow OS, six strategic architectural and produc
 | **`DEC-04`** | Social Publishing & Campaign Scope | **Option A:** Composer + Editorial Calendar + Maker-Checker Approvals + Comment-to-Ticket Attribution | **Phase T** |
 | **`DEC-05`** | AI Autonomy & Budget Governance | **Option A:** 4-Level Autonomy Policy (Default Level 1 Suggest) + Mandatory PII Redaction + Auto Zero-Cost Fallback | **Phase U** |
 | **`DEC-06`** | Tenancy & Carrier Credential Model | **Option A:** Multi-Tenant SaaS with Per-Tenant Encrypted BYOC Credentials + Docker On-Premise Support | **Phase P & Z** |
+
+---
+
+## R2.1C Update — Persistent Sessions, Canonical Tenant Identity & Deferred Capabilities
+
+- **Persistent Sessions (`server/core/sessionStore.ts`):** Session records now persist atomically to `.omniflow_sessions.json` behind `ISessionStore` with `credentialVersion` binding, single/all-user/org revocation, and safe expired-session cleanup. Future PostgreSQL/Redis session storage can implement `ISessionStore` without changing auth routes.
+- **Canonical Tenant Identity (`server/core/tenantIdentity.ts`):** `org-madar-enterprise-001` is confirmed as the canonical runtime primary organization ID; `org-madar-001` (used by `firestore.rules` `isDesignatedBootstrapOrg` and its 39 JVM emulator tests) is preserved as a non-destructive explicit alias without mutating audit hash chains or weakening backup referential integrity (`[P1-06]`).
+- **Deferred Capabilities (Unchanged):** Production SIP INVITE (`501 LIVE_SIP_INVITE_NOT_IMPLEMENTED`), live external provider sandbox certification (WhatsApp/Meta/Twilio/SMTP), and managed Cloud SQL / Firestore SaaS cutover remain deferred until an approved production deployment window.

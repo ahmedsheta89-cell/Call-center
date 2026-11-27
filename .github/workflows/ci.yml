@@ -53,6 +53,12 @@ jobs:
       - name: Run Crash-Consistent Idempotency, Webhook & SMTP Recovery Suite
         run: npm run test:crash-consistency
 
+      - name: Run Persistent Sessions & Canonical Tenant Identity Suite
+        run: npm run test:sessions
+
+      - name: Run Real OS Process Kill (SIGKILL) & Recovery Suite
+        run: npm run test:process-kill
+
       - name: Run Phase 2 Security & Auth Lockdown Suite
         run: npm run test:security
 

@@ -251,7 +251,7 @@ export function subscribeToFirestoreTickets(onUpdate: (tickets: Ticket[]) => voi
   const startListening = () => {
     if (unsubSnapshot) return;
     try {
-      const safeOrgId = sanitizeFirestoreId(organizationId, 'org-madar-001');
+      const safeOrgId = sanitizeFirestoreId(organizationId, 'org-madar-enterprise-001');
       const q = query(collection(firestore, 'tickets'), where('organizationId', '==', safeOrgId), limit(50));
       unsubSnapshot = onSnapshot(
         q,

@@ -1,7 +1,7 @@
 {
   "releaseVersion": "1.0.2",
   "releaseTag": "v1.0.2-windows-local",
-  "buildTimestamp": "2026-11-26T18:44:29.701Z",
+  "buildTimestamp": "2026-11-27T19:50:26.131Z",
   "targetPlatform": "Windows 10 / Windows 11 / Windows Server 2019/2022",
   "runtimeRequirements": {
     "node": ">=22.0.0",
@@ -10,8 +10,8 @@
     "networkBinding": "127.0.0.1 (Strict Loopback / Zero Cloud Exposure)"
   },
   "totalFiles": 22,
-  "totalSizeBytes": 7880160,
-  "totalSizeMB": 7.52,
+  "totalSizeBytes": 7898169,
+  "totalSizeMB": 7.53,
   "fileInventory": {
     ".env.example": {
       "sizeBytes": 2024,
@@ -29,9 +29,9 @@
       "sizeBytes": 46265,
       "sha256": "a40d0e54aefcb7304e89d5a9c387b7ed64161c9f2f6801dda337679fdc392b68"
     },
-    "dist/assets/index-CmgdZGBu.js": {
-      "sizeBytes": 708885,
-      "sha256": "a0d103e4c7723245b498a497faf1bbb2b11bc2be2a3b977b3a18059ea50bd012"
+    "dist/assets/index-BK3NaIfy.js": {
+      "sizeBytes": 708896,
+      "sha256": "863318469629d99f2d610e49345e197ad97925e0b9393b56e4057f8fd2a71efa"
     },
     "dist/assets/index-tYOgJX6i.css": {
       "sizeBytes": 95606,
@@ -55,7 +55,7 @@
     },
     "dist/index.html": {
       "sizeBytes": 2370,
-      "sha256": "1bc216a6fea54a3d2a6c2b4385cb7a87c80e48354831df7a2b0ede6edb820c8f"
+      "sha256": "f14de25818c49d5425a6cee605a246cd0c82b8983daed0506ca2388b788d4368"
     },
     "dist/manifest.webmanifest": {
       "sizeBytes": 1992,
@@ -67,19 +67,19 @@
     },
     "dist/sw.js": {
       "sizeBytes": 1988,
-      "sha256": "2ec83e9a9a0c5bcaaaaeccd189f9570a9008e9126bece11cdf1126ed498cecc8"
+      "sha256": "acbffbc3e9a7abdf604d7c482f790e5269107db740cf862372556bda89d8faf5"
     },
     "dist/workbox-c121765f.js": {
       "sizeBytes": 22270,
       "sha256": "209c89a1434f9012dac6de78f07f9f78278b911a5d7622f1c1e5369bb74e1d9e"
     },
     "dist-server/server.cjs": {
-      "sizeBytes": 5644072,
-      "sha256": "f9175e33488d029d792359c204087af936522b2489eb538f36f7954106fec4a9"
+      "sizeBytes": 5661917,
+      "sha256": "dd532aa822b7d7cf645366f57699d12bda5264690516a038d3758adbb544fa08"
     },
     "package.json": {
-      "sizeBytes": 2847,
-      "sha256": "196760f1dc71409ac76c7e8c0f3c4cca02fe36646d8dcddf08e0d20d240ea1c3"
+      "sizeBytes": 3000,
+      "sha256": "3e824bf7670f7e72b6e8fd8ecd4cbe4d16d797756902c5a026e7a1822d1f9e30"
     },
     "prepare_ntfs_acl_hardening.ps1": {
       "sizeBytes": 30695,

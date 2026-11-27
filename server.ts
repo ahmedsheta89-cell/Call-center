@@ -191,7 +191,7 @@ async function bootstrapModules() {
     { initializeSeedData, ensureEgyptSpecialCustomer, ensureAdminUser },
     { ensurePwaIconsGenerated, getPwaIconBuffer },
     { apiRouter },
-    { mountLegacyUserRouteClosuresAndApiFallback },
+    { mountLegacyUserRouteClosuresAndApiFallback, loadSessionStoreOnStartup },
     { initLocalOwnerAuth },
     { reconcileDurableIdempotencyOnStartup },
   ] = await Promise.all([
@@ -232,6 +232,13 @@ async function bootstrapModules() {
     console.error(`[Idempotency] Startup reconciliation failed fail-closed: ${idemReconcile.error}`);
     fatalBootstrapShutdown();
     throw new Error(`[Idempotency] Durable idempotency storage corrupted or untrusted: ${idemReconcile.error}`);
+  }
+  try {
+    loadSessionStoreOnStartup();
+  } catch (sessErr: any) {
+    console.error(`[Sessions] Startup session store load failed fail-closed: ${sessErr?.message || sessErr}`);
+    fatalBootstrapShutdown();
+    throw sessErr;
   }
 
   // 2. ynamic PWA Binary Icon Serving

@@ -41,6 +41,7 @@ export interface User {
   phoneNumber?: string;
   isActive: boolean;
   mfaEnabled: boolean;
+  credentialVersion?: number;
   createdAt: string;
   updatedAt: string;
 }
