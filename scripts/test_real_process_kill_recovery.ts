@@ -21,7 +21,7 @@ import os from 'os';
 import path from 'path';
 import assert from 'assert';
 import { spawn, type ChildProcess } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const WORKER_ROLE = process.env.OMNIFLOW_PROCESS_KILL_ROLE;
@@ -190,11 +190,12 @@ async function runChildPhaseB(dataDir: string, artifactsPath: string): Promise<v
   assert.strictEqual(smtpRetry.reason, 'RECONCILIATION_REQUIRED');
 
   process.stdout.write(`CHILD_B_VERIFIED:${process.pid}\n`);
+  process.exit(0);
 }
 
 function spawnTsxWorker(role: 'childA' | 'childB', dataDir: string, artifactsPath: string): ChildProcess {
-  const tsxCli = path.resolve(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
-  return spawn(process.execPath, [tsxCli, THIS_FILE], {
+  const tsxLoaderUrl = pathToFileURL(path.resolve(process.cwd(), 'node_modules', 'tsx', 'dist', 'loader.mjs')).href;
+  return spawn(process.execPath, ['--import', tsxLoaderUrl, THIS_FILE], {
     env: {
       ...process.env,
       OMNIFLOW_PROCESS_KILL_ROLE: role,
